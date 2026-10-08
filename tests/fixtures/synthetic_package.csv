@@ -1,0 +1,6 @@
+title,id,field_identifier,field_resource_type,field_model,field_member_of,parent_id,field_weight,field_extent,field_genre,field_type,field_subjects_name,field_edtf_date_created,field_subject,field_geographic_subject,field_linked_agent,field_language,field_description_long,field_rights,field_use_and_reproduction,field_finding_aid_link,field_item_desc_link,field_campus,field_repository,field_campus_unit_repository,field_unit,field_preferred_citation,field_display_hints,file,hocr,url_alias
+North Star Collection,collection-north,,,Paged Content,,,,,,,,,,,,,,,,,,,,,,,,originals/north-star.pdf,,
+North Star Page 2,north-page-002,,,Page,,collection-north,2,,,,,,,,,,,,,,,,,,,,,images/north-page-002.tif,ocr/north-page-002.html,
+North Star Page 1,north-page-001,,,Page,,collection-north,1,,,,,,,,,,,,,,,,,,,,,images/north-page-001.tif,ocr/north-page-001.html,
+South Star Collection,collection-south,,,Paged Content,,,,,,,,,,,,,,,,,,,,,,,,originals/south-star.pdf,,
+South Star Page 1,south-page-001,,,Page,,collection-south,1,,,,,,,,,,,,,,,,,,,,,images/south-page-001.tif,ocr/south-page-001.html,
