@@ -23,6 +23,7 @@ def generate_manifests(
     cantaloupe_base_url: str = "/iiif/2",
     manifest_base_url: Optional[str] = None,
     journal=None,
+    page_dimensions: Optional[Dict[tuple[str, str], tuple[int, int]]] = None,
 ) -> GenerateResult:
     results = RecordedResults(journal, "generate")
     generated_count = 0
@@ -33,6 +34,7 @@ def generate_manifests(
     entries_by_key: Dict[tuple[str, str, str], UploadPlanEntry] = {
         (entry.role, entry.object_id, entry.page_id): entry for entry in upload_plan
     }
+    page_dimensions = page_dimensions or {}
 
     for obj in objects:
         manifest_entry = entries_by_key.get(("manifest", obj.object_id, ""))
@@ -55,6 +57,7 @@ def generate_manifests(
                 entries_by_key,
                 output_dir,
                 service_url_prefix,
+                page_dimensions,
             )
             if page_canvas is None:
                 missing_reasons.append(page_missing or f"Missing image source for page {page.page_id}")
@@ -132,6 +135,7 @@ def _build_canvas_entry(
     entries_by_key: Dict[tuple[str, str, str], UploadPlanEntry],
     output_dir: Path,
     cantaloupe_base_url: str,
+    page_dimensions: Dict[tuple[str, str], tuple[int, int]],
 ) -> tuple[Optional[Dict[str, object]], Optional[str]]:
     service_entry = entries_by_key.get(("service_jpg", obj.object_id, page.page_id))
     master_entry = entries_by_key.get(("master_tiff", obj.object_id, page.page_id))
@@ -147,6 +151,11 @@ def _build_canvas_entry(
         generated_output = _output_path_for_entry(service_key, output_dir)
         if not generated_output.exists():
             return None, f"Generated image not found for page {page.page_id} at {generated_output}"
+
+    dimensions = page_dimensions.get((obj.object_id, page.page_id))
+    if not dimensions or dimensions[0] <= 0 or dimensions[1] <= 0:
+        return None, f"Source pixel dimensions are unavailable for page {page.page_id}."
+    width, height = dimensions
 
     service_id = build_cantaloupe_service_id(
         base_url=cantaloupe_base_url,
@@ -168,6 +177,8 @@ def _build_canvas_entry(
         "@id": canvas_id,
         "@type": "sc:Canvas",
         "label": page.title or page.page_id,
+        "width": width,
+        "height": height,
         "images": [
             {
                 "@type": "oa:Annotation",
@@ -177,6 +188,8 @@ def _build_canvas_entry(
                     "@type": "dctypes:Image",
                     "@id": image_id,
                     "format": "image/jpeg",
+                    "width": width,
+                    "height": height,
                     "service": {
                         "@context": "http://iiif.io/api/image/2/context.json",
                         "@id": service_id,

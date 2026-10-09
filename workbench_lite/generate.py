@@ -3,7 +3,7 @@ import hashlib
 from pathlib import Path
 from .diagnostics import operation_error
 from .runs import RecordedResults
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 from .image_policy import Image, pixel_limit_error
 
@@ -17,6 +17,7 @@ class GenerateResult:
     failed_count: int
     target_count: int
     results: List["GenerateResultEntry"] = field(default_factory=list)
+    page_dimensions: Dict[tuple[str, str], tuple[int, int]] = field(default_factory=dict, repr=False)
 
     def to_dict(self) -> dict:
         return {
@@ -102,6 +103,7 @@ def _generate_derivatives(
     generated_count = 0
     missing_source_count = 0
     failed_count = 0
+    page_dimensions: Dict[tuple[str, str], tuple[int, int]] = {}
     success_message = "Service JPEG generated." if role == "service_jpg" else "Thumbnail JPEG generated."
 
     for entry in entries:
@@ -124,7 +126,12 @@ def _generate_derivatives(
 
         target = _output_path_for_entry(entry, output_dir)
         try:
-            _convert_tiff_to_jpeg(source_path, target, max_long_side=max_long_side, quality=quality)
+            source_dimensions = _convert_tiff_to_jpeg(
+                source_path,
+                target,
+                max_long_side=max_long_side,
+                quality=quality,
+            )
             checksum = _checksum_for_file(target)
             size_bytes = target.stat().st_size
         except (OSError, ValueError, Image.DecompressionBombError) as exc:
@@ -143,6 +150,7 @@ def _generate_derivatives(
             continue
 
         generated_count += 1
+        page_dimensions[(entry.object_id, entry.page_id)] = source_dimensions
         results.append(
             GenerateResultEntry(
                 role=entry.role,
@@ -161,10 +169,16 @@ def _generate_derivatives(
         failed_count=failed_count,
         target_count=len(entries),
         results=results,
+        page_dimensions=page_dimensions,
     )
 
 
-def _convert_tiff_to_jpeg(source_path: Path, output_path: Path, max_long_side: int, quality: int) -> None:
+def _convert_tiff_to_jpeg(
+    source_path: Path,
+    output_path: Path,
+    max_long_side: int,
+    quality: int,
+) -> tuple[int, int]:
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
     with Image.open(source_path) as image:
@@ -177,6 +191,8 @@ def _convert_tiff_to_jpeg(source_path: Path, output_path: Path, max_long_side: i
             image.thumbnail((max_long_side, max_long_side), resample=Image.Resampling.LANCZOS)
 
         image.save(output_path, format="JPEG", quality=quality, optimize=True)
+
+    return width, height
 
 
 def _resolve_source_path(source_path: str, input_dir: Path) -> Path:

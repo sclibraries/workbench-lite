@@ -730,7 +730,7 @@ class FakeClient:
             config_path, csv_path, input_dir = self.write_tiny_package(package_dir)
             check_report = run_check(config_path=config_path, input_csv_override=csv_path)
             generated_dir = package_dir / "generated"
-            generate_service_jpgs(
+            service_report = generate_service_jpgs(
                 upload_plan=check_report.upload_plan,
                 input_dir=input_dir,
                 output_dir=generated_dir,
@@ -749,6 +749,7 @@ class FakeClient:
                 upload_plan=check_report.upload_plan,
                 output_dir=generated_dir,
                 cantaloupe_base_url="http://localhost:8080/iiif/2",
+                page_dimensions=service_report.page_dimensions,
             )
             audit_path = generated_dir / next(e.key for e in check_report.upload_plan if e.role == 'audit')
             audit_path.parent.mkdir(parents=True)
@@ -836,6 +837,11 @@ class FakeClient:
             self.assertTrue(Path(artifact.output_path).exists())
             self.assertGreater(artifact.size_bytes or 0, 0)
             self.assertIsInstance(artifact.checksum, str)
+        self.assertEqual(
+            getattr(generate_report, "page_dimensions", {}),
+            {("parent", "page"): (16, 10)},
+        )
+        self.assertNotIn("page_dimensions", generate_report.to_dict())
 
     def test_generate_thumbnails_creates_outputs(self):
         from workbench_lite.check import run_check
@@ -887,7 +893,7 @@ class FakeClient:
         self.assertEqual(manifest_report.missing_source_count, 1)
         self.assertEqual(manifest_report.results[0].status, "failed")
 
-    def test_generate_manifests_creates_outputs(self):
+    def test_generate_manifests_fails_when_source_dimensions_are_unavailable(self):
         from workbench_lite.check import run_check
         from workbench_lite.generate import generate_service_jpgs
         from workbench_lite.manifest import generate_manifests
@@ -897,7 +903,6 @@ class FakeClient:
             config_path, csv_path, input_dir = self.write_tiny_package(package_dir)
             check_report = run_check(config_path=config_path, input_csv_override=csv_path)
             output_dir = package_dir / "generated"
-
             generate_service_jpgs(
                 upload_plan=check_report.upload_plan,
                 input_dir=input_dir,
@@ -912,6 +917,42 @@ class FakeClient:
                 output_dir=output_dir,
                 cantaloupe_base_url="http://localhost:8080/iiif/2",
             )
+            manifest_path = Path(manifest_report.results[0].output_path)
+
+        self.assertEqual(manifest_report.generated_count, 0)
+        self.assertEqual(manifest_report.failed_count, 1)
+        self.assertIn(
+            "source pixel dimensions are unavailable",
+            manifest_report.results[0].message.lower(),
+        )
+        self.assertFalse(manifest_path.exists())
+
+    def test_generate_manifests_creates_outputs(self):
+        from workbench_lite.check import run_check
+        from workbench_lite.generate import generate_service_jpgs
+        from workbench_lite.manifest import generate_manifests
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            package_dir = Path(temp_dir)
+            config_path, csv_path, input_dir = self.write_tiny_package(package_dir)
+            check_report = run_check(config_path=config_path, input_csv_override=csv_path)
+            output_dir = package_dir / "generated"
+
+            service_report = generate_service_jpgs(
+                upload_plan=check_report.upload_plan,
+                input_dir=input_dir,
+                output_dir=output_dir,
+                max_long_side=8,
+                quality=75,
+            )
+
+            manifest_report = generate_manifests(
+                objects=check_report.objects,
+                upload_plan=check_report.upload_plan,
+                output_dir=output_dir,
+                cantaloupe_base_url="http://localhost:8080/iiif/2",
+                page_dimensions=service_report.page_dimensions,
+            )
             payload = json.loads(Path(manifest_report.results[0].output_path).read_text(encoding="utf-8"))
 
         self.assertEqual(manifest_report.target_count, 1)
@@ -922,6 +963,12 @@ class FakeClient:
         self.assertEqual(len(payload["sequences"][0]["canvases"]), 1)
         canvas = payload["sequences"][0]["canvases"][0]
         resource = canvas["images"][0]["resource"]
+        self.assertEqual((canvas["width"], canvas["height"]), (16, 10))
+        self.assertEqual((resource["width"], resource["height"]), (16, 10))
+        self.assertIs(type(canvas["width"]), int)
+        self.assertIs(type(canvas["height"]), int)
+        self.assertIs(type(resource["width"]), int)
+        self.assertIs(type(resource["height"]), int)
         self.assertIn("service", resource)
         self.assertEqual(resource["service"]["@context"], "http://iiif.io/api/image/2/context.json")
         self.assertTrue(resource["service"]["@id"].startswith("http://localhost:8080/iiif/2/"))
@@ -937,7 +984,7 @@ class FakeClient:
             check_report = run_check(config_path=config_path, input_csv_override=csv_path)
             output_dir = package_dir / "generated"
 
-            generate_service_jpgs(
+            service_report = generate_service_jpgs(
                 upload_plan=check_report.upload_plan,
                 input_dir=input_dir,
                 output_dir=output_dir,
@@ -949,6 +996,7 @@ class FakeClient:
                 upload_plan=check_report.upload_plan,
                 output_dir=output_dir,
                 cantaloupe_base_url="http://localhost:8080/iiif/2",
+                page_dimensions=service_report.page_dimensions,
             )
             manifest_path = Path(manifest_report.results[0].output_path)
             payload = json.loads(manifest_path.read_text(encoding="utf-8"))
@@ -961,8 +1009,8 @@ class FakeClient:
         )
 
         self.assertEqual(canvas["@id"], "page/page")
-        self.assertNotIn("width", canvas)
-        self.assertNotIn("height", canvas)
+        self.assertEqual((canvas["width"], canvas["height"]), (16, 10))
+        self.assertEqual((resource["width"], resource["height"]), (16, 10))
         self.assertEqual(resource["@id"], f"{service_id}/full/!2000,2000/0/default.jpg")
         self.assertEqual(canvas["thumbnail"]["@id"], f"{service_id}/full/!160,160/0/default.jpg")
         self.assertEqual(
@@ -1005,6 +1053,8 @@ class FakeClient:
                 capture_output=True,
                 check=False,
             )
+            manifest_path = package_dir / "generated/workbench-lite/sample/manifests/parent.json"
+            manifest_payload = json.loads(manifest_path.read_text(encoding="utf-8"))
 
         self.assertEqual(result.returncode, 0, result.stderr)
         payload = json.loads(result.stdout)
@@ -1014,6 +1064,14 @@ class FakeClient:
         roles = {entry["role"] for entry in payload["results"]}
         self.assertIn("manifest", roles)
         self.assertIn("service_jpg", roles)
+        self.assertNotIn("page_dimensions", payload)
+        canvas = manifest_payload["sequences"][0]["canvases"][0]
+        resource = canvas["images"][0]["resource"]
+        self.assertEqual((canvas.get("width"), canvas.get("height")), (16, 10))
+        self.assertEqual((resource.get("width"), resource.get("height")), (16, 10))
+        self.assertEqual(canvas["@id"], "page/page")
+        self.assertTrue(resource["@id"].endswith("/full/!2000,2000/0/default.jpg"))
+        self.assertTrue(canvas["thumbnail"]["@id"].endswith("/full/!160,160/0/default.jpg"))
 
     def test_build_cantaloupe_service_id_encodes_path_separators_and_spaces(self):
         from workbench_lite.manifest import build_cantaloupe_service_id

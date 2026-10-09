@@ -183,9 +183,9 @@ class OutcomesTest(unittest.TestCase):
     def test_push_cli_reports_success_missing_and_failed_uploads(self):
         report=run_check(self.config)
         generated=self.root/'generated'
-        generate_service_jpgs(report.upload_plan,self.root,generated)
+        service_report=generate_service_jpgs(report.upload_plan,self.root,generated)
         generate_thumbnails(report.upload_plan,self.root,generated)
-        generate_manifests(report.objects,report.upload_plan,generated)
+        generate_manifests(report.objects,report.upload_plan,generated,page_dimensions=service_report.page_dimensions)
         args=['push','--execute','--config',str(self.config),'--generated-dir',str(generated),'--format','json']
         for fail,want in [(None,0),(report.upload_plan[0].key,1)]:
             with self.subTest(fail=fail):
@@ -239,9 +239,9 @@ class OutcomesTest(unittest.TestCase):
         store=Storage('workbench-lite/sample/originals/parent/parent.pdf')
         plan=run_check(self.config)
         generated=self.root/'generated'
-        generate_service_jpgs(plan.upload_plan,self.root,generated)
+        service_report=generate_service_jpgs(plan.upload_plan,self.root,generated)
         generate_thumbnails(plan.upload_plan,self.root,generated)
-        generate_manifests(plan.objects,plan.upload_plan,generated)
+        generate_manifests(plan.objects,plan.upload_plan,generated,page_dimensions=service_report.page_dimensions)
         out=io.StringIO()
         with patch('workbench_lite.cli.create_s3_client',return_value=store), contextlib.redirect_stdout(out):
             code=main(['push','--execute','--config',str(self.config),'--generated-dir',str(generated)])

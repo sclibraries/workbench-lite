@@ -401,6 +401,7 @@ def _run(args, parser) -> int:
                 ),
                 manifest_base_url=manifest_base_url,
                 journal=args.journal,
+                page_dimensions=generate_report.page_dimensions,
             )
             generate_report = _combine_generate_reports(generate_report, manifest_report)
 
@@ -551,6 +552,7 @@ def _print_generate_report(report) -> None:
 
 def _combine_generate_reports(*reports):
     results = []
+    page_dimensions = {}
     generated_count = 0
     missing_source_count = 0
     failed_count = 0
@@ -561,6 +563,7 @@ def _combine_generate_reports(*reports):
         failed_count += report.failed_count
         target_count += report.target_count
         results.extend(report.results)
+        page_dimensions.update(report.page_dimensions)
 
     return type(reports[0])(
         generated_count=generated_count,
@@ -568,6 +571,7 @@ def _combine_generate_reports(*reports):
         failed_count=failed_count,
         target_count=target_count,
         results=results,
+        page_dimensions=page_dimensions,
     )
 
 
