@@ -23,9 +23,25 @@ control. The review CSV exporter remains future work; the CLI does not currently
 produce an approved File Version handoff CSV.
 
 Before writing anything, execute checks every planned destination for existing
-content. Any existing key, even identical bytes, holds the entire batch. Additive
-reruns and reuse are unsupported. Replacement of live keys is unsupported;
-no delete, overwrite flag or automatic compensation is provided.
+content. A new key is eligible for a conditional create. An existing content key
+is reusable only when `HeadObject(ChecksumMode='ENABLED')` proves the same full
+object SHA-256 and size; matching content is recorded as previously published and
+skipped. Missing or mismatched checksum evidence, or changed bytes at an existing
+content key, holds the batch before any write. ETag is never a checksum.
+
+An existing manifest with matching SHA-256 and size is also skipped. If the newly
+generated manifest differs, the CLI records a `manifest replacement required`
+hold with the observed and planned SHA-256 values and does not write that key.
+The additive run may create and verify its new content and per-run audit keys, and
+new parents' manifests use the normal conditional-create path. Any replacement
+hold suppresses the complete-batch receipt, so the run remains held for review.
+No existing object is overwritten; replacement, deletion and automatic
+compensation remain unsupported.
+
+The push report, journal and run summary classify each planned row as `new`,
+`previously_published` or `held`. A held manifest includes its planned checksum
+and the prior full-object checksum when S3 exposes one; absent or composite
+checksum evidence is reported as unavailable and never treated as a match.
 
 Each write uses S3 `PutObject` with `IfNoneMatch='*'`, closing the race between the
 absence check and a competing creation. It never falls back to an unconditional
@@ -75,7 +91,7 @@ never delete by prefix.
 | CSV/YAML/source validation | Collect independent validation errors | Exit 3; no storage writes; held |
 | Generate | Continue independent derivatives/diagnostics | Exit 1 for processing failures; held |
 | Local push readiness | Inspect the whole local plan for missing files | Exit 1; zero uploads; held |
-| Remote access/destination checks | Stop on denial, uncertainty, collision or unsupported artifact | Exit 1; zero uploads; held |
+| Remote access/destination checks | Stop on denial, uncertain checksum evidence, or changed existing content. A differing existing manifest is recorded as a replacement hold; only new content/audit keys and new-parent manifests may proceed, and that manifest is never written. | Exit 1 for a hold/failure; publication held |
 | Data/audit upload | Stop subsequent uploads on any required failure | Exit 1; retain acknowledgments/unknown intents; no manifest; held |
 | Remote byte verification | Stop subsequent uploads on mismatch/read failure | Exit 1; acknowledged upload remains recorded; held |
 | Manifest upload/verification | Stop immediately; no automatic rollback | Exit 1; possibly directly accessible manifest; held |
@@ -106,7 +122,7 @@ crash the marker may conservatively reappear, requiring reconciliation. It must
 never be removed automatically or treated as an expired lock.
 
 `inspect-run` validates the entire journal, the frozen plan hash, exact destination
-coverage and matching upload/verification fingerprints and any recorded observed checksum/size. It requires the final success
+coverage and matching upload/verification fingerprints and any recorded observed checksum/size. A destination verified unchanged by SHA-256 can satisfy plan coverage without an upload; every other key must have an acknowledged upload and matching post-upload verification. It requires the final success
 receipt, no unknown operations and no pending marker. Changed plan, truncated
 journal, incomplete execution, dry run or missing receipt means **held**. Run IDs,
 plan hashes and publication owner are present in the receipt. New receipts explicitly

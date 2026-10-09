@@ -6,6 +6,8 @@ import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from workbench_lite.locks import WriterLocks, LockError
+from workbench_lite.locks import lock_destination
+from workbench_lite.models import UploadPlanEntry
 
 
 class LockTests(unittest.TestCase):
@@ -24,6 +26,15 @@ class LockTests(unittest.TestCase):
         with WriterLocks(self.root) as third:
             third.acquire('output:/same/path')
         self.assertEqual(list(self.root.iterdir()), [])
+
+    def test_second_additive_run_for_same_destination_is_refused(self):
+        entry = UploadPlanEntry('service_jpg', 'page.jpg', 'public', 'batch/pages/page.jpg',
+                                True, 'parent', 'page', True, True, None)
+        with WriterLocks(self.root) as first:
+            lock_destination(first, 'https://s3.example.test', [entry])
+            with WriterLocks(self.root) as second:
+                with self.assertRaisesRegex(LockError, 'Writer lock is held'):
+                    lock_destination(second, 'https://s3.example.test', [entry])
 
     def test_missing_world_writable_or_symlink_root_never_falls_back(self):
         for root in [self.root/'missing', self.root/'alias']:

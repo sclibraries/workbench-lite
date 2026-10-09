@@ -1,11 +1,14 @@
 """Publication gates protect existing keys and require complete durable evidence."""
 import contextlib
+import hashlib
 import io
 import json
 from pathlib import Path
 import tempfile
 import unittest
 from unittest.mock import patch
+
+from PIL import Image
 
 from cli_test_runner import main
 from test_outcomes import Storage, package
@@ -31,6 +34,18 @@ class PublicationTests(unittest.TestCase):
         with patch('workbench_lite.cli.create_s3_client', return_value=store), contextlib.redirect_stdout(io.StringIO()):
             return main(['push', *self.args, '--execute', '--generated-dir', str(self.output)])
 
+    def execute_json(self, store):
+        output = io.StringIO()
+        with patch('workbench_lite.cli.create_s3_client', return_value=store), contextlib.redirect_stdout(output):
+            code = main(['push', *self.args, '--execute', '--generated-dir', str(self.output), '--format', 'json'])
+        return code, json.loads(output.getvalue())
+
+    def regenerate(self):
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(main(['generate', *self.args, '--output-dir', str(self.output), '--manifests', '--thumbnails']), 0)
+        self.run = Path(json.loads((self.output/'.workbench-run.json').read_text())['run_path'])
+        self.plan = run_check(self.config, run_id=self.run.name).upload_plan
+
     def test_existing_serving_key_blocks_entire_batch_without_writes(self):
         store = Storage()
         key = next(e.key for e in self.plan if e.role == 'service_jpg')
@@ -38,6 +53,174 @@ class PublicationTests(unittest.TestCase):
         self.assertEqual(self.execute(store), 1)
         self.assertEqual(store.calls, [])
         self.assertEqual(store.written[key], b'existing live image')
+
+    def test_unchanged_package_reuses_verified_objects_and_uploads_only_new_audit(self):
+        store = Storage()
+        self.assertEqual(self.execute(store), 0)
+        prior_calls = list(store.calls)
+        prior_objects = dict(store.written)
+
+        self.regenerate()
+        code, report = self.execute_json(store)
+
+        self.assertEqual(code, 0)
+        audit = next(entry for entry in self.plan if entry.role == 'audit')
+        self.assertEqual(store.calls[len(prior_calls):], [audit.key])
+        self.assertTrue(all(store.written[key] == value for key, value in prior_objects.items()))
+        classifications = {row['key']: row['classification'] for row in report['results']}
+        self.assertEqual(classifications[audit.key], 'new')
+        self.assertTrue(all(value == 'previously_published' for key, value in classifications.items() if key != audit.key))
+        self.assertEqual(report['classification_counts']['previously_published'], len(self.plan) - 1)
+        summary = inspect_run(self.run)
+        self.assertEqual(summary['publication']['state'], 'ready_for_review')
+        self.assertTrue(all(item['classification'] == 'previously_published'
+                            for item in summary['push_artifacts'] if item['status'] == 'unchanged'))
+        self.assertIn('previously_published (unchanged)', (self.run/'summary.txt').read_text())
+
+    def test_inspection_rejects_mismatched_checksum_for_reused_key(self):
+        store = Storage()
+        self.assertEqual(self.execute(store), 0)
+        self.regenerate()
+        self.assertEqual(self.execute(store), 0)
+
+        events, error = read_events(self.run)
+        self.assertIsNone(error)
+        reused = next(event for event in events if event['kind'] == 'result'
+                      and event['stage'] == 'destination-check' and event.get('status') == 'unchanged')
+        reused['observed_checksum'] = '0' * 64
+        (self.run/'events.jsonl').write_text(''.join(json.dumps(event)+'\n' for event in events))
+
+        summary = inspect_run(self.run)
+        self.assertEqual(summary['publication']['state'], 'held')
+
+    def test_previous_receipt_without_checksum_type_remains_inspectable(self):
+        self.assertEqual(self.execute(Storage()), 0)
+        events, error = read_events(self.run)
+        self.assertIsNone(error)
+        for event in events:
+            if event.get('stage') == 'verify-upload':
+                event.pop('checksum_type', None)
+        (self.run/'events.jsonl').write_text(''.join(json.dumps(event)+'\n' for event in events))
+
+        self.assertEqual(inspect_run(self.run)['publication']['state'], 'ready_for_review')
+
+    def test_appended_page_writes_only_new_keys_and_holds_changed_parent_manifest(self):
+        store = Storage()
+        self.assertEqual(self.execute(store), 0)
+        prior_calls = list(store.calls)
+        old_manifest = next(entry.key for entry in self.plan if entry.role == 'manifest')
+        old_manifest_bytes = store.written[old_manifest]
+
+        Image.new('RGB', (9, 7), (20, 40, 60)).save(self.root/'page2.tif')
+        with (self.root/'input.csv').open('a', encoding='utf-8') as handle:
+            handle.write('Later page,page2,Page,parent,2,page2.tif\n')
+        self.regenerate()
+        code, report = self.execute_json(store)
+
+        self.assertEqual(code, 1)
+        new_entries = {entry.key for entry in self.plan if entry.page_id == 'page2'}
+        audit_key = next(entry.key for entry in self.plan if entry.role == 'audit')
+        self.assertEqual(set(store.calls[len(prior_calls):]), new_entries | {audit_key})
+        self.assertEqual(store.written[old_manifest], old_manifest_bytes)
+        manifest = next(row for row in report['results'] if row['key'] == old_manifest)
+        self.assertEqual(manifest['status'], 'held')
+        self.assertEqual(manifest['classification'], 'held')
+        self.assertEqual(manifest['previous_checksum'], hashlib.sha256(old_manifest_bytes).hexdigest())
+        self.assertEqual(manifest['checksum'], hashlib.sha256((self.output/old_manifest).read_bytes()).hexdigest())
+        self.assertIn('manifest replacement required', manifest['message'])
+        summary = inspect_run(self.run)
+        self.assertEqual(summary['publication']['state'], 'held')
+        held_summary = next(item for item in summary['push_artifacts'] if item['key'] == old_manifest)
+        self.assertEqual(held_summary['classification'], 'held')
+        self.assertEqual(held_summary['previous_checksum'], manifest['previous_checksum'])
+        self.assertEqual(held_summary['checksum'], manifest['checksum'])
+        inventory = json.loads((self.run/'rollback-inventory.json').read_text())
+        self.assertEqual({entry['key'] for entry in inventory['new_keys']}, new_entries | {audit_key})
+        self.assertIn(old_manifest, {entry['key'] for entry in inventory['held_keys']})
+
+    def test_appended_page_leaves_other_parent_manifests_untouched(self):
+        self.multi_package()
+        store = Storage()
+        self.assertEqual(self.execute(store), 0)
+        prior_calls = list(store.calls)
+        manifest_keys = {entry.object_id: entry.key for entry in self.plan if entry.role == 'manifest'}
+        prior_manifests = {key: store.written[key] for key in manifest_keys.values()}
+
+        Image.new('RGB', (11, 6), (35, 55, 75)).save(self.root/'page2b.tif')
+        with (self.root/'input.csv').open('a', encoding='utf-8') as handle:
+            handle.write('Inserted page,page2b,Page,parent2,2,page2b.tif\n')
+        self.regenerate()
+        code, report = self.execute_json(store)
+
+        self.assertEqual(code, 1)
+        changed_manifest = manifest_keys['parent2']
+        unchanged_manifests = set(manifest_keys.values()) - {changed_manifest}
+        new_entries = {entry.key for entry in self.plan if entry.page_id == 'page2b'}
+        audit_key = next(entry.key for entry in self.plan if entry.role == 'audit')
+        self.assertEqual(set(store.calls[len(prior_calls):]), new_entries | {audit_key})
+        self.assertTrue(all(store.written[key] == value for key, value in prior_manifests.items()))
+        self.assertFalse(unchanged_manifests.intersection(store.calls[len(prior_calls):]))
+        self.assertEqual(next(row for row in report['results'] if row['key'] == changed_manifest)['status'], 'held')
+
+    def test_new_parent_manifest_uses_new_key_and_can_complete_batch(self):
+        store = Storage()
+        self.assertEqual(self.execute(store), 0)
+        prior_calls = list(store.calls)
+
+        (self.root/'parent2.pdf').write_bytes(b'%PDF-1.4\n%%EOF\n')
+        Image.new('RGB', (7, 8), (70, 40, 20)).save(self.root/'page2.tif')
+        with (self.root/'input.csv').open('a', encoding='utf-8') as handle:
+            handle.write('Another parent,parent2,Paged Content,,,parent2.pdf\n')
+            handle.write('Another page,page2,Page,parent2,1,page2.tif\n')
+        self.regenerate()
+        code, report = self.execute_json(store)
+
+        self.assertEqual(code, 0)
+        new_entries = {entry.key for entry in self.plan if entry.object_id == 'parent2'}
+        audit_key = next(entry.key for entry in self.plan if entry.role == 'audit')
+        self.assertEqual(set(store.calls[len(prior_calls):]), new_entries | {audit_key})
+        new_manifest = next(entry.key for entry in self.plan if entry.role == 'manifest' and entry.object_id == 'parent2')
+        manifest_result = next(row for row in report['results'] if row['key'] == new_manifest)
+        self.assertEqual(manifest_result['classification'], 'new')
+        self.assertEqual(manifest_result['status'], 'uploaded')
+        self.assertEqual(inspect_run(self.run)['publication']['state'], 'ready_for_review')
+
+    def test_changed_existing_content_fails_before_any_write(self):
+        store = Storage()
+        self.assertEqual(self.execute(store), 0)
+        prior_calls = list(store.calls)
+        before = dict(store.written)
+
+        Image.new('RGB', (10, 10), (90, 10, 30)).save(self.root/'page.tif')
+        self.regenerate()
+        code, report = self.execute_json(store)
+
+        self.assertEqual(code, 1)
+        self.assertEqual(store.calls, prior_calls)
+        self.assertEqual(store.written, before)
+        changed = next(entry for entry in self.plan if entry.role == 'master_tiff')
+        row = next(result for result in report['results'] if result['key'] == changed.key)
+        self.assertEqual(row['classification'], 'held')
+        self.assertIn(changed.key, ' '.join(report['errors']))
+
+    def test_composite_manifest_checksum_is_not_reported_as_prior_sha256(self):
+        from workbench_lite.s3_client import VerificationResult
+
+        entry = next(entry for entry in self.plan if entry.role == 'manifest')
+        store = Storage()
+        prior = b'prior manifest bytes'
+        store.written[entry.key] = prior
+        store.verify_file = lambda *args: VerificationResult(
+            False, hashlib.sha256(prior).hexdigest(), len(prior), 's3-sha256', 'COMPOSITE'
+        )
+
+        report = push_upload_plan([entry], self.root, store, False, self.output)
+
+        self.assertEqual(report.results[0].status, 'held')
+        self.assertIsNone(report.results[0].previous_checksum)
+        self.assertEqual(report.results[0].previous_checksum_type, 'COMPOSITE')
+        self.assertIn('previous SHA-256 unavailable', report.results[0].message)
+        self.assertEqual(store.calls, [])
 
     def test_remote_mismatch_stops_before_manifest_and_holds_publication(self):
         store = Storage()

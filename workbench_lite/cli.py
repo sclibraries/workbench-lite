@@ -530,11 +530,13 @@ def _print_push_report(report) -> None:
     _print_safe(f"Missing generated: {report.missing_generated_count}")
     _print_safe(f"Uploaded entries: {report.uploaded_count}")
     _print_safe(f"Failed operations: {report.failed_count}")
+    _print_safe(f"Held entries: {report.held_count}")
+    _print_safe(f"Classifications: {json.dumps(report.classification_counts, sort_keys=True)}")
     for error in report.errors:
         _print_safe(error)
     _print_safe("Results:")
     for result in report.results:
-        _print_safe(f"  {result.status}: {result.bucket}/{result.key}: {result.message}")
+        _print_safe(f"  {result.status}: {result.classification} {result.bucket}/{result.key}: {result.message}")
     _print_safe("Role counts:")
     for role, count in sorted(report.role_counts.items()):
         _print_safe(f"  {role}: {count}")

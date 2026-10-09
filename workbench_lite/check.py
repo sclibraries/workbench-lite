@@ -184,7 +184,13 @@ def _validate_child_parent_ids(
     for row in page_rows:
         parent_id = row.get("parent_id", "")
         if not parent_id:
-            errors.append(f"Page row {row.get('id', '<unknown>')} is missing parent_id.")
+            if row.get('field_member_of', '').strip():
+                errors.append(
+                    f"Page row {row.get('id', '<unknown>')} has field_member_of; "
+                    "use parent_id = {parent id}; node IDs are retired."
+                )
+            else:
+                errors.append(f"Page row {row.get('id', '<unknown>')} is missing parent_id.")
         elif parent_id not in parent_ids:
             errors.append(
                 f"Page row {row.get('id', '<unknown>')} references missing parent_id {parent_id}."

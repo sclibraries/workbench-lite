@@ -45,6 +45,11 @@ class PushResult:
     size_bytes: Optional[int]
     message: str = ""
     required: bool = True
+    classification: str = "new"
+    previous_checksum: Optional[str] = None
+    previous_checksum_type: Optional[str] = None
+    observed_size_bytes: Optional[int] = None
+    verification_method: Optional[str] = None
 
     def to_dict(self) -> Dict[str, object]:
         return {
@@ -57,6 +62,11 @@ class PushResult:
             "size_bytes": self.size_bytes,
             "message": self.message,
             "required": self.required,
+            "classification": self.classification,
+            "previous_checksum": self.previous_checksum,
+            "previous_checksum_type": self.previous_checksum_type,
+            "observed_size_bytes": self.observed_size_bytes,
+            "verification_method": self.verification_method,
         }
 
 
@@ -82,6 +92,14 @@ class PushReport:
         return sum(result.status == "failed" for result in self.results)
 
     @property
+    def held_count(self) -> int:
+        return sum(result.classification == "held" for result in self.results)
+
+    @property
+    def classification_counts(self) -> Dict[str, int]:
+        return dict(sorted(Counter(result.classification for result in self.results).items()))
+
+    @property
     def has_errors(self) -> bool:
         return bool(self.errors or self.failed_count or self.missing_source_count or self.missing_generated_count)
 
@@ -90,6 +108,8 @@ class PushReport:
             "publication": {"state": "held", "reason": "Use inspect-run after successful finalization; this report is not a publication receipt."},
             "errors": self.errors,
             "failed_count": self.failed_count,
+            "held_count": self.held_count,
+            "classification_counts": self.classification_counts,
             "unattempted_count": sum(r.status == "unattempted" for r in self.results),
             "deferred_count": sum(r.status == "deferred" for r in self.results),
             "dry_run": self.dry_run,
@@ -130,65 +150,161 @@ def push_upload_plan(
     resolved_profile = profile or os.environ.get("AWS_PROFILE", "")
     role_counts = dict(sorted(Counter(entry.role for entry in entries).items()))
 
-    # Catch all knowable missing-file failures before the first remote write.
-    # Operation-time checks below still handle files lost after this scan.
+    # Establish every local checksum before the first remote write. A failed
+    # local check keeps the whole plan from starting, just as WBL-0605/0607 do.
     readiness_failures = {}
     errors = []
     verified = []
-    if not dry_run:
+    destinations = {}
+    for index, entry in enumerate(entries):
+        source_path = _resolve_upload_path(entry, input_dir, generated_dir)
+        try:
+            status = _entry_status(entry, source_path, dry_run, generated_dir)
+            if status in {"missing_source", "missing_generated"}:
+                readiness_failures[index] = (status, _status_message(status))
+                continue
+            if status == "would_generate":
+                destinations[index] = {"status": "unchecked", "classification": "held",
+                                       "checksum": None, "size_bytes": None}
+                continue
+            checksum = _checksum_for_entry(source_path)
+            size_bytes = source_path.stat().st_size
+            if not dry_run and size_bytes > MAX_SINGLE_PUT_BYTES:
+                readiness_failures[index] = (
+                    "failed", "Artifact exceeds the 5 GiB conditional single-PUT limit; batch held."
+                )
+                continue
+            destinations[index] = {"status": "unchecked", "classification": "new",
+                                    "checksum": checksum, "size_bytes": size_bytes}
+        except OSError as exc:
+            readiness_failures[index] = ("failed", operation_error(exc))
+
+    destination_client = preflight_client or s3_client
+    preflight_errors = []
+    if not readiness_failures and destination_client is not None:
         for index, entry in enumerate(entries):
-            source_path = _resolve_upload_path(entry, input_dir, generated_dir)
-            try:
-                status = _entry_status(entry, source_path, False, generated_dir)
-                if status in {"missing_source", "missing_generated"}:
-                    readiness_failures[index] = (status, _status_message(status))
-            except OSError as exc:
-                readiness_failures[index] = ("failed", operation_error(exc))
-
-    if not dry_run and not readiness_failures:
-        for entry in entries:
-            source = _resolve_upload_path(entry, input_dir, generated_dir)
+            local = destinations[index]
+            if local["checksum"] is None or local["size_bytes"] is None:
+                continue
             operation = None
+            evidence = {**entry.to_dict(), "checksum": local["checksum"], "size_bytes": local["size_bytes"]}
             try:
-                if source.stat().st_size > MAX_SINGLE_PUT_BYTES:
-                    errors.append('Artifact exceeds the 5 GiB conditional single-PUT limit; batch held.')
-                    break
                 if journal:
-                    operation = journal.intent('destination-check', entry.to_dict())
-                exists = (preflight_client or s3_client).object_exists(entry.bucket, entry.key)
+                    operation = journal.intent("destination-check", evidence)
+                exists = destination_client.object_exists(entry.bucket, entry.key)
+                if not exists:
+                    local.update(status="absent", classification="new")
+                    result = {**evidence, "status": "absent", "classification": "new"}
+                else:
+                    remote = destination_client.verify_file(
+                        entry.bucket, entry.key, local["checksum"], local["size_bytes"]
+                    )
+                    if not isinstance(remote, VerificationResult):
+                        remote = VerificationResult(False, None, None, "missing-evidence")
+                    remote_matches = (
+                        remote.matches
+                        and remote.checksum == local["checksum"]
+                        and remote.size_bytes == local["size_bytes"]
+                        and remote.checksum_type == "FULL_OBJECT"
+                        and remote.method in {"s3-sha256", "s3-sha256+readback"}
+                    )
+                    remote_evidence = remote.evidence()
+                    local.update(
+                        status="unchanged" if remote_matches else ("held" if entry.role == "manifest" else "conflict"),
+                        classification="previously_published" if remote_matches else "held",
+                        previous_checksum=remote.checksum if remote.checksum_type == "FULL_OBJECT" else None,
+                        previous_checksum_type=remote.checksum_type,
+                        observed_size_bytes=remote.size_bytes,
+                        verification_method=remote.method,
+                        message="" if remote_matches else _existing_mismatch_message(
+                            entry, local["checksum"],
+                            remote.checksum if remote.checksum_type == "FULL_OBJECT" else None,
+                        ),
+                    )
+                    result = {**evidence, **remote_evidence, "status": local["status"],
+                              "classification": local["classification"], "message": local["message"]}
+                    if remote_matches:
+                        verified.append({**evidence, "verification_method": remote.method})
+                    elif entry.role != "manifest":
+                        preflight_errors.append(local["message"])
                 if journal:
-                    journal.result(operation, 'destination-check', {**entry.to_dict(), 'status': 'conflict' if exists else 'absent'})
-                if exists:
-                    errors.append(f'Existing destination blocks the entire batch: {entry.bucket}/{entry.key}')
-                    break
+                    journal.result(operation, "destination-check", result)
             except STORAGE_ERRORS as exc:
-                errors.append('Destination readiness failed: ' + operation_error(exc))
+                message = "Destination readiness failed: " + operation_error(exc)
+                local.update(status="failed", classification="held", message=message)
+                preflight_errors.append(message)
                 if journal:
-                    journal.result(operation, 'destination-check', {**entry.to_dict(), 'status': 'failed', 'message': operation_error(exc)})
-                break
+                    journal.result(operation, "destination-check", {
+                        **evidence, "status": "failed", "classification": "held", "message": message
+                    })
+    elif not dry_run and destination_client is None and not readiness_failures:
+        preflight_errors.append("Destination readiness failed: no read-only S3 client is available.")
 
+    errors.extend(preflight_errors)
     results: List[PushResult] = []
-    stopped = bool(errors)
+    stopped = bool(readiness_failures or preflight_errors)
     for index, entry in enumerate(entries):
         source_path = _resolve_upload_path(entry, input_dir, generated_dir)
         checksum = None
         size_bytes = None
         operation_id = None
         remote_unknown = False
+        classification = "held" if stopped else "new"
+        previous_checksum = None
+        previous_checksum_type = None
+        observed_size_bytes = None
+        verification_method = None
+        destination = destinations.get(index, {})
         if readiness_failures:
             status, message = readiness_failures.get(index, (
                 "unattempted", "Not attempted because batch upload readiness failed."
             ))
+            classification = "held"
+        elif destination.get("status") == "unchanged":
+            status = "unchanged"
+            message = "Previously published object verified by SHA-256; skipped."
+            classification = "previously_published"
+            checksum = destination.get("checksum")
+            size_bytes = destination.get("size_bytes")
+            previous_checksum = destination.get("previous_checksum")
+            previous_checksum_type = destination.get("previous_checksum_type")
+            observed_size_bytes = destination.get("observed_size_bytes")
+            verification_method = destination.get("verification_method")
+        elif destination.get("status") == "held":
+            status = "held"
+            message = destination.get("message", "Manifest replacement required; batch publication held.")
+            classification = "held"
+            checksum = destination.get("checksum")
+            size_bytes = destination.get("size_bytes")
+            previous_checksum = destination.get("previous_checksum")
+            previous_checksum_type = destination.get("previous_checksum_type")
+            observed_size_bytes = destination.get("observed_size_bytes")
+            verification_method = destination.get("verification_method")
+            errors.append(message)
+        elif destination.get("status") == "conflict":
+            status = "failed"
+            message = destination.get("message", "Existing content cannot be overwritten.")
+            classification = "held"
+            checksum = destination.get("checksum")
+            size_bytes = destination.get("size_bytes")
+            previous_checksum = destination.get("previous_checksum")
+            previous_checksum_type = destination.get("previous_checksum_type")
+            observed_size_bytes = destination.get("observed_size_bytes")
+        elif destination.get("status") == "failed":
+            status = "failed"
+            message = destination.get("message", "Destination readiness failed.")
+            classification = "held"
         elif stopped:
             status = "unattempted"
-            message = "Not attempted after a required operation failed."
+            message = "Not attempted because batch upload readiness failed."
+            classification = destination.get("classification", "held")
         else:
             upload_started = False
             try:
                 status = _entry_status(entry, source_path, dry_run, generated_dir)
                 if status == "would_upload":
-                    checksum = _checksum_for_entry(source_path)
-                    size_bytes = source_path.stat().st_size
+                    checksum = destination.get("checksum") or _checksum_for_entry(source_path)
+                    size_bytes = destination.get("size_bytes") or source_path.stat().st_size
                     if not dry_run:
                         if journal:
                             operation_id = journal.intent("push", {**entry.to_dict(), "checksum": checksum, "size_bytes": size_bytes})
@@ -198,14 +314,22 @@ def push_upload_plan(
                         s3_client.upload_file(source_path, entry.bucket, entry.key, checksum)
                         status = "uploaded"
                 message = _status_message(status)
+                if dry_run and destination_client is None and destination.get("status") == "unchecked":
+                    classification = "held"
+                    message = "Remote destinations were not checked; dry-run does not establish prior publication."
             except STORAGE_ERRORS as exc:
                 status = "failed"
                 message = operation_error(exc)
+                classification = "held"
                 if upload_started:
                     remote_unknown = True
                     message += " Remote outcome unknown; inspect storage before retry or rollback."
             if not dry_run and status in {"missing_source", "missing_generated", "failed"}:
                 stopped = True
+            if destination.get("status") == "unchecked":
+                classification = destination.get("classification", "held")
+        if status == "failed" and message not in errors:
+            errors.append(message)
         results.append(PushResult(
             role=entry.role,
             source_path=str(source_path) if entry.generated and generated_dir is not None else entry.source_path,
@@ -216,6 +340,11 @@ def push_upload_plan(
             size_bytes=size_bytes,
             message=message,
             required=True,
+            classification=classification,
+            previous_checksum=previous_checksum,
+            previous_checksum_type=previous_checksum_type,
+            observed_size_bytes=observed_size_bytes,
+            verification_method=verification_method,
         ))
 
         if journal:
@@ -229,14 +358,24 @@ def push_upload_plan(
                 matches = s3_client.verify_file(entry.bucket, entry.key, checksum, size_bytes)
                 if not isinstance(matches, VerificationResult):
                     matches = VerificationResult(False, None, None, 'missing-evidence')
-                verification_message = '' if matches else 'Remote bytes do not match the uploaded artifact.'
+                verified_upload = (
+                    matches.matches
+                    and matches.checksum == checksum
+                    and matches.size_bytes == size_bytes
+                    and matches.checksum_type == 'FULL_OBJECT'
+                    and matches.method in {'s3-sha256', 's3-sha256+readback'}
+                )
+                verification_message = '' if verified_upload else 'Remote bytes do not match the uploaded artifact.'
             except STORAGE_ERRORS as exc:
                 matches = False
+                verified_upload = False
                 verification_message = operation_error(exc)
             if journal:
                 observed = matches.evidence() if hasattr(matches, 'evidence') else {}
-                journal.result(verification, 'verify-upload', {**identity, **observed, 'status': 'verified' if matches else 'failed', 'message': verification_message})
-            if matches:
+                journal.result(verification, 'verify-upload', {**identity, **observed,
+                                                               'status': 'verified' if verified_upload else 'failed',
+                                                               'message': verification_message})
+            if verified_upload:
                 verified.append(identity)
             else:
                 errors.append('Upload verification failed: ' + verification_message)
@@ -276,6 +415,15 @@ def push_upload_plan(
         results=results,
         errors=errors,
     )
+
+
+def _existing_mismatch_message(entry: UploadPlanEntry, planned_checksum: str, previous_checksum: Optional[str]) -> str:
+    previous = previous_checksum or "unavailable"
+    if entry.role == "manifest":
+        return (f"manifest replacement required for {entry.bucket}/{entry.key}; "
+                f"previous SHA-256 {previous}, planned SHA-256 {planned_checksum}.")
+    return (f"Changed or unverifiable content at existing key {entry.bucket}/{entry.key}; "
+            f"previous SHA-256 {previous}, planned SHA-256 {planned_checksum}. Refusing to overwrite.")
 
 
 def _entry_status(

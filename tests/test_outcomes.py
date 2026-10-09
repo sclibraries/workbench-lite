@@ -90,6 +90,20 @@ class OutcomesTest(unittest.TestCase):
         (self.root/'audit/upload-plan.json').write_text('{}')
         return entries
 
+    def test_field_member_of_without_parent_id_reports_current_package_fix(self):
+        (self.root / 'input.csv').write_text(
+            'title,id,field_model,parent_id,field_weight,file,field_member_of\n'
+            'Parent,parent,Paged Content,,,parent.pdf,\n'
+            'Page,page,Page,,1,page.tif,old-node-17\n'
+        )
+
+        report = run_check(self.config)
+
+        self.assertIn(
+            'Page row page has field_member_of; use parent_id = {parent id}; node IDs are retired.',
+            report.validation_errors,
+        )
+
     def test_all_content_and_required_audit_precede_manifests(self):
         store = Storage()
         report = push_upload_plan(self.plan(), self.root, store, False, self.root)

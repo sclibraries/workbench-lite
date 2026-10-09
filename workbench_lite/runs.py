@@ -158,17 +158,40 @@ def publication_status(path, events, state, pending, error):
         expected = {(e['bucket'], e['key']) for e in plan}
         start = max(i for i, e in enumerate(events) if e['kind'] == 'stage_started' and e['stage'] == 'push')
         results = [e for e in events[start:] if e['kind'] == 'result']
+        destination_checks = [e for e in results if e['stage'] == 'destination-check']
+        destinations = {(e['bucket'], e['key']): e.get('status') for e in destination_checks}
+        if (len(destinations) != len(destination_checks) or set(destinations) != expected
+                or any(status not in {'absent', 'unchanged'} for status in destinations.values())):
+            return held
         uploads = {(e['bucket'], e['key']): (e['checksum'], e['size_bytes']) for e in results
                    if e['stage'] == 'push' and e.get('status') == 'uploaded'}
+        reused = {}
+        for event in results:
+            if event['stage'] != 'destination-check' or event.get('status') != 'unchanged':
+                continue
+            if (event.get('verification_method') not in {'s3-sha256', 's3-sha256+readback'}
+                    or event.get('checksum_type') != 'FULL_OBJECT'
+                    or event.get('observed_checksum') != event.get('checksum')
+                    or event.get('observed_size_bytes') != event.get('size_bytes')):
+                return held
+            reused[(event['bucket'], event['key'])] = (event['checksum'], event['size_bytes'])
+        verified_events = [event for event in results
+                           if event['stage'] == 'verify-upload' and event.get('status') == 'verified']
         for event in results:
             if event['stage'] == 'verify-upload' and event.get('status') == 'verified':
                 if (event.get('verification_method') not in {'s3-sha256', 's3-sha256+readback'}
+                        # Before checksum_type was journaled, verified uploads
+                        # already required a FULL_OBJECT S3 checksum.
+                        or event.get('checksum_type', 'FULL_OBJECT') != 'FULL_OBJECT'
                         or event.get('observed_checksum') != event['checksum']
                         or event.get('observed_size_bytes') != event['size_bytes']):
                     return held
-        verified = {(e['bucket'], e['key']): (e['checksum'], e['size_bytes']) for e in results
-                    if e['stage'] == 'verify-upload' and e.get('status') == 'verified'}
-        if (not expected or set(uploads) != expected or verified != uploads
+        verified = {(e['bucket'], e['key']): (e['checksum'], e['size_bytes']) for e in verified_events}
+        absent = {identity for identity, status in destinations.items() if status == 'absent'}
+        previously_published = {identity for identity, status in destinations.items() if status == 'unchanged'}
+        if (not expected or set(uploads) != absent or set(reused) != previously_published
+                or set(uploads).intersection(reused) or set(uploads) | set(reused) != expected
+                or verified != uploads or len(verified_events) != len(uploads)
                 or receipt['verified_count'] != len(plan)
                 or sum(e['role'] == 'manifest' for e in plan) < 1
                 or receipt['manifest_count'] != sum(e['role'] == 'manifest' for e in plan)):
@@ -197,6 +220,23 @@ def inspect_run(path):
                 pending.pop(event.get('operation_id'), None)
             status = event.get('status', 'unknown')
             counts[status] = counts.get(status, 0) + 1
+    push_starts = [index for index, event in enumerate(events)
+                   if event['kind'] == 'stage_started' and event['stage'] in {'push', 'push-dry-run'}]
+    push_artifacts = []
+    if push_starts:
+        start = push_starts[-1]
+        for event in events[start:]:
+            if event['kind'] != 'result' or event.get('stage') != 'push' or not event.get('classification'):
+                continue
+            push_artifacts.append({key: event[key] for key in (
+                'bucket', 'key', 'role', 'object_id', 'page_id', 'status', 'classification',
+                'checksum', 'previous_checksum', 'previous_checksum_type', 'observed_checksum', 'size_bytes',
+                'observed_size_bytes', 'verification_method', 'message'
+            ) if key in event})
+    classification_counts = {}
+    for artifact in push_artifacts:
+        classification = artifact['classification']
+        classification_counts[classification] = classification_counts.get(classification, 0) + 1
     incomplete = active is not None or not events
     if active:
         alive = False
@@ -217,6 +257,7 @@ def inspect_run(path):
         'state': state, 'exit_code': code, 'incomplete_stage': incomplete,
         'inferred_interruption': incomplete and state == 'interrupted',
         'journal_error': error, 'event_count': len(events), 'counts': counts,
+        'classification_counts': classification_counts, 'push_artifacts': push_artifacts,
         'publication': publication_status(path, events, state, pending, error),
         'unknown_operations': [{**event, 'outcome': 'unknown'} for event in pending.values()],
     }
@@ -330,10 +371,18 @@ class RunJournal:
     def summarize(self):
         summary = inspect_run(self.path)
         atomic_write(self.path / 'summary.json', json_bytes(summary))
+        artifacts = '\n'.join(
+            f"  {item['classification']} ({item['status']}): {item['bucket']}/{item['key']}"
+            for item in summary['push_artifacts']
+        )
+        if not artifacts:
+            artifacts = '  none'
         text = (f"Run: {self.run_id}\nState: {summary['state']}\n"
                 f"Exit code: {summary['exit_code']}\nEvents: {summary['event_count']}\n"
                 f"Unknown operations: {len(summary['unknown_operations'])}\n"
                 f"Counts: {json.dumps(summary['counts'], sort_keys=True)}\n"
+                f"Classifications: {json.dumps(summary['classification_counts'], sort_keys=True)}\n"
+                f"Artifacts:\n{artifacts}\n"
                 "Publication: inspect-run is authoritative; this cached summary cannot authorize handoff.\n")
         atomic_write(self.path / 'summary.txt', text.encode('utf-8'))
 

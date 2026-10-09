@@ -11,7 +11,8 @@ workbench-lite rollback-inventory workbench-lite-runs/RUN_ID --output /secure/pa
 
 The JSON includes the run/batch identity, input hashes and sanitized references,
 planned objects, recorded operation outcomes, confirmed new S3 keys, unknown
-outcomes, local derivatives, and manifest URLs when a base URL was configured in
+outcomes, previously published objects reused by checksum, manifest replacement
+holds, local derivatives, and manifest URLs when a base URL was configured in
 YAML or passed to `generate --manifest-base-url`. These URLs follow the generated
 manifest `@id` and are listed only for confirmed uploads.
 Older generated folders may have no recorded generate stage. For those
@@ -35,12 +36,15 @@ inventory state, govern publication handoff.
 
 A dry-run inventory has `mode: preview` and no confirmed new keys. During execute,
 a key enters `new_keys` only if the durable journal records both an absent
-destination check and an acknowledged upload. A preexisting key enters
-`conflicts`. `unchanged_keys` remains empty because the current CLI blocks
-existing keys without comparing their contents; it does not replace them.
-`unchanged_keys` and `replacements` are reserved for a future additive-rerun
-workflow. Empty lists in the current new-keys-only mode are not proof that
-remote content was compared or that replacement was attempted.
+destination check and an acknowledged upload. An existing content key enters
+`unchanged_keys` only when S3 SHA-256 and size match the current local artifact;
+it is skipped and never becomes rollback deletion scope. Changed existing content
+enters `conflicts`. A differing existing manifest enters `held_keys` with its
+observed prior full-object checksum when S3 provides one, plus its planned
+checksum; otherwise the prior checksum is reported unavailable and the manifest
+stays held. It is not a replacement and is not included in `new_keys`.
+`replacements` remains empty until WBL-0307b defines a
+recoverable overwrite path. These distinctions do not authorize any deletion.
 An upload intent with a missing or uncertain acknowledgment enters
 `unknown_keys`, and the inventory state becomes `needs_reconciliation`. A damaged
 journal or plan produces `invalid_evidence`. An interrupted stage reports

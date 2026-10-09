@@ -82,7 +82,7 @@ def build_inventory(run_path):
         if target is not None:
             target[_identity(event)] = event
 
-    new_keys, unknown_keys, conflicts, unchanged_keys, replacements = [], [], [], [], []
+    new_keys, unknown_keys, conflicts, unchanged_keys, held_keys, replacements = [], [], [], [], [], []
     ownership_uncertain = False
     for entry in plan:
         identity = _identity(entry)
@@ -91,11 +91,26 @@ def build_inventory(run_path):
         item['destination_status'] = check.get('status') if check else 'not_checked'
         item['upload_status'] = upload.get('status') if upload else 'not_attempted'
         item['verification_status'] = verified.get('status') if verified else 'not_verified'
+        if check:
+            item['classification'] = check.get('classification')
+            for source, target in (('checksum', 'checksum'), ('size_bytes', 'size_bytes'),
+                                   ('observed_checksum', 'observed_checksum'),
+                                   ('observed_size_bytes', 'previous_size_bytes'),
+                                   ('verification_method', 'verification_method'),
+                                   ('checksum_type', 'checksum_type')):
+                if source in check:
+                    item[target] = check[source]
+            if check.get('checksum_type') == 'FULL_OBJECT' and check.get('observed_checksum'):
+                item['previous_checksum'] = check['observed_checksum']
         if upload and upload.get('status') == 'uploaded':
             item.update({key: upload.get(key) for key in ('checksum', 'size_bytes')})
         if mode != 'execute':
             continue
-        if check and check.get('status') == 'conflict':
+        if check and check.get('status') == 'unchanged':
+            unchanged_keys.append(item)
+        elif check and check.get('status') == 'held':
+            held_keys.append(item)
+        elif check and check.get('status') in {'conflict', 'failed'}:
             conflicts.append(item)
             if upload and upload.get('status') == 'uploaded':
                 ownership_uncertain = True
@@ -159,7 +174,8 @@ def build_inventory(run_path):
         'pending_operations': [{key: op.get(key) for key in ('sequence', 'stage', 'operation_id', 'bucket', 'key', 'role') if key in op}
                                for op in unresolved],
         'new_keys': new_keys, 'unknown_keys': unknown_keys,
-        'conflicts': conflicts, 'unchanged_keys': unchanged_keys, 'replacements': replacements,
+        'conflicts': conflicts, 'unchanged_keys': unchanged_keys, 'held_keys': held_keys,
+        'replacements': replacements,
         'local_derivatives': derivatives, 'manifest_urls': manifest_urls,
         'aspace': {'changes': [], 'previous_values': [], 'status': 'deferred-to-reviewed-csv'},
         'evidence_errors': [error for error in (journal_error, plan_error, metadata_error) if error],

@@ -26,7 +26,7 @@ Push now performs bounded read-only preflight by default for both dry-run and ex
 - Durable intent/result records for those calls and safe error codes on failure.
 - Read-access status and **write permission: unverified**.
 
-Only the preflight client uses five-second connect/read timeouts and one total SDK attempt. Execute creates a separate upload client after successful preflight, without overriding SDK timeout/retry configuration (including profile/environment settings). Dry runs create no upload client. No PutObject probe, delete, ACL update or other remote mutation is used to test permissions. Read checks do not prove PutObject permission, validate all existing objects, or authorize replacement. Failed access checks prevent uploads. Existing destination keys are rejected before execute and writes use conditional creation; see [publication holds](publication-holds.md).
+Only the preflight client uses five-second connect/read timeouts and one total SDK attempt. Execute creates a separate upload client after successful preflight, without overriding SDK timeout/retry configuration (including profile/environment settings). Dry runs create no upload client. No PutObject probe, delete, ACL update or other remote mutation is used to test permissions. Bucket access checks do not prove PutObject permission or authorize replacement. Before execute, every planned key is checked: matching existing content is verified by SHA-256 and size then skipped; changed content is rejected; a differing manifest is held for review. New writes use conditional creation. See [publication holds](publication-holds.md).
 
 For explicitly local checks without credentials or network access:
 

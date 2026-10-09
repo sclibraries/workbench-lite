@@ -12,13 +12,14 @@ class VerificationResult:
     checksum: Optional[str]
     size_bytes: Optional[int]
     method: str
+    checksum_type: str = 'FULL_OBJECT'
 
     def __bool__(self):
         return self.matches
 
     def evidence(self):
         return {'observed_checksum': self.checksum, 'observed_size_bytes': self.size_bytes,
-                'verification_method': self.method}
+                'verification_method': self.method, 'checksum_type': self.checksum_type}
 
 
 class Boto3S3Client:
@@ -64,9 +65,9 @@ class Boto3S3Client:
         except (binascii.Error, ValueError, TypeError):
             pass
         size = metadata.get('ContentLength')
-        matches = (stored == checksum and size == size_bytes
-                   and metadata.get('ChecksumType', 'FULL_OBJECT') == 'FULL_OBJECT')
-        result = VerificationResult(matches, stored, size, 's3-sha256')
+        checksum_type = metadata.get('ChecksumType', 'FULL_OBJECT')
+        matches = stored == checksum and size == size_bytes and checksum_type == 'FULL_OBJECT'
+        result = VerificationResult(matches, stored, size, 's3-sha256', checksum_type)
         if not matches or not self.full_readback:
             return result
         response = self.client.get_object(Bucket=bucket, Key=key)
@@ -78,7 +79,7 @@ class Boto3S3Client:
                 length += len(chunk)
                 digest.update(chunk)
             return VerificationResult(length == size_bytes and digest.hexdigest() == checksum,
-                                      digest.hexdigest(), length, 's3-sha256+readback')
+                                      digest.hexdigest(), length, 's3-sha256+readback', checksum_type)
         finally:
             body.close()
 
