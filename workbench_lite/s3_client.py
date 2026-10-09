@@ -22,6 +22,14 @@ class VerificationResult:
                 'verification_method': self.method, 'checksum_type': self.checksum_type}
 
 
+@dataclass(frozen=True)
+class ObjectIdentity:
+    checksum: Optional[str]
+    size_bytes: Optional[int]
+    checksum_type: Optional[str]
+    etag: Optional[str]
+
+
 class Boto3S3Client:
     def __init__(self, client, *, full_readback=False):
         self.client = client
@@ -46,6 +54,43 @@ class Boto3S3Client:
             if exc.response.get('Error', {}).get('Code') in {'404', 'NoSuchKey', 'NotFound'}:
                 return False
             raise
+
+    def inspect_object(self, bucket, key):
+        """Read the current full-object checksum, size and ETag, or return None."""
+        from botocore.exceptions import ClientError
+        try:
+            metadata = self.client.head_object(
+                Bucket=bucket, Key=key, ChecksumMode='ENABLED'
+            )
+        except ClientError as exc:
+            error = exc.response.get('Error', {})
+            status = exc.response.get('ResponseMetadata', {}).get('HTTPStatusCode')
+            if status == 404 or error.get('Code') in {'404', 'NoSuchKey', 'NotFound'}:
+                return None
+            raise
+
+        checksum = None
+        try:
+            decoded = base64.b64decode(metadata.get('ChecksumSHA256') or '', validate=True)
+            if len(decoded) == 32:
+                checksum = decoded.hex()
+        except (binascii.Error, ValueError, TypeError):
+            pass
+        return ObjectIdentity(
+            checksum=checksum,
+            size_bytes=metadata.get('ContentLength'),
+            checksum_type=metadata.get('ChecksumType', 'FULL_OBJECT'),
+            etag=metadata.get('ETag'),
+        )
+
+    def delete_object(self, bucket, key, *, if_match):
+        """Delete only with an ETag precondition; never fall back to an unconditional call."""
+        if not isinstance(if_match, str) or not if_match:
+            raise ValueError('Conditional delete requires the current ETag.')
+        model = self.client.meta.service_model.operation_model('DeleteObject')
+        if 'IfMatch' not in model.input_shape.members:
+            raise OSError('Installed SDK lacks conditional DeleteObject support; upgrade boto3.')
+        return self.client.delete_object(Bucket=bucket, Key=key, IfMatch=if_match)
 
     def upload_file(self, source_path, bucket, key, checksum):
         # A HEAD alone cannot prevent a competing writer replacing a serving key.

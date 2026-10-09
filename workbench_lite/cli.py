@@ -19,6 +19,7 @@ from .runs import RunJournal, JournalError, inspect_run, read_events, digest
 from .locks import WriterLocks, LockError, lock_output_and_run, lock_destination
 from .preflight import output_readiness, storage_readiness
 from .rollback_inventory import build_inventory, write_inventory
+from .rollback import run_rollback
 
 
 def main(argv=None, *, lock_factory=WriterLocks) -> int:
@@ -90,6 +91,19 @@ def main(argv=None, *, lock_factory=WriterLocks) -> int:
     inventory_parser.add_argument("path", type=Path)
     inventory_parser.add_argument("--output", type=Path)
     inventory_parser.add_argument("--format", choices=["text", "json"], default="text")
+    rollback_parser = subparsers.add_parser(
+        "rollback", help="Preview or safely remove a run's confirmed new S3 objects"
+    )
+    rollback_parser.add_argument("path", type=Path, help="Source run directory")
+    rollback_parser.add_argument("--config", required=True, type=Path,
+                                 help="Current YAML config; bucket settings must match the source run")
+    rollback_parser.add_argument("--execute", action="store_true",
+                                 help="Execute the deletion plan after matching confirmation")
+    rollback_parser.add_argument("--confirm", help="Source RUN_ID required with --execute")
+    rollback_parser.add_argument("--endpoint-url", default=None)
+    rollback_parser.add_argument("--region", default=None)
+    rollback_parser.add_argument("--profile", default=None)
+    rollback_parser.add_argument("--format", choices=["text", "json"], default="text")
     for command_parser in [check_parser, push_parser, generate_parser, verify_parser]:
         command_parser.add_argument("--run-dir", type=Path, default=Path("workbench-lite-runs"))
 
@@ -123,6 +137,8 @@ def main(argv=None, *, lock_factory=WriterLocks) -> int:
               f"Unknown outcomes: {len(inventory['unknown_keys'])}\n"
               "Deletion authorized: no")
         return 1 if inventory['state'] in {'needs_reconciliation', 'invalid_evidence', 'incomplete_stage'} else 0
+    if args.command == 'rollback':
+        return _run_rollback_command(args, lock_factory)
     journal = None
     locks = lock_factory()
     args.locks = locks
@@ -201,6 +217,62 @@ def main(argv=None, *, lock_factory=WriterLocks) -> int:
             except JournalError as exc:
                 _print_error(args, str(exc))
                 raise SystemExit(1) from exc
+
+
+def _run_rollback_command(args, lock_factory) -> int:
+    if args.execute and not args.confirm:
+        _print_error(args, 'rollback --execute requires --confirm matching the source run ID.')
+        return 1
+    if args.confirm and not args.execute:
+        _print_error(args, 'rollback --confirm is valid only with --execute.')
+        return 1
+
+    locks = lock_factory()
+    code = 1
+    try:
+        client = create_s3_client(
+            args.endpoint_url, args.region, args.profile, preflight=True
+        )
+        report = run_rollback(
+            args.path, client, execute=args.execute, confirm=args.confirm,
+            config_path=args.config, locks=locks,
+        )
+        _print_rollback_report(report, args.format)
+        code = report['exit_code']
+    except (ConfigError, JournalError, LockError) as exc:
+        _print_error(args, str(exc))
+    except STORAGE_ERRORS as exc:
+        _print_error(args, operation_error(exc))
+    finally:
+        try:
+            locks.release()
+        except LockError as exc:
+            _print_error(args, str(exc))
+            code = 1
+    return code
+
+
+def _print_rollback_report(report, output_format):
+    if output_format == 'json':
+        print(json.dumps(sanitize(report), indent=2))
+        return
+    _print_safe(f"Rollback {report['mode']}: {report['source_run_id']}")
+    if report.get('rollback_run_id'):
+        _print_safe(f"Rollback run: {report['rollback_run_id']}")
+    for item in report['results']:
+        checksum = item.get('checksum') or 'unavailable'
+        _print_safe(f"  {item['status']}: {item.get('bucket')}/{item.get('key')} "
+                    f"[{item.get('role')}; sha256={checksum}]")
+        if item.get('reason'):
+            _print_safe(f"    {item['reason']}")
+    if report.get('exclusions'):
+        _print_safe('Excluded from deletion:')
+        for item in report['exclusions']:
+            _print_safe(f"  {item.get('bucket')}/{item.get('key')}: {item['reason']}")
+    _print_safe('Notes:')
+    for note in report['notes']:
+        _print_safe(f"  - {note}")
+    _print_safe(f"State: {report['state']}; exit: {report['exit_code']}")
 
 
 def _open_run(args):

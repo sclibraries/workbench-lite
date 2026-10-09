@@ -53,12 +53,59 @@ The valid journal prefix still shows
 acknowledged writes, but it does not resolve missing evidence. An acknowledged
 write remains listed even if later verification or another upload fails.
 
-Every inventory has `deletion_authorized: false`. A future rollback command needs a
-read-only preview, current-object identity checks, and explicit authorization before
-any delete/restore operation. For each new key, it must compare the current S3
-checksum with the inventory's uploaded checksum before deleting it; mere key
-existence is insufficient, including when this run's verification failed. Do
-not delete by prefix or act on `new_keys` alone;
-inspect unknown outcomes, later object changes, and the full run first. The
-publication hold described in [publication-holds.md](publication-holds.md) stays
-in force until recovery and review are complete.
+Every inventory has `deletion_authorized: false`; the inventory itself never grants
+permission to delete. The `rollback` command adds a read-only preview and explicit
+authorization:
+
+```sh
+workbench-lite rollback workbench-lite-runs/RUN_ID --config package.yml
+workbench-lite rollback workbench-lite-runs/RUN_ID --config package.yml --execute --confirm RUN_ID \
+  --profile APPROVED_PROFILE --endpoint-url APPROVED_ENDPOINT --region APPROVED_REGION
+```
+
+Review the full preview first. It lists every proposed key with bucket, key, role
+and recorded SHA-256, plus exclusions and reasons. Execution requires a complete,
+reviewable execute inventory and the matching source run ID. Preview runs,
+unknown or pending operations, incomplete/damaged evidence, and inventories with
+replacement entries are refused. The command only considers `new_keys`; it never
+deletes unchanged, held, conflicting, unknown, or unrelated objects. It scans later
+local run journals and leaves keys reused by a later run as conflicts. Journals on
+other machines cannot be seen, so that dependency scan is local to the configured
+run root.
+
+Immediately before each delete, the command reads the current S3 `FULL_OBJECT`
+SHA-256 and size. Both must match the acknowledged upload evidence. A mismatch is a
+conflict and the object stays. If the object is absent, the result is
+`already_deleted`. The delete request also sends the current ETag in `If-Match` as
+an extra guard. A 412 is recorded as a conflict and no retry or unconditional
+delete is attempted. The checksum-and-size comparison is the required identity
+guard; never remove it even on endpoints that ignore `If-Match`.
+
+Rollback order is manifests, derivatives, masters, then audit objects. Rollback
+uses the same package/destination locks as writers and records each delete intent
+and result in its own run journal. An interrupted rollback can be rerun against
+the same source run. Once execution starts, `rollback-hold.json` permanently keeps
+the source run held; publishing again requires a new run. Workbench-lite does not
+restore ArchivesSpace File Versions. Staff must separately review the update CSV
+and restore any prior File Version value when needed. Delete recoverability depends
+on bucket versioning, which has not been confirmed for this bucket.
+
+### Before the first real rollback
+
+Before the first rollback against a real S3 environment, an authorized operator
+must probe the **staging bucket** once to confirm that a stale ETag is rejected
+with HTTP 412. Use a new, unique key and synthetic bytes in the approved staging
+bucket: upload version A, record its ETag, overwrite that same synthetic key with
+version B, then issue `DeleteObject` with version A's stale ETag. The expected
+result is HTTP 412 under [S3 conditional-delete behavior](https://docs.aws.amazon.com/AmazonS3/latest/userguide/conditional-deletes.html).
+Confirm version B is still present, then remove only this probe object using its
+current ETag. If the stale-ETag request succeeds, returns anything
+other than 412, or version B is missing, stop; do not run rollback until the
+endpoint behavior has been reviewed. Do not use a production object for this
+probe. This staging probe is a required future runbook step and was not run during
+implementation.
+
+LocalStack 3.8.1 was separately observed to ignore stale `If-Match` and return 204.
+The LocalStack rehearsal therefore relies on the required checksum-and-size check;
+it does not certify conditional-delete enforcement. Never fall back to an
+unconditional delete if an SDK or endpoint rejects `If-Match`.

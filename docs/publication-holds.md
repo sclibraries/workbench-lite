@@ -166,10 +166,13 @@ For the current general-purpose S3 bucket flow, the operator/service role needs:
 | `s3:ListBucket` | Each destination bucket ARN, for HeadBucket/ListObjectsV2 preflight and unambiguous missing-key checks |
 | `s3:GetObject` | Approved object prefixes, for HeadObject checksum/size and optional full readback |
 | `s3:PutObject` | Approved object prefixes, for conditional creation with SHA-256 |
+| `s3:DeleteObject` | Approved object prefixes, for an explicitly authorized rollback using conditional `If-Match`; not needed for normal publication |
 | `kms:GenerateDataKey`, `kms:Decrypt` when using SSE-KMS | Applicable KMS key, permitted by IAM and key policy, for encrypted upload/checksum retrieval |
 
-There is no `s3:HeadObject` IAM action. `ListAllMyBuckets` and delete permission are
-not needed by this flow. `s3:ListBucket` is bucket-scoped, not an object-ARN action.
+There is no `s3:HeadObject` IAM action. `ListAllMyBuckets` is not needed. Conditional
+deletes with an ETag require both `s3:DeleteObject` and `s3:GetObject`; keep delete
+permission restricted to the authorized rollback role and approved prefixes.
+`s3:ListBucket` is bucket-scoped, not an object-ARN action.
 The current `HeadBucket` call has no prefix parameter: a policy granting listing
 only when `s3:prefix` matches may not authorize this preflight. The execution
 environment must either
@@ -187,12 +190,17 @@ does not certify production IAM or KMS policy.
 
 ## After a failed execute
 
-There is currently **no supported retry, resume or rollback command**. The same
-run is blocked after an execute attempt. A new run targeting partially populated
-keys is also blocked by the existing-destination gate. If the failure wrote no
-objects, a fresh run can proceed after the underlying problem is corrected; no
-deletion is needed. After partial or uncertain writes, stop intake for that batch,
-retain its run ID/journal and exact destination keys, and escalate for reconciliation.
-Do not delete objects by hand, remove the run reference, or change the batch prefix
-to evade the hold. Do not resume or delete until a reviewed recovery procedure is
-available. Staff rollout must include a supported recovery procedure.
+The `rollback` command supports deletion only for a complete, reviewable execute
+inventory. It previews by default; execution requires the current `--config`,
+`--execute` and `--confirm RUN_ID`, and deletes only confirmed new keys whose
+current `FULL_OBJECT` SHA-256 and size
+still match the source journal. It refuses incomplete stages, unknown outcomes,
+damaged evidence and replacements. See [rollback inventory](rollback-inventory.md)
+for the preview, staging probe and execution procedure.
+
+An incomplete or uncertain execute is not eligible for automatic rollback. Stop
+intake for that batch, retain its run ID/journal and exact destination keys, and
+escalate for reconciliation. Do not delete objects by hand, remove the run
+reference, or change the batch prefix to evade the hold. Once a supported rollback
+starts, the source run stays held permanently, even after rollback completes;
+republishing requires a new run. Rollback does not restore ArchivesSpace values.

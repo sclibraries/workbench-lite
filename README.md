@@ -97,7 +97,8 @@ python3 -m workbench_lite.cli push --config package.yml --execute --profile PROF
   --endpoint-url ENDPOINT --region REGION --generated-dir generated
 ```
 
-Other commands include `verify-cantaloupe`, `inspect-run`, and `rollback-inventory`.
+Other commands include `verify-cantaloupe`, `inspect-run`, `rollback-inventory`, and
+`rollback`.
 Run `python3 -m workbench_lite.cli COMMAND --help` for their options. The Compass S3
 inventory utility is available at `scripts/export_compass_s3_package.py`; run it with
 `--help` for its options.

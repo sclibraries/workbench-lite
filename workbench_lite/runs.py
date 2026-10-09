@@ -138,6 +138,12 @@ def read_events(path):
 
 def publication_status(path, events, state, pending, error):
     held = {'state': 'held', 'reason': 'No durable complete-batch receipt; do not hand off to publication.'}
+    try:
+        if (Path(path) / 'rollback-hold.json').exists():
+            return {'state': 'held',
+                    'reason': 'Rollback has started; this source run remains held permanently. Republish with a new run.'}
+    except OSError:
+        return held
     if error or pending or state != 'completed' or not events:
         return held
     try:
