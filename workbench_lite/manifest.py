@@ -152,6 +152,8 @@ def _build_canvas_entry(
         if not generated_output.exists():
             return None, f"Generated image not found for page {page.page_id} at {generated_output}"
 
+    # Canvas size is the master's pixel size, the coordinate space for OCR word boxes.
+    # The painted image is a bounded derivative, so it carries no width/height of its own.
     dimensions = page_dimensions.get((obj.object_id, page.page_id))
     if not dimensions or dimensions[0] <= 0 or dimensions[1] <= 0:
         return None, f"Source pixel dimensions are unavailable for page {page.page_id}."
@@ -188,8 +190,6 @@ def _build_canvas_entry(
                     "@type": "dctypes:Image",
                     "@id": image_id,
                     "format": "image/jpeg",
-                    "width": width,
-                    "height": height,
                     "service": {
                         "@context": "http://iiif.io/api/image/2/context.json",
                         "@id": service_id,

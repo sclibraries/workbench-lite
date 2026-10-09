@@ -964,11 +964,10 @@ class FakeClient:
         canvas = payload["sequences"][0]["canvases"][0]
         resource = canvas["images"][0]["resource"]
         self.assertEqual((canvas["width"], canvas["height"]), (16, 10))
-        self.assertEqual((resource["width"], resource["height"]), (16, 10))
+        self.assertNotIn("width", resource)
+        self.assertNotIn("height", resource)
         self.assertIs(type(canvas["width"]), int)
         self.assertIs(type(canvas["height"]), int)
-        self.assertIs(type(resource["width"]), int)
-        self.assertIs(type(resource["height"]), int)
         self.assertIn("service", resource)
         self.assertEqual(resource["service"]["@context"], "http://iiif.io/api/image/2/context.json")
         self.assertTrue(resource["service"]["@id"].startswith("http://localhost:8080/iiif/2/"))
@@ -1010,7 +1009,7 @@ class FakeClient:
 
         self.assertEqual(canvas["@id"], "page/page")
         self.assertEqual((canvas["width"], canvas["height"]), (16, 10))
-        self.assertEqual((resource["width"], resource["height"]), (16, 10))
+        self.assertNotIn("width", resource)
         self.assertEqual(resource["@id"], f"{service_id}/full/!2000,2000/0/default.jpg")
         self.assertEqual(canvas["thumbnail"]["@id"], f"{service_id}/full/!160,160/0/default.jpg")
         self.assertEqual(
@@ -1068,7 +1067,7 @@ class FakeClient:
         canvas = manifest_payload["sequences"][0]["canvases"][0]
         resource = canvas["images"][0]["resource"]
         self.assertEqual((canvas.get("width"), canvas.get("height")), (16, 10))
-        self.assertEqual((resource.get("width"), resource.get("height")), (16, 10))
+        self.assertEqual((resource.get("width"), resource.get("height")), (None, None))
         self.assertEqual(canvas["@id"], "page/page")
         self.assertTrue(resource["@id"].endswith("/full/!2000,2000/0/default.jpg"))
         self.assertTrue(canvas["thumbnail"]["@id"].endswith("/full/!160,160/0/default.jpg"))
