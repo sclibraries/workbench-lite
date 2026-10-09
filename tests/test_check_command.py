@@ -926,6 +926,55 @@ class FakeClient:
         self.assertEqual(resource["service"]["@context"], "http://iiif.io/api/image/2/context.json")
         self.assertTrue(resource["service"]["@id"].startswith("http://localhost:8080/iiif/2/"))
 
+    def test_generate_manifests_bounds_canvas_image_requests(self):
+        from workbench_lite.check import run_check
+        from workbench_lite.generate import generate_service_jpgs
+        from workbench_lite.manifest import generate_manifests
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            package_dir = Path(temp_dir)
+            config_path, csv_path, input_dir = self.write_tiny_package(package_dir)
+            check_report = run_check(config_path=config_path, input_csv_override=csv_path)
+            output_dir = package_dir / "generated"
+
+            generate_service_jpgs(
+                upload_plan=check_report.upload_plan,
+                input_dir=input_dir,
+                output_dir=output_dir,
+                max_long_side=8,
+                quality=75,
+            )
+            manifest_report = generate_manifests(
+                objects=check_report.objects,
+                upload_plan=check_report.upload_plan,
+                output_dir=output_dir,
+                cantaloupe_base_url="http://localhost:8080/iiif/2",
+            )
+            manifest_path = Path(manifest_report.results[0].output_path)
+            payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+
+        canvas = payload["sequences"][0]["canvases"][0]
+        resource = canvas["images"][0]["resource"]
+        service_id = (
+            "http://localhost:8080/iiif/2/workbench-lite%2Fsample%2Fderivatives%2Fparent"
+            "%2Fpages%2Fpage%2Fservice.jpg"
+        )
+
+        self.assertEqual(canvas["@id"], "page/page")
+        self.assertNotIn("width", canvas)
+        self.assertNotIn("height", canvas)
+        self.assertEqual(resource["@id"], f"{service_id}/full/!2000,2000/0/default.jpg")
+        self.assertEqual(canvas["thumbnail"]["@id"], f"{service_id}/full/!160,160/0/default.jpg")
+        self.assertEqual(
+            resource["service"],
+            {
+                "@context": "http://iiif.io/api/image/2/context.json",
+                "@id": service_id,
+                "profile": "http://iiif.io/api/image/2/level2.json",
+            },
+        )
+        self.assertNotIn("full/full", json.dumps(payload))
+
     def test_cli_generate_outputs_json_summary_with_manifests(self):
         env = os.environ.copy()
         env["PYTHONPATH"] = str(PACKAGE_ROOT) + os.pathsep + str(PACKAGE_ROOT / "tests")

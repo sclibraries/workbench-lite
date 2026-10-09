@@ -12,6 +12,10 @@ from .runs import RecordedResults
 from .models import UploadPlanEntry, WorkbenchObject
 
 
+MANIFEST_IMAGE_MAX_DIMENSION = 2000
+MANIFEST_THUMBNAIL_MAX_DIMENSION = 160
+
+
 def generate_manifests(
     objects: List[WorkbenchObject],
     upload_plan: List[UploadPlanEntry],
@@ -148,7 +152,14 @@ def _build_canvas_entry(
         base_url=cantaloupe_base_url,
         image_key=service_key,
     )
-    image_id = f"{service_id}/full/full/0/default.jpg"
+    image_id = (
+        f"{service_id}/full/!{MANIFEST_IMAGE_MAX_DIMENSION},"
+        f"{MANIFEST_IMAGE_MAX_DIMENSION}/0/default.jpg"
+    )
+    thumbnail_id = (
+        f"{service_id}/full/!{MANIFEST_THUMBNAIL_MAX_DIMENSION},"
+        f"{MANIFEST_THUMBNAIL_MAX_DIMENSION}/0/default.jpg"
+    )
 
     hocr_entry = entries_by_key.get(("hocr", obj.object_id, page.page_id))
 
@@ -175,7 +186,7 @@ def _build_canvas_entry(
             }
         ],
         "thumbnail": {
-            "@id": image_id,
+            "@id": thumbnail_id,
         },
     }
 
