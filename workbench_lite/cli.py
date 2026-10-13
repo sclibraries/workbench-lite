@@ -1,11 +1,13 @@
 import argparse
 import csv
+import hashlib
 import json
 import os
 import signal
 import sys
 from collections import Counter
 from pathlib import Path
+from types import SimpleNamespace
 
 from .check import run_check, _resolve_csv_path
 from .config import ConfigError, load_config
@@ -15,11 +17,12 @@ from .verify import verify_manifest_service_urls
 from .push import STORAGE_ERRORS, push_upload_plan
 from .diagnostics import operation_error, sanitize
 from .s3_client import create_s3_client
-from .runs import RunJournal, JournalError, inspect_run, read_events, digest
+from .runs import RunJournal, JournalError, inspect_run, read_events, digest, atomic_write, json_bytes
 from .locks import WriterLocks, LockError, lock_output_and_run, lock_destination
 from .preflight import output_readiness, storage_readiness
 from .rollback_inventory import build_inventory, write_inventory
 from .rollback import run_rollback
+from .storage_plan import DEFAULT_PRIVATE_BUCKET, DEFAULT_PUBLIC_BUCKET
 
 
 def main(argv=None, *, lock_factory=WriterLocks) -> int:
@@ -38,6 +41,7 @@ def main(argv=None, *, lock_factory=WriterLocks) -> int:
     push_parser.add_argument("--allow-dummy-files", action="store_true")
     push_parser.add_argument("--dry-run", action="store_true")
     push_parser.add_argument("--execute", action="store_true")
+    push_parser.add_argument("--resume", action="store_true", help="Resume a held execute run after verifying its recorded state")
     push_parser.add_argument("--verify-readback", action="store_true", help="Also download uploaded objects for full-byte verification after S3 checksum verification")
     push_parser.add_argument("--offline", action="store_true", help="Dry-run only: skip credential/access checks, explicitly unverified")
     push_parser.add_argument("--endpoint-url", default=None)
@@ -87,6 +91,9 @@ def main(argv=None, *, lock_factory=WriterLocks) -> int:
     inspect_parser = subparsers.add_parser("inspect-run", help="Read evidence without retrying operations")
     inspect_parser.add_argument("path", type=Path)
     inspect_parser.add_argument("--format", choices=["text", "json"], default="text")
+    reconcile_parser = subparsers.add_parser("reconcile", help="Read-only reconciliation of unknown upload outcomes")
+    reconcile_parser.add_argument("path", type=Path, help="Run directory to inspect in S3")
+    reconcile_parser.add_argument("--format", choices=["text", "json"], default="text")
     inventory_parser = subparsers.add_parser("rollback-inventory", help="Rebuild read-only rollback evidence from a run")
     inventory_parser.add_argument("path", type=Path)
     inventory_parser.add_argument("--output", type=Path)
@@ -113,6 +120,10 @@ def main(argv=None, *, lock_factory=WriterLocks) -> int:
             parser.error("--offline is only valid with --dry-run")
         if args.execute and args.allow_dummy_files:
             parser.error("push --execute cannot be combined with --allow-dummy-files")
+        if args.resume and not args.execute:
+            parser.error("push --resume requires --execute")
+        if args.resume and args.generated_dir is None:
+            parser.error("push --resume requires --generated-dir")
         if args.dry_run and args.execute:
             parser.error("push accepts only one of --dry-run or --execute")
         if not args.dry_run and not args.execute:
@@ -125,6 +136,8 @@ def main(argv=None, *, lock_factory=WriterLocks) -> int:
               f"Publication: {summary['publication']['state']}\n"
               f"Journal error: {summary['journal_error'] or 'none'}")
         return 1 if summary['journal_error'] or summary['incomplete_stage'] or summary['unknown_operations'] else (summary['exit_code'] or 0)
+    if args.command == 'reconcile':
+        return _run_reconcile_command(args, lock_factory)
     if args.command == "rollback-inventory":
         try:
             inventory = write_inventory(args.path, args.output) if args.output else build_inventory(args.path)
@@ -191,6 +204,15 @@ def main(argv=None, *, lock_factory=WriterLocks) -> int:
                         write_inventory(journal.path)
                         if args.rollback_file:
                             write_inventory(journal.path, args.rollback_file)
+                    if journal is not None and code == 0 and args.command == 'push' and args.execute:
+                        journal.complete_publication()
+                        if (journal.path / 'upload-plan.json').exists():
+                            try:
+                                write_inventory(journal.path)
+                                if args.rollback_file:
+                                    write_inventory(journal.path, args.rollback_file)
+                            except JournalError as exc:
+                                _print_error(args, f"Rollback inventory refresh failed: {exc}")
                 except JournalError as exc:
                     _print_error(args, str(exc))
                     raise SystemExit(1) from exc
@@ -198,23 +220,12 @@ def main(argv=None, *, lock_factory=WriterLocks) -> int:
             try:
                 locks.release()
             except LockError as exc:
-                _print_error(args, str(exc))
-                raise SystemExit(1) from exc
-
-        if journal is not None and code == 0:
-            try:
-                journal.complete_publication()
-                if args.command == 'push' and args.execute and (journal.path / 'upload-plan.json').exists():
-                    # The pre-receipt inventory is already durable. Refresh its
-                    # stage state after receipt; a refresh failure cannot revoke
-                    # the independently committed publication receipt.
+                if journal is not None and code == 0 and args.command == 'push' and args.execute:
                     try:
-                        write_inventory(journal.path)
-                        if args.rollback_file:
-                            write_inventory(journal.path, args.rollback_file)
-                    except JournalError as exc:
-                        _print_error(args, f"Rollback inventory refresh failed: {exc}")
-            except JournalError as exc:
+                        atomic_write(journal.path / 'publication-pending',
+                                     json_bytes({'run_id': journal.run_id}))
+                    except JournalError:
+                        pass
                 _print_error(args, str(exc))
                 raise SystemExit(1) from exc
 
@@ -252,6 +263,114 @@ def _run_rollback_command(args, lock_factory) -> int:
     return code
 
 
+def _run_reconcile_command(args, lock_factory) -> int:
+    path = args.path.resolve()
+    locks = lock_factory()
+    journal = None
+    code = 1
+    try:
+        locks.acquire('run:' + str(path))
+        journal = RunJournal.open(path)
+        plan = json.loads((path / 'upload-plan.json').read_text())['entries']
+        storage = _recorded_storage(journal.path)
+        endpoint = storage.get('effective_endpoint_url') or storage.get('configured_endpoint_url')
+        region = storage.get('effective_region') or storage.get('configured_region')
+        if not endpoint:
+            raise JournalError('Run has no recorded S3 endpoint for safe reconciliation.')
+        lock_destination(locks, endpoint.rstrip('/').lower(), [SimpleNamespace(**entry) for entry in plan])
+        profile = storage.get('configured_profile')
+        if profile == 'default':
+            profile = None
+        client = create_s3_client(endpoint, region, profile, preflight=True)
+        journal.start('reconcile')
+        unknown, conflicts = _reconcile_pending(journal, client)
+        code = 1 if unknown else 0
+        journal.finish(code)
+        inventory = write_inventory(path)
+        payload = {'run_id': path.name, 'unknown_count': unknown,
+                   'conflict_count': conflicts, 'inventory_state': inventory['state']}
+        print(json.dumps(sanitize(payload), indent=2) if args.format == 'json' else
+              f"Run: {path}\nUnknown outcomes: {unknown}\nConflicts: {conflicts}\n"
+              f"Rollback inventory: {inventory['state']}")
+    except STORAGE_ERRORS as exc:
+        _print_error(args, operation_error(exc))
+        code = 1
+    except (JournalError, LockError, OSError, ValueError, KeyError, TypeError) as exc:
+        _print_error(args, str(exc))
+        code = 1
+    finally:
+        try:
+            locks.release()
+        except LockError as exc:
+            _print_error(args, str(exc))
+            code = 1
+    return code
+
+
+def _recorded_storage(run_path):
+    events, error = read_events(run_path)
+    if error:
+        raise JournalError('Run journal is damaged; cannot reconcile storage safely.')
+    storage = next((event.get('storage') for event in reversed(events)
+                    if event['kind'] == 'context' and event.get('stage') == 'push'
+                    and isinstance(event.get('storage'), dict)), None)
+    if not storage:
+        raise JournalError('Run has no recorded S3 endpoint configuration.')
+    return storage
+
+
+def _reconcile_pending(journal, client):
+    summary = inspect_run(journal.path)
+    unknown_count = 0
+    conflict_count = 0
+    for pending in summary['unknown_operations']:
+        bucket, key = pending.get('bucket'), pending.get('key')
+        checksum, size = pending.get('checksum'), pending.get('size_bytes')
+        common = {
+            'bucket': bucket, 'key': key, 'role': pending.get('role'),
+            'object_id': pending.get('object_id'), 'page_id': pending.get('page_id'),
+            'checksum': checksum, 'size_bytes': size,
+            'reconciliation_stage': 'reconcile',
+        }
+        try:
+            observed = client.inspect_object(bucket, key)
+        except STORAGE_ERRORS as exc:
+            journal.result(pending['operation_id'], 'push', {
+                **common, 'status': 'unknown', 'remote_outcome': 'unknown',
+                'disposition': 'unknown', 'reconciled': False,
+                'reconciliation_error_class': type(exc).__name__,
+            }, attempt=pending.get('attempt', 1))
+            unknown_count += 1
+            continue
+        if observed is None:
+            journal.result(pending['operation_id'], 'push', {
+                **common, 'status': 'absent', 'remote_outcome': 'absent',
+                'disposition': 'absent', 'reconciled': True,
+            }, attempt=pending.get('attempt', 1))
+        else:
+            observed_checksum = getattr(observed, 'checksum', None)
+            observed_size = getattr(observed, 'size_bytes', None)
+            observed_type = getattr(observed, 'checksum_type', None)
+            if (isinstance(checksum, str) and isinstance(size, int)
+                    and observed_checksum == checksum and observed_size == size
+                    and observed_type == 'FULL_OBJECT'):
+                journal.result(pending['operation_id'], 'push', {
+                    **common, 'status': 'confirmed', 'remote_outcome': 'written',
+                    'disposition': 'reconciled_written', 'reconciled': True,
+                    'observed_checksum': observed_checksum,
+                    'observed_size_bytes': observed_size, 'checksum_type': observed_type,
+                }, attempt=pending.get('attempt', 1))
+            else:
+                journal.result(pending['operation_id'], 'push', {
+                    **common, 'status': 'conflict', 'remote_outcome': 'conflict',
+                    'disposition': 'conflict', 'reconciled': True,
+                    'observed_checksum': observed_checksum,
+                    'observed_size_bytes': observed_size, 'checksum_type': observed_type,
+                }, attempt=pending.get('attempt', 1))
+                conflict_count += 1
+    return unknown_count, conflict_count
+
+
 def _print_rollback_report(report, output_format):
     if output_format == 'json':
         print(json.dumps(sanitize(report), indent=2))
@@ -278,6 +397,8 @@ def _print_rollback_report(report, output_format):
 def _open_run(args):
     if args.command == 'push' and args.generated_dir is not None:
         reference = args.generated_dir / '.workbench-run.json'
+        if args.resume and not reference.exists():
+            raise JournalError('Resume requires the generated directory to reference an existing run.')
         if reference.exists():
             try:
                 info = json.loads(reference.read_text())
@@ -287,7 +408,8 @@ def _open_run(args):
             except (ValueError, KeyError, TypeError, OSError) as exc:
                 raise JournalError('Cannot read generated output run reference.') from exc
             events, _ = read_events(run.path)
-            if any(e['kind'] == 'stage_started' and e['stage'] == 'push' for e in events):
+            prior_pushes = [e for e in events if e['kind'] == 'stage_started' and e['stage'] == 'push']
+            if prior_pushes and not args.resume:
                 raise JournalError('This run already attempted execute; inspect it before reconciliation.')
             generation = [e for e in events if e['stage'] == 'generate'
                           and e['kind'] in {'stage_started', 'stage_finished'}]
@@ -306,8 +428,76 @@ def _open_run(args):
             if not csv_path.is_file():
                 raise ConfigError(f"CSV file not found: {csv_path}")
             run.inputs(args.config, config, csv_path)
+            if args.resume:
+                _validate_resume(args, run, events, prior_pushes, config, csv_path)
             return run
     return RunJournal.create(args.run_dir)
+
+
+def _validate_resume(args, run, events, prior_pushes, config, csv_path):
+    if not prior_pushes:
+        raise JournalError('Resume requires a previous execute attempt in this run.')
+    if (run.path / 'publication-pending').exists():
+        raise JournalError('Resume refused: publication finalization is pending; inspect this run.')
+    if (run.path / 'rollback-hold.json').exists():
+        raise JournalError('Resume refused: rollback has started for this run.')
+    if any(event['kind'] == 'stage_finished' and event['stage'] == 'push'
+           and event.get('publication_receipt') for event in events):
+        raise JournalError('Resume refused: this run already has a publication receipt.')
+    if any(event['kind'] == 'stage_finished' and event['stage'] == 'push'
+           and event.get('exit_code') == 0 for event in events):
+        raise JournalError('Resume refused: this execute run is already complete.')
+
+    metadata = json.loads((run.path / 'run.json').read_text())
+    package = Path(__file__).parent
+    source_hash = hashlib.sha256(b''.join(
+        path.read_bytes() for path in sorted(package.glob('*.py'))
+    )).hexdigest()
+    if metadata.get('software', {}).get('source_sha256') != source_hash:
+        raise JournalError('Resume refused: workbench-lite source changed since this run was created.')
+    snapshot_hashes = metadata.get('snapshot_hashes', {})
+    try:
+        if (digest(run.path / 'input.csv') != snapshot_hashes.get('csv')
+                or digest(run.path / 'config.json') != snapshot_hashes.get('config')):
+            raise JournalError('Resume refused: recorded input snapshot changed.')
+    except OSError as exc:
+        raise JournalError('Resume refused: recorded input snapshot is unavailable.') from exc
+    if not (run.path / 'upload-plan.json').is_file() or digest(run.path / 'upload-plan.json') != metadata.get('plan_sha256'):
+        raise JournalError('Resume refused: immutable upload plan changed or is unavailable.')
+
+    expected_buckets = {
+        str(config.get('s3_private_bucket') or DEFAULT_PRIVATE_BUCKET),
+        str(config.get('s3_public_bucket') or DEFAULT_PUBLIC_BUCKET),
+    }
+    recorded = json.loads((run.path / 'config.json').read_text())
+    recorded_buckets = {
+        str(recorded.get('s3_private_bucket') or DEFAULT_PRIVATE_BUCKET),
+        str(recorded.get('s3_public_bucket') or DEFAULT_PUBLIC_BUCKET),
+    }
+    if expected_buckets != recorded_buckets:
+        raise JournalError('Resume refused: S3 buckets differ from the recorded run.')
+    storage = _recorded_storage(run.path)
+    prior_endpoint = storage.get('effective_endpoint_url') or storage.get('configured_endpoint_url')
+    requested_endpoint = (args.endpoint_url or os.environ.get('AWS_ENDPOINT_URL_S3')
+                          or os.environ.get('AWS_ENDPOINT_URL'))
+    if requested_endpoint and prior_endpoint and requested_endpoint.rstrip('/').lower() != prior_endpoint.rstrip('/').lower():
+        raise JournalError('Resume refused: S3 endpoint differs from the recorded run.')
+    prior_region = storage.get('effective_region') or storage.get('configured_region')
+    requested_region = args.region or os.environ.get('AWS_DEFAULT_REGION') or os.environ.get('AWS_REGION')
+    if requested_region and prior_region and requested_region != prior_region:
+        raise JournalError('Resume refused: S3 region differs from the recorded run.')
+
+    latest_by_identity = {}
+    for event in events:
+        if event['kind'] == 'result' and event.get('stage') == 'push':
+            latest_by_identity[(event.get('bucket'), event.get('key'))] = event
+    if any(event.get('disposition') == 'conflict' for event in latest_by_identity.values()):
+        raise JournalError('Resume refused: a prior upload is in conflict; review the run.')
+
+    report = run_check(args.config, args.input_csv, args.allow_dummy_files, run_id=run.run_id)
+    if report.validation_errors:
+        raise JournalError('Resume refused: current package validation differs from its recorded run.')
+    run.plan(report.upload_plan)
 
 
 def _checked(args):
@@ -398,6 +588,15 @@ def _run(args, parser) -> int:
         if not dry_run:
             endpoint = getattr(sdk_meta, 'endpoint_url', None) or args.endpoint_url or os.environ.get('AWS_ENDPOINT_URL_S3') or os.environ.get('AWS_ENDPOINT_URL') or 'aws-s3'
             lock_destination(args.locks, endpoint.rstrip('/').lower(), check_report.upload_plan)
+            if args.resume:
+                recorded = _recorded_storage(args.journal.path)
+                prior_endpoint = recorded.get('effective_endpoint_url') or recorded.get('configured_endpoint_url')
+                prior_region = recorded.get('effective_region') or recorded.get('configured_region')
+                if not prior_endpoint or prior_endpoint.rstrip('/').lower() != endpoint.rstrip('/').lower():
+                    raise JournalError('Resume refused: S3 endpoint differs from the recorded run.')
+                current_region = getattr(sdk_meta, 'region_name', None) or args.region or os.environ.get('AWS_DEFAULT_REGION') or os.environ.get('AWS_REGION')
+                if prior_region and current_region and prior_region != current_region:
+                    raise JournalError('Resume refused: S3 region differs from the recorded run.')
         args.journal.append('context', stage='push', storage={
             'effective_endpoint_url': getattr(sdk_meta, 'endpoint_url', None),
             'effective_region': getattr(sdk_meta, 'region_name', None),
@@ -405,6 +604,11 @@ def _run(args, parser) -> int:
             'configured_region': args.region or os.environ.get('AWS_DEFAULT_REGION') or os.environ.get('AWS_REGION'),
             'configured_profile': args.profile or os.environ.get('AWS_PROFILE') or 'default',
         })
+        if args.resume:
+            unknown, conflicts = _reconcile_pending(args.journal, preflight_client)
+            if unknown or conflicts:
+                _print_error(args, 'Resume stopped because reconciliation found an unknown outcome or conflict.')
+                return 1
         endpoint = getattr(sdk_meta, 'endpoint_url', None) or args.endpoint_url or os.environ.get('AWS_ENDPOINT_URL_S3') or os.environ.get('AWS_ENDPOINT_URL') or 'aws-s3 (SDK default)'
         remote = storage_readiness(preflight_client, check_report.upload_plan, endpoint, offline=args.offline, journal=args.journal)
         args.preflight['storage'] = remote
@@ -412,7 +616,10 @@ def _run(args, parser) -> int:
         if remote['errors']:
             _print_preflight(args)
             return 1
-        s3_client = None if dry_run else create_s3_client(args.endpoint_url, args.region, args.profile, full_readback=args.verify_readback)
+        s3_client = None if dry_run else create_s3_client(
+            args.endpoint_url, args.region, args.profile,
+            full_readback=args.verify_readback, upload=True,
+        )
         push_report = push_upload_plan(
             check_report.upload_plan,
             input_dir=input_dir,

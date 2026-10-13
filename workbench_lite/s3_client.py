@@ -5,6 +5,8 @@ import hashlib
 from pathlib import Path
 from typing import Optional
 
+from .retry_policy import UPLOAD_CONNECT_TIMEOUT_SECONDS, UPLOAD_READ_TIMEOUT_SECONDS
+
 
 @dataclass(frozen=True)
 class VerificationResult:
@@ -136,6 +138,7 @@ def create_s3_client(
     *,
     preflight: bool = False,
     full_readback: bool = False,
+    upload: bool = False,
 ) -> Boto3S3Client:
     try:
         import boto3  # type: ignore
@@ -149,6 +152,12 @@ def create_s3_client(
     if preflight:
         client_kwargs['config'] = Config(
             connect_timeout=5, read_timeout=5, retries={'total_max_attempts': 1}
+        )
+    elif upload:
+        client_kwargs['config'] = Config(
+            connect_timeout=UPLOAD_CONNECT_TIMEOUT_SECONDS,
+            read_timeout=UPLOAD_READ_TIMEOUT_SECONDS,
+            retries={'total_max_attempts': 1},
         )
     if endpoint_url:
         client_kwargs["endpoint_url"] = endpoint_url

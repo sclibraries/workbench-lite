@@ -9,12 +9,59 @@ import unittest
 from unittest.mock import patch
 
 from PIL import Image
+from botocore.exceptions import ClientError, EndpointConnectionError
+from types import SimpleNamespace
 
 from cli_test_runner import main
 from test_outcomes import Storage, package
 from workbench_lite.check import run_check
+from workbench_lite.cli import main as cli_main
 from workbench_lite.push import push_upload_plan
 from workbench_lite.runs import inspect_run, read_events, RunJournal, JournalError
+
+
+class TransientStorage(Storage):
+    def __init__(self, failures=(), head_error_key=None):
+        super().__init__()
+        self.failures = list(failures)
+        self.head_error_key = head_error_key
+        self.head_calls = []
+        self.client = SimpleNamespace(meta=SimpleNamespace(
+            endpoint_url='http://s3.test', region_name='us-east-1'
+        ))
+
+    def upload_file(self, source, bucket, key, checksum):
+        self.calls.append(key)
+        if self.failures:
+            failure = self.failures.pop(0)
+            if failure == 'connection':
+                raise EndpointConnectionError(endpoint_url='http://s3.test')
+            if failure == 'lost_ack':
+                self.written[key] = Path(source).read_bytes()
+                raise EndpointConnectionError(endpoint_url='http://s3.test')
+            if failure == 'precondition_own_write':
+                self.written[key] = Path(source).read_bytes()
+                raise ClientError({'Error': {'Code': 'PreconditionFailed'},
+                                   'ResponseMetadata': {'HTTPStatusCode': 412}}, 'PutObject')
+            if failure == 'precondition_conflict':
+                self.written[key] = b'competing content'
+                raise ClientError({'Error': {'Code': 'PreconditionFailed'},
+                                   'ResponseMetadata': {'HTTPStatusCode': 412}}, 'PutObject')
+            if failure in {'access_denied', 'bad_digest', 'invalid_digest'}:
+                code, status = {
+                    'access_denied': ('AccessDenied', 403),
+                    'bad_digest': ('BadDigest', 500),
+                    'invalid_digest': ('InvalidDigest', 503),
+                }[failure]
+                raise ClientError({'Error': {'Code': code},
+                                   'ResponseMetadata': {'HTTPStatusCode': status}}, 'PutObject')
+        self.written[key] = Path(source).read_bytes()
+
+    def inspect_object(self, bucket, key):
+        self.head_calls.append((bucket, key))
+        if key == self.head_error_key:
+            raise EndpointConnectionError(endpoint_url='http://s3.test')
+        return super().inspect_object(bucket, key)
 
 
 class PublicationTests(unittest.TestCase):
@@ -33,6 +80,15 @@ class PublicationTests(unittest.TestCase):
     def execute(self, store):
         with patch('workbench_lite.cli.create_s3_client', return_value=store), contextlib.redirect_stdout(io.StringIO()):
             return main(['push', *self.args, '--execute', '--generated-dir', str(self.output)])
+
+    def execute_at_endpoint(self, store, *, resume=False, endpoint='http://s3.test'):
+        output = io.StringIO()
+        command = ['push', *self.args, '--endpoint-url', endpoint,
+                   '--region', 'us-east-1', '--execute', '--generated-dir', str(self.output)]
+        if resume:
+            command.append('--resume')
+        with patch('workbench_lite.cli.create_s3_client', return_value=store), contextlib.redirect_stdout(output):
+            return main(command)
 
     def execute_json(self, store):
         output = io.StringIO()
@@ -53,6 +109,314 @@ class PublicationTests(unittest.TestCase):
         self.assertEqual(self.execute(store), 1)
         self.assertEqual(store.calls, [])
         self.assertEqual(store.written[key], b'existing live image')
+
+    def test_transient_upload_retries_once_after_an_absent_head(self):
+        store = TransientStorage(['connection'])
+        first_key = next(entry.key for entry in self.plan if entry.role != 'manifest')
+        with patch('time.sleep') as sleep, patch('random.uniform', return_value=0.25):
+            code = self.execute(store)
+
+        self.assertEqual(code, 0)
+        self.assertEqual(store.calls.count(first_key), 2)
+        events, error = read_events(self.run)
+        attempts = [event for event in events
+                    if event['kind'] == 'result' and event['stage'] == 'push'
+                    and event.get('key') == first_key]
+        self.assertEqual([event['attempt'] for event in attempts], [1, 2])
+        self.assertEqual(attempts[0]['disposition'], 'retrying')
+        self.assertEqual(attempts[0]['delay_before_next_attempt'], 0.25)
+        self.assertEqual(attempts[1]['disposition'], 'written')
+        self.assertEqual(inspect_run(self.run)['retry_count'], 1)
+        sleep.assert_called_once_with(0.25)
+
+    def test_upload_retries_stop_after_three_transient_attempts(self):
+        store = TransientStorage(['connection', 'connection', 'connection'])
+        first_key = next(entry.key for entry in self.plan if entry.role != 'manifest')
+        with patch('time.sleep'), patch('random.uniform', side_effect=[0.2, 0.4]):
+            self.assertEqual(self.execute(store), 1)
+        self.assertEqual(store.calls.count(first_key), 3)
+        events, error = read_events(self.run)
+        attempts = [event for event in events if event['kind'] == 'result'
+                    and event['stage'] == 'push' and event.get('key') == first_key]
+        self.assertEqual([event['attempt'] for event in attempts], [1, 2, 3])
+        self.assertEqual(attempts[-1]['disposition'], 'retries_exhausted')
+
+    def test_access_denied_and_checksum_errors_are_not_retried(self):
+        for failure in ('access_denied', 'bad_digest', 'invalid_digest'):
+            with self.subTest(failure=failure):
+                self.regenerate()
+                store = TransientStorage([failure])
+                first_key = next(entry.key for entry in self.plan if entry.role != 'manifest')
+                with patch('time.sleep') as sleep:
+                    self.assertEqual(self.execute(store), 1)
+                self.assertEqual(store.calls, [first_key])
+                events, error = read_events(self.run)
+                attempt = next(event for event in events if event['kind'] == 'result'
+                               and event['stage'] == 'push' and event.get('key') == first_key)
+                self.assertEqual(attempt['disposition'], 'not_retryable')
+                sleep.assert_not_called()
+
+    def test_lost_ack_is_confirmed_by_full_object_checksum_without_second_put(self):
+        store = TransientStorage(['lost_ack'])
+        first_key = next(entry.key for entry in self.plan if entry.role != 'manifest')
+        self.assertEqual(self.execute(store), 0)
+        self.assertEqual(store.calls.count(first_key), 1)
+        events, error = read_events(self.run)
+        attempt = next(event for event in events if event['kind'] == 'result'
+                       and event['stage'] == 'push' and event.get('key') == first_key)
+        self.assertEqual(attempt['disposition'], 'reconciled_written')
+        self.assertTrue(attempt['reconciled'])
+        self.assertEqual(inspect_run(self.run)['publication']['state'], 'ready_for_review')
+
+    def test_precondition_race_conflicts_without_retry(self):
+        store = TransientStorage(['precondition_conflict'])
+        first_key = next(entry.key for entry in self.plan if entry.role != 'manifest')
+        self.assertEqual(self.execute(store), 1)
+        self.assertEqual(store.calls, [first_key])
+        events, error = read_events(self.run)
+        attempt = next(event for event in events if event['kind'] == 'result'
+                       and event['stage'] == 'push' and event.get('key') == first_key)
+        self.assertEqual(attempt['http_status'], 412)
+        self.assertEqual(attempt['disposition'], 'conflict')
+
+    def test_own_write_precondition_response_reconciles_without_repeating_put(self):
+        store = TransientStorage(['precondition_own_write'])
+        first_key = next(entry.key for entry in self.plan if entry.role != 'manifest')
+        self.assertEqual(self.execute(store), 0)
+        self.assertEqual(store.calls.count(first_key), 1)
+        events, error = read_events(self.run)
+        attempt = next(event for event in events if event['kind'] == 'result'
+                       and event['stage'] == 'push' and event.get('key') == first_key)
+        self.assertEqual(attempt['http_status'], 412)
+        self.assertEqual(attempt['disposition'], 'reconciled_written')
+        self.assertTrue(attempt['reconciled'])
+
+    def test_run_retry_wait_budget_uses_slow_clock_without_real_sleep(self):
+        store = TransientStorage(['connection', 'connection'])
+        first_key = next(entry.key for entry in self.plan if entry.role != 'manifest')
+        with patch('workbench_lite.push.RUN_RETRY_WAIT_BUDGET_SECONDS', 1.0), \
+                patch('workbench_lite.push.time.sleep') as sleep, \
+                patch('workbench_lite.push.time.monotonic', side_effect=[0.0, 1.5]), \
+                patch('workbench_lite.push.random.uniform', return_value=0.75):
+            self.assertEqual(self.execute(store), 1)
+        self.assertEqual(store.calls, [first_key])
+        sleep.assert_called_once_with(0.75)
+        events, error = read_events(self.run)
+        attempt = next(event for event in events if event['kind'] == 'result'
+                       and event['stage'] == 'push' and event.get('key') == first_key)
+        self.assertEqual(attempt['disposition'], 'retries_exhausted')
+        self.assertEqual(attempt['actual_retry_wait_seconds'], 1.5)
+
+    def test_resume_retries_entry_after_attempt_limit_with_continuing_attempt_numbers(self):
+        store = TransientStorage(['connection', 'connection', 'connection', 'connection'])
+        first_key = next(entry.key for entry in self.plan if entry.role != 'manifest')
+        with patch('time.sleep'), patch('random.uniform', side_effect=[0.2, 0.4]):
+            self.assertEqual(self.execute_at_endpoint(store), 1)
+        self.assertEqual(store.calls.count(first_key), 3)
+
+        with patch('time.sleep'), patch('random.uniform', return_value=0.2):
+            self.assertEqual(self.execute_at_endpoint(store, resume=True), 0)
+        self.assertEqual(store.calls.count(first_key), 5)
+        self.assertEqual(inspect_run(self.run)['publication']['state'], 'ready_for_review')
+        events, error = read_events(self.run)
+        attempts = [event for event in events if event['kind'] == 'result'
+                    and event['stage'] == 'push' and event.get('key') == first_key]
+        self.assertEqual([event['attempt'] for event in attempts], [1, 2, 3, 4, 5])
+        receipts = [event for event in events if event.get('publication_receipt')]
+        self.assertEqual(len(receipts), 1)
+
+    def test_resume_retries_entry_after_wait_budget_with_continuing_attempt_numbers(self):
+        store = TransientStorage(['connection'])
+        first_key = next(entry.key for entry in self.plan if entry.role != 'manifest')
+        with patch('workbench_lite.push.RUN_RETRY_WAIT_BUDGET_SECONDS', 300.0), \
+                patch('workbench_lite.push.time.sleep'), \
+                patch('workbench_lite.push.time.monotonic', side_effect=[0.0, 300.5]), \
+                patch('workbench_lite.push.random.uniform', return_value=0.75):
+            self.assertEqual(self.execute_at_endpoint(store), 1)
+        self.assertEqual(store.calls, [first_key])
+
+        store.failures.append('connection')
+        with patch('time.sleep'), patch('random.uniform', return_value=0.25):
+            self.assertEqual(self.execute_at_endpoint(store, resume=True), 0)
+        self.assertEqual(store.calls.count(first_key), 3)
+        self.assertEqual(inspect_run(self.run)['publication']['state'], 'ready_for_review')
+        events, error = read_events(self.run)
+        attempts = [event for event in events if event['kind'] == 'result'
+                    and event['stage'] == 'push' and event.get('key') == first_key]
+        self.assertEqual([event['attempt'] for event in attempts], [1, 2, 3])
+        receipts = [event for event in events if event.get('publication_receipt')]
+        self.assertEqual(len(receipts), 1)
+
+    def test_reconcile_confirms_unknown_write_and_rollback_accepts_the_run(self):
+        from workbench_lite.locks import WriterLocks
+
+        first_key = next(entry.key for entry in self.plan if entry.role != 'manifest')
+        store = TransientStorage(['lost_ack'], head_error_key=first_key)
+        self.assertEqual(self.execute_at_endpoint(store), 1)
+        self.assertTrue(inspect_run(self.run)['unknown_operations'])
+        self.assertIn(first_key, store.written)
+        old_journal = (self.run/'events.jsonl').read_bytes()
+        put_calls = list(store.calls)
+        store.head_error_key = None
+        lock_root = self.root/'command-locks'
+        lock_root.mkdir(mode=0o700)
+        output = io.StringIO()
+        with patch('workbench_lite.cli.create_s3_client', return_value=store), contextlib.redirect_stdout(output):
+            code = cli_main(['reconcile', str(self.run), '--format', 'json'],
+                            lock_factory=lambda: WriterLocks(lock_root))
+        self.assertEqual(code, 0)
+        self.assertTrue((self.run/'events.jsonl').read_bytes().startswith(old_journal))
+        self.assertEqual(store.calls, put_calls)
+        summary = inspect_run(self.run)
+        self.assertFalse(summary['unknown_operations'])
+        inventory = json.loads((self.run/'rollback-inventory.json').read_text())
+        self.assertEqual(inventory['state'], 'reviewable')
+        self.assertIn(first_key, {item['key'] for item in inventory['new_keys']})
+
+        output = io.StringIO()
+        with patch('workbench_lite.cli.create_s3_client', return_value=store), contextlib.redirect_stdout(output):
+            rollback_code = cli_main([
+                'rollback', str(self.run), '--config', str(self.config),
+                '--endpoint-url', 'http://s3.test', '--region', 'us-east-1',
+                '--format', 'json',
+            ], lock_factory=lambda: WriterLocks(lock_root))
+        self.assertEqual(rollback_code, 0)
+        rollback_report = json.loads(output.getvalue())
+        self.assertEqual(rollback_report['mode'], 'preview')
+        self.assertIn(first_key, {item['key'] for item in rollback_report['results']})
+
+    def test_reconcile_resolves_absent_and_conflict_without_s3_writes(self):
+        from workbench_lite.locks import WriterLocks
+
+        for failure, expected in (('connection', 'absent'), ('precondition_conflict', 'conflict')):
+            with self.subTest(outcome=expected):
+                self.regenerate()
+                first_key = next(entry.key for entry in self.plan if entry.role != 'manifest')
+                store = TransientStorage([failure], head_error_key=first_key)
+                self.assertEqual(self.execute_at_endpoint(store), 1)
+                before_objects = dict(store.written)
+                put_calls = list(store.calls)
+                store.head_error_key = None
+                locks = self.root/('locks-'+expected)
+                locks.mkdir(mode=0o700)
+                output = io.StringIO()
+                with patch('workbench_lite.cli.create_s3_client', return_value=store), contextlib.redirect_stdout(output):
+                    code = cli_main(['reconcile', str(self.run), '--format', 'json'],
+                                    lock_factory=lambda: WriterLocks(locks))
+                self.assertEqual(code, 0)
+                self.assertEqual(store.written, before_objects)
+                self.assertEqual(store.calls, put_calls)
+                events, error = read_events(self.run)
+                resolved = [event for event in events if event.get('reconciliation_stage') == 'reconcile']
+                self.assertEqual(resolved[-1]['status'], expected)
+                self.assertFalse(inspect_run(self.run)['unknown_operations'])
+
+    def test_resume_verifies_previous_writes_and_completes_the_same_run(self):
+        store = TransientStorage(['ok', 'access_denied'])
+        first_key, second_key = [entry.key for entry in self.plan if entry.role != 'manifest'][:2]
+        self.assertEqual(self.execute_at_endpoint(store), 1)
+        previous_calls = list(store.calls)
+        self.assertIn(first_key, store.written)
+        self.assertNotIn(second_key, store.written)
+
+        self.assertEqual(self.execute_at_endpoint(store, resume=True), 0)
+        self.assertEqual(store.calls.count(first_key), previous_calls.count(first_key))
+        self.assertEqual(inspect_run(self.run)['publication']['state'], 'ready_for_review')
+        inventory = json.loads((self.run/'rollback-inventory.json').read_text())
+        self.assertEqual(inventory['state'], 'reviewable')
+        self.assertEqual({item['key'] for item in inventory['new_keys']},
+                         {entry.key for entry in self.plan})
+        events, error = read_events(self.run)
+        resume_stage = [event for event in events if event['kind'] == 'stage_started'
+                        and event['stage'] == 'push'][-1]
+        self.assertTrue(resume_stage['options']['resume'])
+
+    def test_resume_stops_when_a_previously_written_object_is_missing_or_changed(self):
+        for change in ('missing', 'changed'):
+            with self.subTest(change=change):
+                self.regenerate()
+                store = TransientStorage(['ok', 'access_denied'])
+                first_key, _ = [entry.key for entry in self.plan if entry.role != 'manifest'][:2]
+                self.assertEqual(self.execute_at_endpoint(store), 1)
+                previous_calls = list(store.calls)
+                if change == 'missing':
+                    del store.written[first_key]
+                else:
+                    store.written[first_key] = b'changed outside this run'
+
+                self.assertEqual(self.execute_at_endpoint(store, resume=True), 1)
+                self.assertEqual(store.calls, previous_calls)
+                events, error = read_events(self.run)
+                check = [event for event in events if event['kind'] == 'result'
+                         and event['stage'] == 'destination-check'
+                         and event.get('key') == first_key][-1]
+                self.assertEqual(check['status'], 'conflict')
+                self.assertFalse(inspect_run(self.run)['unknown_operations'])
+
+    def test_resume_reconciles_pending_write_before_verifying_and_skipping_it(self):
+        first_key = next(entry.key for entry in self.plan if entry.role != 'manifest')
+        store = TransientStorage(['lost_ack'], head_error_key=first_key)
+        self.assertEqual(self.execute_at_endpoint(store), 1)
+        self.assertTrue(inspect_run(self.run)['unknown_operations'])
+        original_calls = list(store.calls)
+        store.head_error_key = None
+
+        self.assertEqual(self.execute_at_endpoint(store, resume=True), 0)
+        self.assertEqual(store.calls.count(first_key), original_calls.count(first_key))
+        summary = inspect_run(self.run)
+        self.assertEqual(summary['publication']['state'], 'ready_for_review')
+        self.assertFalse(summary['unknown_operations'])
+
+    def test_resume_refuses_receipt_pending_marker_rollback_hold_and_changed_evidence(self):
+        original_config = self.config.read_bytes()
+        original_csv = (self.root/'input.csv').read_bytes()
+        refusal_cases = ('config', 'csv', 'snapshot', 'plan', 'source',
+                         'pending', 'rollback_hold', 'endpoint', 'buckets', 'reference')
+        for case in refusal_cases:
+            with self.subTest(case=case):
+                self.config.write_bytes(original_config)
+                (self.root/'input.csv').write_bytes(original_csv)
+                self.regenerate()
+                store = TransientStorage(['access_denied'])
+                self.assertEqual(self.execute_at_endpoint(store), 1)
+                event_bytes = (self.run/'events.jsonl').read_bytes()
+                endpoint = 'http://s3.test'
+                if case == 'config':
+                    self.config.write_text(self.config.read_text()+'# changed\n')
+                elif case == 'csv':
+                    (self.root/'input.csv').write_text((self.root/'input.csv').read_text()+'\n')
+                elif case == 'snapshot':
+                    (self.run/'input.csv').write_text('changed snapshot\n')
+                elif case == 'plan':
+                    (self.run/'upload-plan.json').write_text('{}')
+                elif case == 'source':
+                    metadata = json.loads((self.run/'run.json').read_text())
+                    metadata['software']['source_sha256'] = '0'*64
+                    (self.run/'run.json').write_text(json.dumps(metadata))
+                elif case == 'pending':
+                    (self.run/'publication-pending').write_text('{}')
+                elif case == 'rollback_hold':
+                    (self.run/'rollback-hold.json').write_text('{}')
+                elif case == 'endpoint':
+                    endpoint = 'http://other.test'
+                elif case == 'buckets':
+                    self.config.write_text(self.config.read_text()+'s3_private_bucket: other-bucket\n')
+                elif case == 'reference':
+                    (self.output/'.workbench-run.json').unlink()
+
+                if case == 'endpoint':
+                    store.client.meta.endpoint_url = endpoint
+                self.assertEqual(self.execute_at_endpoint(store, resume=True, endpoint=endpoint), 1)
+                self.assertEqual((self.run/'events.jsonl').read_bytes(), event_bytes)
+
+        self.config.write_bytes(original_config)
+        (self.root/'input.csv').write_bytes(original_csv)
+        self.regenerate()
+        store = TransientStorage()
+        self.assertEqual(self.execute_at_endpoint(store), 0)
+        event_bytes = (self.run/'events.jsonl').read_bytes()
+        self.assertEqual(self.execute_at_endpoint(store, resume=True), 1)
+        self.assertEqual((self.run/'events.jsonl').read_bytes(), event_bytes)
 
     def test_unchanged_package_reuses_verified_objects_and_uploads_only_new_audit(self):
         store = Storage()
@@ -267,7 +631,7 @@ class PublicationTests(unittest.TestCase):
         self.assertNotIn(manifests[3], store.calls)
         summary = inspect_run(self.run)
         self.assertEqual(summary['publication']['state'], 'held')
-        self.assertTrue(summary['unknown_operations'])
+        self.assertFalse(summary['unknown_operations'])
 
     def test_final_receipt_failure_never_authorizes_handoff(self):
         original = RunJournal.append
@@ -282,7 +646,9 @@ class PublicationTests(unittest.TestCase):
         self.assertEqual(inspect_run(self.run)['publication']['state'], 'held')
 
     def test_manifest_lost_ack_is_held_and_uncertain(self):
-        store = Storage(next(e.key for e in self.plan if e.role == 'manifest'))
+        manifest = next(e.key for e in self.plan if e.role == 'manifest')
+        failures = ['ok'] * sum(entry.role != 'manifest' for entry in self.plan) + ['connection']
+        store = TransientStorage(failures, head_error_key=manifest)
         self.assertEqual(self.execute(store), 1)
         summary = inspect_run(self.run)
         self.assertEqual(summary.get('publication', {}).get('state'), 'held')
@@ -409,7 +775,7 @@ class PublicationTests(unittest.TestCase):
         (self.run/'publication-pending').write_text('{}')
         self.assertEqual(inspect_run(self.run)['publication']['state'], 'held')
 
-    def test_released_lock_gap_rejects_new_execute_and_dry_run_before_journal_write(self):
+    def test_receipt_finalization_holds_locks_against_resume_and_second_writer(self):
         import os
         import subprocess
         import sys
@@ -428,7 +794,7 @@ from test_outcomes import Storage
 original = RunJournal.complete_publication
 def paused(run):
     if run.stage == 'push':
-        assert not list(Path(os.environ['WBL_TEST_LOCK_DIR']).iterdir())
+        assert list(Path(os.environ['WBL_TEST_LOCK_DIR']).iterdir())
         Path(os.environ['READY']).touch()
         deadline = time.monotonic() + 15
         while not Path(os.environ['RELEASE']).exists():
@@ -451,11 +817,11 @@ raise SystemExit(cli.entrypoint())
             before = (self.run/'events.jsonl').read_bytes()
             other_cwd = self.root/'other-cwd'
             other_cwd.mkdir()
-            for mode in [['--execute'], ['--dry-run', '--offline']]:
+            for mode in [['--execute'], ['--execute', '--resume']]:
                 contender = subprocess.run([sys.executable, '-m', 'cli_test_runner', *common, *mode],
                                            env=env, cwd=other_cwd, capture_output=True, text=True, timeout=10)
                 self.assertEqual(contender.returncode, 1, contender.stderr)
-                self.assertIn('already attempted execute', contender.stdout + contender.stderr)
+                self.assertIn('Writer lock is held', contender.stdout + contender.stderr)
                 self.assertEqual((self.run/'events.jsonl').read_bytes(), before)
             release.touch()
             stdout, stderr = child.communicate(timeout=10)

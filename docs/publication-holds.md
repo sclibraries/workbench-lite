@@ -46,10 +46,26 @@ checksum evidence is reported as unavailable and never treated as a match.
 Each write uses S3 `PutObject` with `IfNoneMatch='*'`, closing the race between the
 absence check and a competing creation. It never falls back to an unconditional
 write. The installed boto3 model must support this argument; unsupported SDKs
-fail before writes. SDK timeout/retry defaults and configured overrides still
-apply to uploads; preflight uses its dedicated bounded client. There are no new
-application-level retries. A lost acknowledgment followed by a conditional-write
-conflict remains unknown until reconciliation.
+fail before writes. The upload client sets 10-second connect and 60-second read
+timeouts and one total SDK attempt. The application makes at most three attempts
+per entry, with full-jitter backoff based on one and four seconds and a five-minute
+retry-wait budget per invocation. Each `push --execute` and `--resume` starts with
+fresh attempt and wait limits, so a run stopped by retries can be resumed while
+journal attempt numbers continue across invocations. It retries only connection errors/timeouts, HTTP
+429/500/502/503/504, and S3 SlowDown or RequestTimeout. AccessDenied, other 4xx
+responses, validation/local-file/checksum errors and conflicts are not retried.
+Preflight retains its separate five-second, one-attempt client.
+
+After every failed or unacknowledged PUT, the CLI issues `HeadObject` while the
+destination lock remains held. A matching FULL_OBJECT SHA-256 and size confirms
+the write and prevents another PUT. Confirmed absence permits another attempt only
+for a retryable error. A different or unreadable identity is a conflict and stops
+the batch; a failed HEAD leaves the outcome unknown. HTTP 412 follows this same
+reconciliation path and is never retried. Attempt events record the attempt number,
+safe error class/code/status, wait and disposition. Use `reconcile RUN_DIR` to
+resolve still-unknown attempts with HEAD only; it does not write or delete S3
+objects. Resume uses the same run after checking its local evidence, endpoint,
+buckets and every previously written object. See [CLI outcomes](cli-outcomes.md).
 
 Only conditional **single-request uploads up to 5 GiB per artifact** are currently
 supported. Larger artifacts hold the whole batch before writing; multipart
@@ -96,7 +112,9 @@ never delete by prefix.
 | Remote byte verification | Stop subsequent uploads on mismatch/read failure | Exit 1; acknowledged upload remains recorded; held |
 | Manifest upload/verification | Stop immediately; no automatic rollback | Exit 1; possibly directly accessible manifest; held |
 | Journal intent/result persistence | Abort all remote writes | Exit 1; missing receipt means unknown operation; held |
-| Summary or lock release | Do not write the completion receipt | Exit 1; finalization incomplete; held |
+| Summary persistence | Do not write the completion receipt | Exit 1; finalization incomplete; held |
+| Receipt write or marker removal | Keep the pending marker when possible | Exit 1; finalization incomplete; held |
+| Lock release | Restore a pending marker if release is uncertain | Exit 1; held |
 | SIGINT / SIGTERM | Attempt terminal evidence and release owned locks | Exit 130 / 143, explicit interrupted state; held |
 | SIGKILL / process death | No handler/automatic cleanup | Incomplete stage inferred interrupted when PID is gone; held |
 | Diagnostic URL verification | Continue independent URLs | Exit 4 if any fail; never publication approval |
@@ -107,22 +125,26 @@ misuse still returns 2. Dry runs never create a publication receipt.
 
 ## Durable completion and inspection
 
-Push records each write intent before the request, then its acknowledgment before
-checksum verification (and optional readback). Verification has its own intent/result. Missing acknowledgment remains
-unknown; a failed verification does not erase an acknowledged upload from recovery
-evidence. The rollback inventory, if requested, must also write successfully.
+Push records each write intent before the request, then its attempt result before
+the next attempt. Verified writes have their own intent/result. A missing
+acknowledgment remains pending until HEAD reconciliation resolves it; a failed HEAD
+leaves it unknown. A failed verification does not erase a confirmed upload from
+recovery evidence. The rollback inventory, if requested, must also write
+successfully.
 
-Successful execute remains `running` through summary persistence and lock release.
-Only then does finalization create a durable `publication-pending` marker, sync a
-terminal journal event containing the complete-batch receipt, and remove the marker
-as its final action. No required work follows marker removal. A failed append is
-truncated when possible; if truncation also fails, the marker still holds publication.
-Marker removal is deliberately not followed by another directory sync: after a
-crash the marker may conservatively reappear, requiring reconciliation. It must
-never be removed automatically or treated as an expired lock.
+Successful execute remains `running` through summary persistence. Finalization
+then creates a durable `publication-pending` marker, syncs a terminal journal event
+containing the complete-batch receipt, and removes the marker while output, run and
+destination locks are still held. The locks are released only after the receipt is
+committed. A failed receipt write leaves the marker and keeps the run held; resume
+refuses it. A failed append is truncated when possible; if truncation also fails,
+the marker still holds publication. If marker removal or lock release is uncertain,
+the run remains held. Marker removal is deliberately not followed by another
+directory sync: after a crash the marker may conservatively reappear, requiring
+reconciliation. It must never be removed automatically or treated as an expired lock.
 
 `inspect-run` validates the entire journal, the frozen plan hash, exact destination
-coverage and matching upload/verification fingerprints and any recorded observed checksum/size. A destination verified unchanged by SHA-256 can satisfy plan coverage without an upload; every other key must have an acknowledged upload and matching post-upload verification. It requires the final success
+coverage and matching upload/verification fingerprints and any recorded observed checksum/size. A destination verified unchanged by SHA-256 can satisfy plan coverage without an upload; every other key must have a PUT acknowledgment or reconciled write and matching post-upload verification. It requires the final success
 receipt, no unknown operations and no pending marker. Changed plan, truncated
 journal, incomplete execution, dry run or missing receipt means **held**. Run IDs,
 plan hashes and publication owner are present in the receipt. New receipts explicitly
@@ -139,13 +161,14 @@ use the cached summary or audit as a release marker. An inspection exit status
 alone is insufficient: always require the explicit publication state. This keeps
 failure of summary writing or lock release from granting premature approval.
 
-The final receipt is committed after processing and summary persistence, then
-release before the receipt commits. A lock-release failure must not leave a batch
-ready. This is safe under the current CLI because `_open_run` rejects **both execute
-and dry-run** attachment to any run that has already started execute, before writing
-a new stage. A subprocess regression pauses exactly after release and confirms both
-contenders are rejected without changing journal bytes. Any future resume support must
-preserve this exclusion; it cannot simply relax the existing-execute guard.
+The final receipt is committed after processing and summary persistence but before
+lock release. If lock release fails, a hold marker is restored so inspection cannot
+report the batch ready. Without `--resume`, `_open_run` rejects execute and dry-run
+attachment to a run that has already started execute. Resume validates the recorded
+inputs, snapshots, plan, software source hash, endpoint, buckets and rollback/receipt
+state, then acquires output, run and destination locks before reconciliation or
+remote checks. A subprocess regression pauses finalization and confirms resume and a
+second writer are denied while those locks remain held.
 
 A surviving pending marker or uncertain operation requires operator review of
 storage and process ownership. Do not manually manufacture a receipt to unblock a

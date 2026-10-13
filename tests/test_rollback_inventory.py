@@ -60,6 +60,24 @@ class RollbackInventoryTests(unittest.TestCase):
         self.assertEqual(inventory['state'], 'needs_reconciliation')
         self.assertFalse(inventory['deletion_authorized'])
 
+    def test_latest_attempt_intent_is_pending_even_after_an_earlier_absent_result(self):
+        self.run.start('push')
+        entry = self.entries[0]
+        self.record('destination-check', entry, 'absent')
+        identity = {**entry.to_dict(), 'checksum': 'a' * 64, 'size_bytes': 10}
+        operation = self.run.intent('push', identity, attempt=1)
+        self.run.result(operation, 'push', {**identity, 'status': 'failed',
+                                           'remote_outcome': 'absent', 'disposition': 'retrying'},
+                       attempt=1)
+        self.run.intent('push', identity, operation_id=operation, attempt=2)
+        self.run.finish(130)
+
+        inventory = build_inventory(self.run.path)
+
+        self.assertEqual([item['key'] for item in inventory['unknown_keys']], [entry.key])
+        self.assertEqual(inventory['state'], 'needs_reconciliation')
+        self.assertEqual(len(inventory['pending_operations']), 1)
+
     def test_preexisting_destination_never_becomes_new(self):
         self.run.start('push')
         self.record('destination-check', self.entries[0], 'conflict')

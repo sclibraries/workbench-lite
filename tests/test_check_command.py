@@ -499,6 +499,41 @@ class CheckCommandTest(unittest.TestCase):
         self.assertEqual(calls, [("s3", {"endpoint_url": "http://localhost:4566", "region_name": "us-east-1"})])
         self.assertEqual(s3_client.client.uploads, [])
 
+    def test_create_s3_client_configures_bounded_upload_timeouts_and_retries(self):
+        import types
+
+        from workbench_lite.s3_client import create_s3_client
+
+        calls = []
+        fake_boto3 = types.SimpleNamespace()
+
+        class FakeBotoClient:
+            pass
+
+        def client(service_name, **kwargs):
+            calls.append((service_name, kwargs))
+            return FakeBotoClient()
+
+        fake_boto3.client = client
+        original_boto3 = sys.modules.get("boto3")
+        sys.modules["boto3"] = fake_boto3
+        try:
+            create_s3_client(
+                endpoint_url="http://localhost:4566",
+                region="us-east-1",
+                upload=True,
+            )
+        finally:
+            if original_boto3 is None:
+                sys.modules.pop("boto3", None)
+            else:
+                sys.modules["boto3"] = original_boto3
+
+        config = calls[0][1]["config"]
+        self.assertEqual(config.connect_timeout, 10)
+        self.assertEqual(config.read_timeout, 60)
+        self.assertEqual(config.retries["total_max_attempts"], 1)
+
     def test_create_s3_client_supports_profile(self):
         import types
 

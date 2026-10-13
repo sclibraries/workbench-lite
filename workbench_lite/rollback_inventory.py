@@ -50,26 +50,29 @@ def build_inventory(run_path):
               if event['kind'] == 'stage_started' and event['stage'] in {'push', 'push-dry-run'}]
     if stages:
         start, stage = stages[-1]
-        stage_events = events[start:]
+        stage_events = events[stages[0][0]:]
         mode = 'preview' if stage['stage'] == 'push-dry-run' else 'execute'
         options = stage.get('options', {})
         if not isinstance(options, dict):
             options = {}
             metadata_error = 'Push stage options have an invalid structure.'
+        latest_stage_events = events[start:]
         stage_complete = any(event['kind'] == 'stage_finished' and event['stage'] == stage['stage']
-                             for event in stage_events)
+                             for event in latest_stage_events)
     else:
         stage_events, mode, options, stage_complete = [], 'no_push', {}, False
 
     intents = {event['operation_id']: event for event in stage_events if event['kind'] == 'intent'}
     results = [event for event in stage_events if event['kind'] == 'result']
     checks = {}
+    initial_checks = {}
     uploads = {}
     verification = {}
     operations = []
-    result_ids = {event['operation_id'] for event in results}
-    uncertain_ids = {event['operation_id'] for event in results if event.get('remote_outcome') == 'unknown'}
+    latest_result_by_operation = {}
+    ever_written = set()
     for event in results:
+        latest_result_by_operation[event['operation_id']] = event
         op = intents.get(event['operation_id'])
         operations.append({key: event.get(key) for key in
                            ('sequence', 'stage', 'operation_id', 'bucket', 'key', 'role',
@@ -78,50 +81,72 @@ def build_inventory(run_path):
                            if key in event})
         if not op or _identity(op) != _identity(event):
             continue
-        target = {'destination-check': checks, 'push': uploads, 'verify-upload': verification}.get(event['stage'])
-        if target is not None:
-            target[_identity(event)] = event
+        identity = _identity(event)
+        if event['stage'] == 'destination-check':
+            initial_checks.setdefault(identity, event)
+            checks[identity] = event
+        elif event['stage'] == 'push':
+            uploads[identity] = event
+            if (event.get('status') in {'uploaded', 'confirmed'}
+                    and event.get('remote_outcome') not in {'unknown', 'absent', 'conflict'}):
+                ever_written.add(identity)
+        elif event['stage'] == 'verify-upload':
+            verification[identity] = event
+    unresolved_ids = {
+        operation_id for operation_id, intent in intents.items()
+        if (operation_id not in latest_result_by_operation
+            or latest_result_by_operation[operation_id]['sequence'] < intent['sequence']
+            or latest_result_by_operation[operation_id].get('remote_outcome') == 'unknown')
+    }
 
     new_keys, unknown_keys, conflicts, unchanged_keys, held_keys, replacements = [], [], [], [], [], []
     ownership_uncertain = False
     for entry in plan:
         identity = _identity(entry)
         check, upload, verified = checks.get(identity), uploads.get(identity), verification.get(identity)
+        origin_check = initial_checks.get(identity, check)
         item = {key: entry.get(key) for key in ('bucket', 'key', 'role', 'object_id', 'page_id', 'public', 'generated')}
-        item['destination_status'] = check.get('status') if check else 'not_checked'
+        item['destination_status'] = origin_check.get('status') if origin_check else 'not_checked'
+        if check and check is not origin_check:
+            item['current_destination_status'] = check.get('status')
         item['upload_status'] = upload.get('status') if upload else 'not_attempted'
         item['verification_status'] = verified.get('status') if verified else 'not_verified'
-        if check:
-            item['classification'] = check.get('classification')
+        if origin_check:
+            item['classification'] = origin_check.get('classification')
             for source, target in (('checksum', 'checksum'), ('size_bytes', 'size_bytes'),
                                    ('observed_checksum', 'observed_checksum'),
                                    ('observed_size_bytes', 'previous_size_bytes'),
                                    ('verification_method', 'verification_method'),
                                    ('checksum_type', 'checksum_type')):
-                if source in check:
-                    item[target] = check[source]
-            if check.get('checksum_type') == 'FULL_OBJECT' and check.get('observed_checksum'):
-                item['previous_checksum'] = check['observed_checksum']
-        if upload and upload.get('status') == 'uploaded':
+                if source in origin_check:
+                    item[target] = origin_check[source]
+            if origin_check.get('checksum_type') == 'FULL_OBJECT' and origin_check.get('observed_checksum'):
+                item['previous_checksum'] = origin_check['observed_checksum']
+        if upload and upload.get('status') in {'uploaded', 'confirmed'}:
             item.update({key: upload.get(key) for key in ('checksum', 'size_bytes')})
         if mode != 'execute':
             continue
-        if check and check.get('status') == 'unchanged':
-            unchanged_keys.append(item)
-        elif check and check.get('status') == 'held':
-            held_keys.append(item)
+        if upload and (upload.get('status') == 'conflict' or upload.get('remote_outcome') == 'conflict'):
+            conflicts.append(item)
+            if identity in ever_written and upload.get('remote_outcome') != 'written':
+                ownership_uncertain = True
         elif check and check.get('status') in {'conflict', 'failed'}:
             conflicts.append(item)
-            if upload and upload.get('status') == 'uploaded':
+            if identity in ever_written:
                 ownership_uncertain = True
-        elif (check and check.get('status') == 'absent' and upload
-              and upload.get('status') == 'uploaded' and upload.get('remote_outcome') != 'unknown'):
+        elif origin_check and origin_check.get('status') == 'unchanged':
+            unchanged_keys.append(item)
+        elif origin_check and origin_check.get('status') == 'held':
+            held_keys.append(item)
+        elif (origin_check and origin_check.get('status') == 'absent' and upload
+              and upload.get('status') in {'uploaded', 'confirmed'}
+              and upload.get('remote_outcome') not in {'unknown', 'conflict'}):
             new_keys.append(item)
         elif any(_identity(op) == identity and op['stage'] == 'push' and
-                 (op['operation_id'] not in result_ids or op['operation_id'] in uncertain_ids)
+                 op['operation_id'] in unresolved_ids
                  for op in intents.values()):
             unknown_keys.append(item)
-        elif upload and upload.get('status') == 'uploaded':
+        elif upload and upload.get('remote_outcome') == 'written':
             # An acknowledgement without proof that the destination was absent
             # cannot make a key eligible for a future delete.
             conflicts.append(item)
@@ -148,9 +173,7 @@ def build_inventory(run_path):
     derivatives = [{key: event.get(key) for key in ('role', 'output_path', 'checksum', 'size_bytes')}
                    for event in generated if event.get('role') != 'manifest']
 
-    unresolved = [op for op in intents.values() if
-                  not any(result['operation_id'] == op['operation_id'] and result.get('remote_outcome') != 'unknown'
-                          for result in results)]
+    unresolved = [op for op in intents.values() if op['operation_id'] in unresolved_ids]
     if journal_error or plan_error or metadata_error or not stages:
         state = 'invalid_evidence'
     elif unknown_keys or unresolved or ownership_uncertain:

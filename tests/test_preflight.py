@@ -48,7 +48,7 @@ class PreflightTests(unittest.TestCase):
             with patch('workbench_lite.cli.create_s3_client', side_effect=[reader, writer]) as factory:
                 self.assertEqual(main(['push', *common, '--execute', '--generated-dir', str(output)]), 0)
         self.assertEqual(factory.call_args_list[0].kwargs, {'preflight': True})
-        self.assertEqual(factory.call_args_list[1].kwargs, {'full_readback': False})
+        self.assertEqual(factory.call_args_list[1].kwargs, {'full_readback': False, 'upload': True})
         self.assertTrue(writer.calls)
 
     def test_pixel_limit_is_distinct_from_corruption(self):

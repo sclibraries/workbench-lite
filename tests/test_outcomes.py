@@ -37,6 +37,14 @@ class Storage:
     def object_exists(self, bucket, key):
         return key in self.written
 
+    def inspect_object(self, bucket, key):
+        import hashlib
+        if key not in self.written:
+            return None
+        from workbench_lite.s3_client import ObjectIdentity
+        value = self.written[key]
+        return ObjectIdentity(hashlib.sha256(value).hexdigest(), len(value), 'FULL_OBJECT', '"test-etag"')
+
     def verify_file(self, bucket, key, checksum, size_bytes):
         import hashlib
         value = self.written[key]
@@ -128,7 +136,7 @@ class OutcomesTest(unittest.TestCase):
         rendered=json.dumps(report.to_dict())
         for secret in ['TOPSECRET','PASS','SIGNED']:
             self.assertNotIn(secret,rendered)
-        self.assertIn('unknown',rendered.lower())
+        self.assertIn('absent',rendered.lower())
 
     def test_missing_generated_directory_is_failure_not_successful_skip(self):
         report=push_upload_plan(self.plan(),self.root,Storage(),False)
@@ -163,7 +171,8 @@ class OutcomesTest(unittest.TestCase):
         (self.root/'page.tif').unlink()
         with patch('workbench_lite.cli.create_s3_client',side_effect=AssertionError('client created')):
             with contextlib.redirect_stdout(io.StringIO()):
-                self.assertEqual(main(['push','--execute','--config',str(self.config)]),3)
+                self.assertEqual(main(['push','--execute','--config',str(self.config),
+                                       '--run-dir',str(self.root/'runs')]),3)
 
     def test_corrupt_tiff_is_caught_during_preflight(self):
         (self.root/'page.tif').write_bytes(b'not an image')
@@ -200,7 +209,8 @@ class OutcomesTest(unittest.TestCase):
         service_report=generate_service_jpgs(report.upload_plan,self.root,generated)
         generate_thumbnails(report.upload_plan,self.root,generated)
         generate_manifests(report.objects,report.upload_plan,generated,page_dimensions=service_report.page_dimensions)
-        args=['push','--execute','--config',str(self.config),'--generated-dir',str(generated),'--format','json']
+        args=['push','--execute','--config',str(self.config),'--generated-dir',str(generated),
+              '--format','json','--run-dir',str(self.root/'runs')]
         for fail,want in [(None,0),(report.upload_plan[0].key,1)]:
             with self.subTest(fail=fail):
                 (generated / '.workbench-run.json').unlink(missing_ok=True)
@@ -258,9 +268,10 @@ class OutcomesTest(unittest.TestCase):
         generate_manifests(plan.objects,plan.upload_plan,generated,page_dimensions=service_report.page_dimensions)
         out=io.StringIO()
         with patch('workbench_lite.cli.create_s3_client',return_value=store), contextlib.redirect_stdout(out):
-            code=main(['push','--execute','--config',str(self.config),'--generated-dir',str(generated)])
+            code=main(['push','--execute','--config',str(self.config),'--generated-dir',str(generated),
+                       '--run-dir',str(self.root/'runs')])
         self.assertEqual(code,1)
-        for text in ['failed:', 'unattempted:', 'audit/', 'unknown']:
+        for text in ['failed:', 'unattempted:', 'audit/', 'absent']:
             self.assertIn(text,out.getvalue())
         self.assertNotIn('TOPSECRET',out.getvalue())
 
@@ -280,7 +291,8 @@ sys.exit(cli.entrypoint())
         for fault,want in [('fatal',1),('SIGINT',130),('SIGTERM',143)]:
             (self.root / '.workbench-run.json').unlink(missing_ok=True)
             env={**os.environ,'PYTHONPATH':str(ROOT) + os.pathsep + str(ROOT / 'tests'),'FAULT':fault}
-            result=subprocess.run([sys.executable,'-c',runner,'push','--execute','--config',str(self.config),'--generated-dir',str(self.root)],
+            result=subprocess.run([sys.executable,'-c',runner,'push','--execute','--config',str(self.config),
+                                   '--generated-dir',str(self.root),'--run-dir',str(self.root/'runs')],
                                   env=env,capture_output=True,text=True,timeout=10)
             self.assertEqual(result.returncode,want,result.stderr)
             self.assertNotIn('TOPSECRET',result.stdout+result.stderr)
@@ -298,7 +310,9 @@ sys.exit(cli.entrypoint())
         response.headers={'Content-Type':'application/json'}
         response.read.return_value=b'{"width":8,"height":8}'
         with patch('workbench_lite.verify.urlopen',return_value=response), contextlib.redirect_stdout(io.StringIO()):
-            self.assertEqual(main(['verify-cantaloupe','--manifest',str(manifest),'--cantaloupe-base-url','http://localhost']),0)
+            self.assertEqual(main(['verify-cantaloupe','--manifest',str(manifest),
+                                   '--cantaloupe-base-url','http://localhost',
+                                   '--run-dir',str(self.root/'runs')]),0)
 
     def test_rollback_write_failure_preserves_upload_report(self):
         target=self.root/'rollback-directory'
@@ -390,7 +404,8 @@ sys.exit(cli.entrypoint())
         with patch('workbench_lite.cli.create_s3_client', side_effect=AssertionError('client created')):
             with contextlib.redirect_stderr(io.StringIO()):
                 with self.assertRaises(SystemExit) as caught:
-                    main(['push', '--execute', '--config', str(self.config)])
+                    main(['push', '--execute', '--config', str(self.config),
+                          '--run-dir', str(self.root/'runs')])
         self.assertEqual(caught.exception.code, 2)
         result = self.cli('push', '--execute', '--config', self.config)
         self.assertEqual(result.returncode, 2, result.stderr)
@@ -418,12 +433,14 @@ sys.exit(cli.entrypoint())
                 store = Storage()
                 exc = ClientError({'Error': {'Code': code, 'Message': 'TOPSECRET'},
                                    'ResponseMetadata': {'HTTPHeaders': {'Authorization': 'TOPSECRET'}}}, 'PutObject')
-                with patch.object(store, 'upload_file', side_effect=exc):
+                with patch.object(store, 'upload_file', side_effect=exc), \
+                        patch('workbench_lite.push.time.sleep'), \
+                        patch('workbench_lite.push.random.uniform', return_value=0):
                     report = push_upload_plan(self.plan(), self.root, store, False, self.root)
                 message = next(r.message for r in report.results if r.status == 'failed')
                 self.assertIn(code, message)
                 self.assertNotIn('TOPSECRET', json.dumps(report.to_dict()))
-                self.assertIn('unknown', message)
+                self.assertIn('absent', message)
 
 
     def test_wrapped_transfer_failure_retains_s3_code(self):

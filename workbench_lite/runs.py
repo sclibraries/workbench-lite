@@ -222,10 +222,17 @@ def inspect_run(path):
         elif kind == 'intent':
             pending[event['operation_id']] = event
         elif kind == 'result':
-            if event.get('remote_outcome') != 'unknown':
+            if event.get('remote_outcome') == 'unknown':
+                pending[event['operation_id']] = event
+            else:
                 pending.pop(event.get('operation_id'), None)
             status = event.get('status', 'unknown')
             counts[status] = counts.get(status, 0) + 1
+    retry_count = sum(
+        1 for event in events
+        if event['kind'] == 'intent' and event.get('stage') == 'push'
+        and event.get('attempt', 1) > 1
+    )
     push_starts = [index for index, event in enumerate(events)
                    if event['kind'] == 'stage_started' and event['stage'] in {'push', 'push-dry-run'}]
     push_artifacts = []
@@ -263,6 +270,7 @@ def inspect_run(path):
         'state': state, 'exit_code': code, 'incomplete_stage': incomplete,
         'inferred_interruption': incomplete and state == 'interrupted',
         'journal_error': error, 'event_count': len(events), 'counts': counts,
+        'retry_count': retry_count,
         'classification_counts': classification_counts, 'push_artifacts': push_artifacts,
         'publication': publication_status(path, events, state, pending, error),
         'unknown_operations': [{**event, 'outcome': 'unknown'} for event in pending.values()],
@@ -336,13 +344,13 @@ class RunJournal:
         self.append('stage_started', stage=stage, pid=os.getpid(), hostname=socket.gethostname(), options=options or {})
         self.summarize()
 
-    def intent(self, stage, identity):
-        operation_id = uuid4().hex
-        self.append('intent', stage=stage, operation_id=operation_id, attempt=1, **identity)
+    def intent(self, stage, identity, *, operation_id=None, attempt=1):
+        operation_id = operation_id or uuid4().hex
+        self.append('intent', stage=stage, operation_id=operation_id, attempt=attempt, **identity)
         return operation_id
 
-    def result(self, operation_id, stage, result):
-        self.append('result', stage=stage, operation_id=operation_id, attempt=1, **result)
+    def result(self, operation_id, stage, result, *, attempt=1):
+        self.append('result', stage=stage, operation_id=operation_id, attempt=attempt, **result)
 
     def finish(self, code, error=None):
         if self.stage == 'push' and code == 0:
@@ -355,7 +363,7 @@ class RunJournal:
         self.summarize()
 
     def complete_publication(self):
-        """Final commit point after all other required work, including lock release."""
+        """Commit the receipt while the execute writer locks are still held."""
         if self.stage != 'push':
             return
         events, error = read_events(self.path)
@@ -385,6 +393,7 @@ class RunJournal:
             artifacts = '  none'
         text = (f"Run: {self.run_id}\nState: {summary['state']}\n"
                 f"Exit code: {summary['exit_code']}\nEvents: {summary['event_count']}\n"
+                f"Retries: {summary['retry_count']}\n"
                 f"Unknown operations: {len(summary['unknown_operations'])}\n"
                 f"Counts: {json.dumps(summary['counts'], sort_keys=True)}\n"
                 f"Classifications: {json.dumps(summary['classification_counts'], sort_keys=True)}\n"

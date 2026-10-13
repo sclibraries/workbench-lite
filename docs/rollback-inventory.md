@@ -35,23 +35,36 @@ to read the final journal state. The journal and `inspect-run`, not the cached
 inventory state, govern publication handoff.
 
 A dry-run inventory has `mode: preview` and no confirmed new keys. During execute,
-a key enters `new_keys` only if the durable journal records both an absent
-destination check and an acknowledged upload. An existing content key enters
+a key enters `new_keys` only if the durable journal records an initially absent
+destination and a write confirmed by the PUT response or later full-object
+checksum/size reconciliation. A resumed push retains that initial ownership
+evidence after rechecking the destination. An existing content key enters
 `unchanged_keys` only when S3 SHA-256 and size match the current local artifact;
 it is skipped and never becomes rollback deletion scope. Changed existing content
 enters `conflicts`. A differing existing manifest enters `held_keys` with its
 observed prior full-object checksum when S3 provides one, plus its planned
 checksum; otherwise the prior checksum is reported unavailable and the manifest
 stays held. It is not a replacement and is not included in `new_keys`.
-`replacements` remains empty until WBL-0307b defines a
-recoverable overwrite path. These distinctions do not authorize any deletion.
-An upload intent with a missing or uncertain acknowledgment enters
-`unknown_keys`, and the inventory state becomes `needs_reconciliation`. A damaged
+`replacements` remains empty; the CLI has no recoverable overwrite path. These
+distinctions do not authorize any deletion. An upload intent with no result or a
+latest result whose remote outcome is unknown enters `unknown_keys`, and the
+inventory state becomes `needs_reconciliation`. Earlier unknown results are
+resolved by later attempt or reconciliation events and do not keep an operation
+pending. A damaged
 journal or plan produces `invalid_evidence`. An interrupted stage reports
 `incomplete_stage` unless an unknown operation already requires reconciliation.
-The valid journal prefix still shows
-acknowledged writes, but it does not resolve missing evidence. An acknowledged
-write remains listed even if later verification or another upload fails.
+The valid journal prefix still shows confirmed writes, but it does not resolve
+missing evidence. A confirmed write remains listed even if later verification or
+another upload fails. Reconciliation appends a `confirmed`, `absent` or `conflict`
+result for each unknown operation without changing prior journal records. It uses
+HEAD only and does not write or delete S3 objects. After all outcomes are resolved,
+the inventory no longer reports `needs_reconciliation`; conflicts remain excluded
+from `new_keys` and are listed separately.
+
+```sh
+workbench-lite reconcile workbench-lite-runs/RUN_ID
+workbench-lite rollback-inventory workbench-lite-runs/RUN_ID
+```
 
 Every inventory has `deletion_authorized: false`; the inventory itself never grants
 permission to delete. The `rollback` command adds a read-only preview and explicit
@@ -74,7 +87,7 @@ other machines cannot be seen, so that dependency scan is local to the configure
 run root.
 
 Immediately before each delete, the command reads the current S3 `FULL_OBJECT`
-SHA-256 and size. Both must match the acknowledged upload evidence. A mismatch is a
+SHA-256 and size. Both must match the confirmed write evidence. A mismatch is a
 conflict and the object stays. If the object is absent, the result is
 `already_deleted`. The delete request also sends the current ETag in `If-Match` as
 an extra guard. A 412 is recorded as a conflict and no retry or unconditional
