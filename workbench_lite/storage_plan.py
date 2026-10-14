@@ -6,9 +6,9 @@ from urllib.parse import urlparse
 from .models import UploadPlanEntry, WorkbenchObject
 
 
-DEFAULT_PRIVATE_BUCKET = "compass-prod-i2-files"
-DEFAULT_PUBLIC_BUCKET = "islandora-derivatives"
-DEFAULT_PREFIX = "workbench-lite"
+DEFAULT_PRIVATE_BUCKET = 'compass-prod-i2-files'
+DEFAULT_PUBLIC_BUCKET = 'islandora-derivatives'
+DEFAULT_PREFIX = 'workbench-lite'
 
 
 def build_upload_plan(
@@ -19,10 +19,10 @@ def build_upload_plan(
     run_id: str = None,
 ) -> List[UploadPlanEntry]:
     run_id = run_id or uuid4().hex
-    private_bucket = str(config.get("s3_private_bucket") or DEFAULT_PRIVATE_BUCKET)
-    public_bucket = str(config.get("s3_public_bucket") or DEFAULT_PUBLIC_BUCKET)
-    prefix = str(config.get("s3_prefix") or DEFAULT_PREFIX)
-    batch_id = str(config.get("batch_id") or config_path.stem)
+    private_bucket = str(config.get('s3_private_bucket') or DEFAULT_PRIVATE_BUCKET)
+    public_bucket = str(config.get('s3_public_bucket') or DEFAULT_PUBLIC_BUCKET)
+    prefix = str(config.get('s3_prefix') or DEFAULT_PREFIX)
+    batch_id = str(config.get('batch_id') or config_path.stem)
     batch_prefix = _join_key(prefix, _normalize_segment(batch_id))
 
     plan: List[UploadPlanEntry] = []
@@ -31,18 +31,18 @@ def build_upload_plan(
         if workbench_object.pdf_path:
             plan.append(
                 _entry(
-                    role="pdf",
+                    role='pdf',
                     source_path=workbench_object.pdf_path,
                     bucket=private_bucket,
                     key=_join_key(
                         batch_prefix,
-                        "originals",
+                        'originals',
                         object_segment,
                         _source_basename(workbench_object.pdf_path),
                     ),
                     public=False,
                     object_id=workbench_object.object_id,
-                    page_id="",
+                    page_id='',
                     generated=False,
                     input_dir=input_dir,
                 )
@@ -53,14 +53,14 @@ def build_upload_plan(
             if page.file_path:
                 plan.append(
                     _entry(
-                        role="master_tiff",
+                        role='master_tiff',
                         source_path=page.file_path,
                         bucket=private_bucket,
                         key=_join_key(
                             batch_prefix,
-                            "originals",
+                            'originals',
                             object_segment,
-                            "pages",
+                            'pages',
                             _source_basename(page.file_path),
                         ),
                         public=False,
@@ -74,12 +74,12 @@ def build_upload_plan(
             if page.hocr_path:
                 plan.append(
                     _entry(
-                        role="hocr",
+                        role='hocr',
                         source_path=page.hocr_path,
                         bucket=public_bucket,
                         key=_join_key(
                             batch_prefix,
-                            "ocr",
+                            'ocr',
                             object_segment,
                             _source_basename(page.hocr_path),
                         ),
@@ -94,16 +94,16 @@ def build_upload_plan(
             if page.file_path:
                 plan.append(
                     _entry(
-                        role="service_jpg",
+                        role='service_jpg',
                         source_path=page.file_path,
                         bucket=public_bucket,
                         key=_join_key(
                             batch_prefix,
-                            "derivatives",
+                            'derivatives',
                             object_segment,
-                            "pages",
+                            'pages',
                             page_segment,
-                            "service.jpg",
+                            'service.jpg',
                         ),
                         public=True,
                         object_id=workbench_object.object_id,
@@ -114,16 +114,16 @@ def build_upload_plan(
                 )
                 plan.append(
                     _entry(
-                        role="thumbnail",
+                        role='thumbnail',
                         source_path=page.file_path,
                         bucket=public_bucket,
                         key=_join_key(
                             batch_prefix,
-                            "derivatives",
+                            'derivatives',
                             object_segment,
-                            "pages",
+                            'pages',
                             page_segment,
-                            "thumbnail.jpg",
+                            'thumbnail.jpg',
                         ),
                         public=True,
                         object_id=workbench_object.object_id,
@@ -135,13 +135,13 @@ def build_upload_plan(
 
         plan.append(
             UploadPlanEntry(
-                role="manifest",
-                source_path="",
+                role='manifest',
+                source_path='',
                 bucket=public_bucket,
-                key=_join_key(batch_prefix, "manifests", f"{object_segment}.json"),
+                key=_join_key(batch_prefix, 'manifests', f'{object_segment}.json'),
                 public=True,
                 object_id=workbench_object.object_id,
-                page_id="",
+                page_id='',
                 generated=True,
                 source_exists=False,
                 checksum=None,
@@ -150,13 +150,13 @@ def build_upload_plan(
 
     plan.append(
         UploadPlanEntry(
-            role="audit",
-            source_path="",
+            role='audit',
+            source_path='',
             bucket=private_bucket,
-            key=_join_key(batch_prefix, "audit", run_id, "upload-plan.json"),
+            key=_join_key(batch_prefix, 'audit', run_id, 'upload-plan.json'),
             public=False,
-            object_id="",
-            page_id="",
+            object_id='',
+            page_id='',
             generated=True,
             source_exists=False,
             checksum=None,
@@ -193,7 +193,7 @@ def _entry(
 def _source_exists(source_path: str, input_dir: Path) -> bool:
     if not source_path:
         return False
-    if source_path.startswith("http://") or source_path.startswith("https://"):
+    if source_path.startswith('http://') or source_path.startswith('https://'):
         return True
     path = Path(source_path)
     if not path.is_absolute():
@@ -211,17 +211,17 @@ def _normalize_segment(value: str) -> str:
     characters: List[str] = []
     previous_was_separator = False
     for character in value.strip():
-        if character.isalnum() or character in {"-", "_", "."}:
+        if character.isalnum() or character in {'-', '_', '.'}:
             characters.append(character)
             previous_was_separator = False
         else:
             if not previous_was_separator:
-                characters.append("_")
+                characters.append('_')
             previous_was_separator = True
 
-    normalized = "".join(characters).strip("._-")
-    return normalized or "unnamed"
+    normalized = ''.join(characters).strip('._-')
+    return normalized or 'unnamed'
 
 
 def _join_key(*parts: str) -> str:
-    return "/".join(part.strip("/") for part in parts if part.strip("/"))
+    return '/'.join(part.strip('/') for part in parts if part.strip('/'))

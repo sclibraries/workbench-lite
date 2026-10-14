@@ -13,11 +13,11 @@ class PageRecord:
 
     def to_dict(self) -> Dict[str, object]:
         return {
-            "page_id": self.page_id,
-            "title": self.title,
-            "weight": self.weight,
-            "file_path": self.file_path,
-            "hocr_path": self.hocr_path,
+            'page_id': self.page_id,
+            'title': self.title,
+            'weight': self.weight,
+            'file_path': self.file_path,
+            'hocr_path': self.hocr_path,
         }
 
 
@@ -31,11 +31,11 @@ class WorkbenchObject:
 
     def to_dict(self) -> Dict[str, object]:
         return {
-            "object_id": self.object_id,
-            "title": self.title,
-            "pdf_path": self.pdf_path,
-            "page_count": len(self.pages),
-            "pages": [page.to_dict() for page in self.pages],
+            'object_id': self.object_id,
+            'title': self.title,
+            'pdf_path': self.pdf_path,
+            'page_count': len(self.pages),
+            'pages': [page.to_dict() for page in self.pages],
         }
 
 
@@ -54,16 +54,16 @@ class UploadPlanEntry:
 
     def to_dict(self) -> Dict[str, object]:
         return {
-            "role": self.role,
-            "source_path": self.source_path,
-            "bucket": self.bucket,
-            "key": self.key,
-            "public": self.public,
-            "object_id": self.object_id,
-            "page_id": self.page_id,
-            "generated": self.generated,
-            "source_exists": self.source_exists,
-            "checksum": self.checksum,
+            'role': self.role,
+            'source_path': self.source_path,
+            'bucket': self.bucket,
+            'key': self.key,
+            'public': self.public,
+            'object_id': self.object_id,
+            'page_id': self.page_id,
+            'generated': self.generated,
+            'source_exists': self.source_exists,
+            'checksum': self.checksum,
         }
 
 
@@ -83,15 +83,15 @@ class CheckReport:
 
     def to_dict(self) -> Dict[str, object]:
         return {
-            "row_count": self.row_count,
-            "column_count": self.column_count,
-            "parent_count": self.parent_count,
-            "page_count": self.page_count,
-            "unique_child_parent_count": self.unique_child_parent_count,
-            "bad_child_weight_count": self.bad_child_weight_count,
-            "file_counts": self.file_counts,
-            "validation_errors": self.validation_errors,
-            "validation_warnings": self.validation_warnings,
-            "objects": [obj.to_dict() for obj in self.objects],
-            "upload_plan": [entry.to_dict() for entry in self.upload_plan],
+            'row_count': self.row_count,
+            'column_count': self.column_count,
+            'parent_count': self.parent_count,
+            'page_count': self.page_count,
+            'unique_child_parent_count': self.unique_child_parent_count,
+            'bad_child_weight_count': self.bad_child_weight_count,
+            'file_counts': self.file_counts,
+            'validation_errors': self.validation_errors,
+            'validation_warnings': self.validation_warnings,
+            'objects': [obj.to_dict() for obj in self.objects],
+            'upload_plan': [entry.to_dict() for entry in self.upload_plan],
         }

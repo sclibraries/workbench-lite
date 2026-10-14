@@ -10,12 +10,12 @@ class ConfigError(ValueError):
 def load_config(config_path: Path) -> Dict[str, object]:
     path = Path(config_path)
     if not path.exists():
-        raise ConfigError(f"Config file not found: {path}")
+        raise ConfigError(f'Config file not found: {path}')
 
     try:
         import yaml  # type: ignore
     except ImportError as exc:
-        raise ConfigError("PyYAML is required; install the Workbench-lite requirements.") from exc
+        raise ConfigError('PyYAML is required; install the Workbench-lite requirements.') from exc
 
     class UniqueKeyLoader(yaml.SafeLoader):
         pass
@@ -30,36 +30,51 @@ def load_config(config_path: Path) -> Dict[str, object]:
         return result
 
     UniqueKeyLoader.add_constructor(yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG, unique_mapping)
-    with path.open("r", encoding="utf-8") as handle:
+    with path.open('r', encoding='utf-8') as handle:
         try:
             loaded = yaml.load(handle, Loader=UniqueKeyLoader)
             if loaded is None:
                 loaded = {}
         except yaml.YAMLError as exc:
-            raise ConfigError("Invalid YAML syntax; check the configuration file.") from exc
+            raise ConfigError('Invalid YAML syntax; check the configuration file.') from exc
     if not isinstance(loaded, dict):
-        raise ConfigError("Workbench-lite config must be a YAML mapping.")
+        raise ConfigError('Workbench-lite config must be a YAML mapping.')
     return _validate_config(loaded)
 
 
-def _validate_config(config: Dict[str, object]) -> Dict[str, object]:
+def _validate_config(config: Dict[str, object]) -> Dict[str, object]:  # noqa: C901
     # Validate consumed scalar types before any generation/upload side effects.
-    for name in ("input_dir", "input_csv", "manifest_base_url", "cantaloupe_base_url",
-                 "s3_private_bucket", "s3_public_bucket", "s3_prefix", "batch_id"):
+    for name in (
+        'input_dir',
+        'input_csv',
+        'manifest_base_url',
+        'cantaloupe_base_url',
+        's3_private_bucket',
+        's3_public_bucket',
+        's3_prefix',
+        'batch_id',
+    ):
         if name in config and not isinstance(config[name], str):
-            raise ConfigError(f"Configuration {name} must be a string.")
-    if "allow_missing_files" in config and not isinstance(config["allow_missing_files"], bool):
-        raise ConfigError("Configuration allow_missing_files must be a boolean.")
+            raise ConfigError(f'Configuration {name} must be a string.')
+    if 'allow_missing_files' in config and not isinstance(config['allow_missing_files'], bool):
+        raise ConfigError('Configuration allow_missing_files must be a boolean.')
     for name in ('s3_prefix', 'batch_id'):
         if name in config:
             value = config[name]
-            if not value.strip('/') or any(part in {'.', '..'} for part in value.split('/')) or '\\' in value or '\x00' in value:
+            if (
+                not value.strip('/')
+                or any(part in {'.', '..'} for part in value.split('/'))
+                or '\\' in value
+                or '\x00' in value
+            ):
                 raise ConfigError(f'Configuration {name} contains an unsafe key segment.')
     for name in ('s3_private_bucket', 's3_public_bucket'):
         if name in config and not re.fullmatch(r'[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]', config[name]):
             raise ConfigError(f'Configuration {name} must be a DNS-style S3 bucket name.')
     additional = config.get('additional_files', [])
-    if not isinstance(additional, list) or any(not isinstance(item, dict) or len(item) != 1 for item in additional):
+    if not isinstance(additional, list) or any(
+        not isinstance(item, dict) or len(item) != 1 for item in additional
+    ):
         raise ConfigError('Configuration additional_files must be a list of single-field mappings.')
     keys = [key for item in additional for key in item]
     if any(not isinstance(key, str) or not key for key in keys) or len(keys) != len(set(keys)):
@@ -68,7 +83,7 @@ def _validate_config(config: Dict[str, object]) -> Dict[str, object]:
 
 
 def normalize_additional_files(config: Dict[str, object]) -> Dict[str, object]:
-    raw_entries = config.get("additional_files", [])
+    raw_entries = config.get('additional_files', [])
     normalized: Dict[str, object] = {}
     if not isinstance(raw_entries, list):
         return normalized

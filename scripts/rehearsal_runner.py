@@ -43,9 +43,7 @@ def cli_factory(mode=None):
             endpoint_url and re.fullmatch(r'http://127\.0\.0\.1:\d+', endpoint_url)
         )
         if endpoint_url != ENDPOINT and not closed_loopback:
-            raise RuntimeError(
-                f'Rehearsal refused unexpected endpoint: {endpoint_url!r}'
-            )
+            raise RuntimeError(f'Rehearsal refused unexpected endpoint: {endpoint_url!r}')
         adapter = create_s3_client(endpoint_url, region or 'us-east-1', None, **kwargs)
         return FaultClient(adapter, mode)
 
@@ -89,9 +87,7 @@ class ScenarioRunner:
         return f'{self.base_prefix}/{alias}/case-{number:02d}'
 
     def command(self, directory, display, argv, *, mode=None, extra_patches=()):
-        result = invoke_cli(
-            argv, cli_factory(mode), self.lock_root, extra_patches=extra_patches
-        )
+        result = invoke_cli(argv, cli_factory(mode), self.lock_root, extra_patches=extra_patches)
         self.evidence.record_command(directory, display, argv, result)
         return result
 
@@ -158,9 +154,7 @@ class ScenarioRunner:
         if resume:
             argv.append('--resume')
         label = 'push --execute' + (' --resume' if resume else '')
-        return self.command(
-            directory, label, argv, mode=mode, extra_patches=extra_patches
-        )
+        return self.command(directory, label, argv, mode=mode, extra_patches=extra_patches)
 
     def run_all(self):
         for alias in ('single', 'triple'):
@@ -232,9 +226,7 @@ class ScenarioRunner:
             )
             return {'steps': {}, 'recovery': 'scenario did not complete'}, error
 
-    def _case_record(
-        self, alias, number, directory, prefix, before, observed, error, elapsed
-    ):
+    def _case_record(self, alias, number, directory, prefix, before, observed, error, elapsed):
         after = self._storage_snapshot(prefix)
         sentinel_ok, sentinel_state = checksum_sentinels(self.storage, self.sentinels)
         if not sentinel_ok:
@@ -245,9 +237,7 @@ class ScenarioRunner:
                     'expected': 'all sentinel checksums unchanged',
                     'observed': sentinel_state,
                     'reproduction': {
-                        'commands': [
-                            item['command'] for item in self.evidence.commands[-8:]
-                        ],
+                        'commands': [item['command'] for item in self.evidence.commands[-8:]],
                     },
                 }
             )
@@ -294,11 +284,7 @@ class ScenarioRunner:
             hold_barrier=True,
         )
         deadline = time.monotonic() + 60
-        while (
-            time.monotonic() < deadline
-            and process.poll() is None
-            and not ready.exists()
-        ):
+        while time.monotonic() < deadline and process.poll() is None and not ready.exists():
             time.sleep(0.02)
         if not ready.exists():
             process.kill()
@@ -416,18 +402,12 @@ class RehearsalController:
         finally:
             self._finalize()
         self._print_result()
-        return int(
-            bool(
-                self.error or self.evidence.findings or not self.cleanup.get('complete')
-            )
-        )
+        return int(bool(self.error or self.evidence.findings or not self.cleanup.get('complete')))
 
     def _prepare_existing_root(self):
         entries = list(self.artifact_root.iterdir())
         history = [
-            item
-            for item in entries
-            if item.is_dir() and item.name.startswith('startup-check-')
+            item for item in entries if item.is_dir() and item.name.startswith('startup-check-')
         ]
         active = [item for item in entries if item not in history]
         if not active:
@@ -548,10 +528,7 @@ class RehearsalController:
     def _print_result(self):
         results = self.runner.results if self.runner else []
         print(f'Artifacts: {self.artifact_root}')
-        print(
-            f'Scenarios recorded: {len(results)}; '
-            f'findings: {len(self.evidence.findings)}'
-        )
+        print(f'Scenarios recorded: {len(results)}; findings: {len(self.evidence.findings)}')
         print(f'Cleanup complete: {self.cleanup.get("complete")}')
         print(f'Summary: {self.artifact_root / "summary.md"}')
 

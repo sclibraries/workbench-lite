@@ -1,4 +1,5 @@
 """Local readiness and bounded read-only storage checks; never probe-write."""
+
 import json
 import os
 from pathlib import Path
@@ -12,14 +13,18 @@ from .diagnostics import operation_error
 def safe_source(value, input_dir):
     path = Path(value)
     root = Path(input_dir).resolve()
-    if ('..' in path.parts or '\\' in value or '\x00' in value
-            or value.startswith(('http://', 'https://'))):
+    if (
+        '..' in path.parts
+        or '\\' in value
+        or '\x00' in value
+        or value.startswith(('http://', 'https://'))
+    ):
         return False
-    candidate = path if path.is_absolute() else root/path
+    candidate = path if path.is_absolute() else root / path
     return candidate.resolve().is_relative_to(root)
 
 
-def validate_content(path, role):
+def validate_content(path, role):  # noqa: C901
     """Return a safe diagnostic; PDF checking is framing, not full parsing."""
     path = Path(path)
     try:
@@ -54,7 +59,7 @@ def validate_content(path, role):
     return None
 
 
-def output_readiness(entries, input_dir, output_dir, *, generating=False, new_audit=False):
+def output_readiness(entries, input_dir, output_dir, *, generating=False, new_audit=False):  # noqa: C901, PLR0915
     errors, planned, missing = [], [], []
     required_bytes = 0
     root = Path(output_dir).resolve() if output_dir is not None else None
@@ -64,20 +69,27 @@ def output_readiness(entries, input_dir, output_dir, *, generating=False, new_au
         if '..' in Path(entry.key).parts or Path(entry.key).is_absolute() or '\\' in entry.key:
             errors.append(f'Unsafe destination key for {entry.object_id}/{entry.page_id}.')
             continue
-        target = root/entry.key if root else None
+        target = root / entry.key if root else None
         if target and not target.resolve().is_relative_to(root):
-            errors.append(f'Output escapes generated directory for {entry.object_id}/{entry.page_id}: {entry.key}')
+            errors.append(
+                f'Output escapes generated directory for '
+                f'{entry.object_id}/{entry.page_id}: {entry.key}'
+            )
             continue
         if target:
             parent = target.parent
             while not parent.exists():
                 parent = parent.parent
             if not parent.is_dir() or (target.exists() and not target.is_file()):
-                errors.append(f'Generated artifact path is not a writable file location: {entry.key}')
+                errors.append(
+                    f'Generated artifact path is not a writable file location: {entry.key}'
+                )
                 continue
             if generating or (new_audit and entry.role == 'audit'):
                 if not os.access(parent, os.W_OK | os.X_OK):
-                    errors.append(f'Generated artifact parent is not writable/searchable: {entry.key}')
+                    errors.append(
+                        f'Generated artifact parent is not writable/searchable: {entry.key}'
+                    )
                 if target.is_file() and entry.role != 'audit' and not os.access(target, os.W_OK):
                     errors.append(f'Generated artifact cannot be overwritten: {entry.key}')
         if generating or (new_audit and entry.role == 'audit') or root is None:
@@ -85,7 +97,7 @@ def output_readiness(entries, input_dir, output_dir, *, generating=False, new_au
             required_bytes += 65536  # Per-file encoding, manifest and journal allowance.
             if generating and entry.role in {'service_jpg', 'thumbnail'}:
                 source = Path(entry.source_path)
-                source = source if source.is_absolute() else Path(input_dir)/source
+                source = source if source.is_absolute() else Path(input_dir) / source
                 if source.is_file():
                     try:
                         with Image.open(source) as image:
@@ -108,13 +120,20 @@ def output_readiness(entries, input_dir, output_dir, *, generating=False, new_au
             errors.append('Output directory is not writable/searchable.')
         if free < required_bytes:
             errors.append('Insufficient free disk for conservative generation/evidence estimate.')
-    return {'errors': errors, 'missing_generated': missing, 'planned_generation': planned,
-            'estimated_additional_bytes': required_bytes, 'available_bytes': free,
-            'estimate_basis': 'source RGB upper estimate plus 64 KiB per generated entry; no disk reservation'}
+    return {
+        'errors': errors,
+        'missing_generated': missing,
+        'planned_generation': planned,
+        'estimated_additional_bytes': required_bytes,
+        'available_bytes': free,
+        'estimate_basis': 'source RGB upper estimate plus 64 KiB per generated entry; '
+        'no disk reservation',
+    }
 
 
 def storage_readiness(client, entries, endpoint, *, offline=False, journal=None):
     from .push import STORAGE_ERRORS
+
     targets = []
     checks, errors = [], []
     for bucket in sorted({entry.bucket for entry in entries}):
@@ -125,8 +144,10 @@ def storage_readiness(client, entries, endpoint, *, offline=False, journal=None)
         targets.append({'endpoint': endpoint, 'bucket': bucket, 'prefix': prefix})
         if offline:
             continue
-        operations = [('HeadBucket', client.head_bucket, {'Bucket': bucket}),
-                      ('ListObjectsV2', None, {'Bucket': bucket, 'Prefix': prefix, 'MaxKeys': 1})]
+        operations = [
+            ('HeadBucket', client.head_bucket, {'Bucket': bucket}),
+            ('ListObjectsV2', None, {'Bucket': bucket, 'Prefix': prefix, 'MaxKeys': 1}),
+        ]
         for operation, method, parameters in operations:
             identity = {'operation': operation, 'bucket': bucket, 'prefix': prefix}
             op = journal.intent('preflight', identity) if journal else None
@@ -146,7 +167,17 @@ def storage_readiness(client, entries, endpoint, *, offline=False, journal=None)
                 journal.result(op, 'preflight', result)
             if result['status'] == 'failed':
                 break
-    return {'targets': targets, 'checks': checks, 'errors': errors,
-            'credential_access': 'not_checked' if offline else 'failed' if errors else 'read_access_verified',
-            'write_permission': 'unverified', 'offline': offline,
-            'limitations': 'Read-only access does not prove PutObject permission or absence of conflicting remote objects.'}
+    return {
+        'targets': targets,
+        'checks': checks,
+        'errors': errors,
+        'credential_access': 'not_checked'
+        if offline
+        else 'failed'
+        if errors
+        else 'read_access_verified',
+        'write_permission': 'unverified',
+        'offline': offline,
+        'limitations': 'Read-only access does not prove PutObject permission or absence of '
+        'conflicting remote objects.',
+    }

@@ -11,12 +11,33 @@ It does not create repository records.
 
 ## Test
 
+Install the development tools with:
+
+```sh
+python3 -m pip install -r requirements-dev.txt
+```
+
+Run lint and format checks with:
+
+```sh
+python3 -m ruff check . && python3 -m ruff format --check .
+```
+
+Run the test suite with:
+
 ```sh
 python3 -m unittest discover -s tests -v
 ```
 
 The suite uses synthetic packages and local test doubles. It must keep passing without AWS
 credentials, network access or staff inputs; do not add tests that need them.
+
+## Code standards
+
+- Keep code DRY; share rules and behavior instead of copying them.
+- Keep each module, class, and function focused on one responsibility.
+- Prefer lean functions with one level of abstraction; extract helpers when that makes flow easier to follow.
+- Ruff lint and format checks must pass. Fix findings by simplifying and reformatting the code.
 
 ## Safety rules for storage
 

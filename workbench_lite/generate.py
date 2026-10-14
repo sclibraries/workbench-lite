@@ -16,16 +16,18 @@ class GenerateResult:
     missing_source_count: int
     failed_count: int
     target_count: int
-    results: List["GenerateResultEntry"] = field(default_factory=list)
-    page_dimensions: Dict[tuple[str, str], tuple[int, int]] = field(default_factory=dict, repr=False)
+    results: List['GenerateResultEntry'] = field(default_factory=list)
+    page_dimensions: Dict[tuple[str, str], tuple[int, int]] = field(
+        default_factory=dict, repr=False
+    )
 
     def to_dict(self) -> dict:
         return {
-            "generated_count": self.generated_count,
-            "missing_source_count": self.missing_source_count,
-            "failed_count": self.failed_count,
-            "target_count": self.target_count,
-            "results": [entry.to_dict() for entry in self.results],
+            'generated_count': self.generated_count,
+            'missing_source_count': self.missing_source_count,
+            'failed_count': self.failed_count,
+            'target_count': self.target_count,
+            'results': [entry.to_dict() for entry in self.results],
         }
 
 
@@ -37,17 +39,17 @@ class GenerateResultEntry:
     status: str
     checksum: Optional[str]
     size_bytes: Optional[int]
-    message: str = ""
+    message: str = ''
 
     def to_dict(self) -> dict:
         return {
-            "role": self.role,
-            "source_path": self.source_path,
-            "output_path": self.output_path,
-            "status": self.status,
-            "checksum": self.checksum,
-            "size_bytes": self.size_bytes,
-            "message": self.message,
+            'role': self.role,
+            'source_path': self.source_path,
+            'output_path': self.output_path,
+            'status': self.status,
+            'checksum': self.checksum,
+            'size_bytes': self.size_bytes,
+            'message': self.message,
         }
 
 
@@ -63,7 +65,7 @@ def generate_service_jpgs(
         upload_plan=upload_plan,
         input_dir=input_dir,
         output_dir=output_dir,
-        role="service_jpg",
+        role='service_jpg',
         max_long_side=max_long_side,
         quality=quality,
         journal=journal,
@@ -82,7 +84,7 @@ def generate_thumbnails(
         upload_plan=upload_plan,
         input_dir=input_dir,
         output_dir=output_dir,
-        role="thumbnail",
+        role='thumbnail',
         max_long_side=max_long_side,
         quality=quality,
         journal=journal,
@@ -99,12 +101,14 @@ def _generate_derivatives(
     journal=None,
 ) -> GenerateResult:
     entries = [entry for entry in upload_plan if entry.role == role]
-    results = RecordedResults(journal, "generate")
+    results = RecordedResults(journal, 'generate')
     generated_count = 0
     missing_source_count = 0
     failed_count = 0
     page_dimensions: Dict[tuple[str, str], tuple[int, int]] = {}
-    success_message = "Service JPEG generated." if role == "service_jpg" else "Thumbnail JPEG generated."
+    success_message = (
+        'Service JPEG generated.' if role == 'service_jpg' else 'Thumbnail JPEG generated.'
+    )
 
     for entry in entries:
         results.begin(entry.to_dict())
@@ -116,10 +120,10 @@ def _generate_derivatives(
                     role=entry.role,
                     source_path=str(source_path),
                     output_path=str(_output_path_for_entry(entry, output_dir)),
-                    status="missing_source",
+                    status='missing_source',
                     checksum=None,
                     size_bytes=None,
-                    message="Source image file is missing.",
+                    message='Source image file is missing.',
                 )
             )
             continue
@@ -141,10 +145,12 @@ def _generate_derivatives(
                     role=entry.role,
                     source_path=str(source_path),
                     output_path=str(target),
-                    status="failed",
+                    status='failed',
                     checksum=None,
                     size_bytes=None,
-                    message=pixel_limit_error() if isinstance(exc, Image.DecompressionBombError) else operation_error(exc),
+                    message=pixel_limit_error()
+                    if isinstance(exc, Image.DecompressionBombError)
+                    else operation_error(exc),
                 )
             )
             continue
@@ -156,7 +162,7 @@ def _generate_derivatives(
                 role=entry.role,
                 source_path=str(source_path),
                 output_path=str(target),
-                status="generated",
+                status='generated',
                 checksum=checksum,
                 size_bytes=size_bytes,
                 message=success_message,
@@ -184,13 +190,13 @@ def _convert_tiff_to_jpeg(
     with Image.open(source_path) as image:
         width, height = image.size
         if width == 0 or height == 0:
-            raise ValueError("Source image has invalid dimensions.")
+            raise ValueError('Source image has invalid dimensions.')
 
-        image = image.convert("RGB")
+        image = image.convert('RGB')
         if max_long_side > 0:
             image.thumbnail((max_long_side, max_long_side), resample=Image.Resampling.LANCZOS)
 
-        image.save(output_path, format="JPEG", quality=quality, optimize=True)
+        image.save(output_path, format='JPEG', quality=quality, optimize=True)
 
     return width, height
 
@@ -203,13 +209,13 @@ def _resolve_source_path(source_path: str, input_dir: Path) -> Path:
 
 
 def _output_path_for_entry(entry: UploadPlanEntry, output_dir: Path) -> Path:
-    normalized = str(Path(entry.key).as_posix()).lstrip("/")
+    normalized = str(Path(entry.key).as_posix()).lstrip('/')
     return output_dir / normalized
 
 
 def _checksum_for_file(path: Path) -> str:
     digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+    with path.open('rb') as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b''):
             digest.update(chunk)
     return digest.hexdigest()

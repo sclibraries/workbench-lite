@@ -22,27 +22,19 @@ def parse_sample(value):
         raise argparse.ArgumentTypeError('samples must use ALIAS=PATH syntax')
     alias, path = value.split('=', 1)
     if alias not in {'single', 'triple', 'large'}:
-        raise argparse.ArgumentTypeError(
-            'sample alias must be single, triple, or large'
-        )
+        raise argparse.ArgumentTypeError('sample alias must be single, triple, or large')
     source = Path(path).expanduser().resolve()
     if not source.is_dir():
-        raise argparse.ArgumentTypeError(
-            f'sample directory does not exist for alias {alias}'
-        )
+        raise argparse.ArgumentTypeError(f'sample directory does not exist for alias {alias}')
     return alias, source
 
 
 def validate_target(endpoint, private_bucket, public_bucket):
     if endpoint != ENDPOINT:
-        raise ValueError(
-            'Only the specified loopback LocalStack endpoint is permitted.'
-        )
+        raise ValueError('Only the specified loopback LocalStack endpoint is permitted.')
     pattern = re.compile(r'^wbl-local-test-[a-z0-9][a-z0-9.-]*[a-z0-9]$')
     if not pattern.fullmatch(private_bucket) or not pattern.fullmatch(public_bucket):
-        raise ValueError(
-            'Both rehearsal buckets must use the wbl-local-test-* namespace.'
-        )
+        raise ValueError('Both rehearsal buckets must use the wbl-local-test-* namespace.')
     if private_bucket == public_bucket:
         raise ValueError('Private and public rehearsal buckets must differ.')
 
@@ -109,9 +101,7 @@ def storage_listing(storage, bucket, prefix):
             break
         token = response.get('NextContinuationToken')
         if not token:
-            raise RuntimeError(
-                'LocalStack listing was truncated without a continuation token.'
-            )
+            raise RuntimeError('LocalStack listing was truncated without a continuation token.')
     return result
 
 
@@ -135,9 +125,7 @@ def sample_inputs(source_root):
     configs = sorted([*source_root.rglob('*.yml'), *source_root.rglob('*.yaml')])
     csvs = sorted(source_root.rglob('*.csv'))
     if len(configs) != 1 or len(csvs) != 1:
-        raise ValueError(
-            'Each supplied sample copy must contain one YAML config and one CSV.'
-        )
+        raise ValueError('Each supplied sample copy must contain one YAML config and one CSV.')
     return configs[0], csvs[0]
 
 

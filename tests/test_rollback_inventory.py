@@ -1,4 +1,5 @@
 """Rollback evidence must never promote a plan into a confirmed write."""
+
 import json
 import contextlib
 import io
@@ -23,9 +24,35 @@ class RollbackInventoryTests(unittest.TestCase):
         self.config.write_text('batch_id: batch-one\n')
         self.csv.write_text('title\nexample\n')
         self.run = RunJournal.create(self.root / 'runs')
-        self.run.inputs(self.config, {'batch_id': 'batch-one', 'input_csv': str(self.csv)}, self.csv)
-        self.entries = [UploadPlanEntry('master_tiff', 'source.tif', 'private', 'batch/new.tif', False, 'obj', 'page', False, True, None),
-                        UploadPlanEntry('manifest', 'obj.json', 'public', 'batch/obj.json', True, 'obj', '', True, True, None)]
+        self.run.inputs(
+            self.config, {'batch_id': 'batch-one', 'input_csv': str(self.csv)}, self.csv
+        )
+        self.entries = [
+            UploadPlanEntry(
+                'master_tiff',
+                'source.tif',
+                'private',
+                'batch/new.tif',
+                False,
+                'obj',
+                'page',
+                False,
+                True,
+                None,
+            ),
+            UploadPlanEntry(
+                'manifest',
+                'obj.json',
+                'public',
+                'batch/obj.json',
+                True,
+                'obj',
+                '',
+                True,
+                True,
+                None,
+            ),
+        ]
         self.run.plan(self.entries)
 
     def record(self, stage, entry, status, *, outcome=None):
@@ -66,9 +93,12 @@ class RollbackInventoryTests(unittest.TestCase):
         self.record('destination-check', entry, 'absent')
         identity = {**entry.to_dict(), 'checksum': 'a' * 64, 'size_bytes': 10}
         operation = self.run.intent('push', identity, attempt=1)
-        self.run.result(operation, 'push', {**identity, 'status': 'failed',
-                                           'remote_outcome': 'absent', 'disposition': 'retrying'},
-                       attempt=1)
+        self.run.result(
+            operation,
+            'push',
+            {**identity, 'status': 'failed', 'remote_outcome': 'absent', 'disposition': 'retrying'},
+            attempt=1,
+        )
         self.run.intent('push', identity, operation_id=operation, attempt=2)
         self.run.finish(130)
 
@@ -98,6 +128,7 @@ class RollbackInventoryTests(unittest.TestCase):
     def test_output_must_not_overwrite_run_evidence(self):
         from workbench_lite.rollback_inventory import write_inventory
         from workbench_lite.runs import JournalError
+
         self.run.start('push-dry-run')
         self.run.finish(0)
         before = (self.run.path / 'events.jsonl').read_bytes()
@@ -153,29 +184,53 @@ class RollbackInventoryTests(unittest.TestCase):
         self.record('push', self.entries[0], 'uploaded')
         self.run.finish(1)
         output = self.root / 'copy.json'
-        with patch('workbench_lite.cli.create_s3_client', side_effect=AssertionError('remote call')):
-            self.assertEqual(main(['rollback-inventory', str(self.run.path), '--output', str(output)]), 0)
+        with patch(
+            'workbench_lite.cli.create_s3_client', side_effect=AssertionError('remote call')
+        ):
+            self.assertEqual(
+                main(['rollback-inventory', str(self.run.path), '--output', str(output)]), 0
+            )
         self.assertEqual(json.loads(output.read_text())['new_keys'][0]['key'], 'batch/new.tif')
         self.assertEqual(output.stat().st_mode & 0o077, 0)
 
     def test_manifest_url_uses_generate_flag_when_yaml_has_no_base(self):
         from test_outcomes import Storage, package
+
         config = package(self.root)
         output = self.root / 'generated'
         base_url = 'https://digital.example.edu/manifests'
         common = ['--config', str(config), '--run-dir', str(self.root / 'runs')]
         with contextlib.redirect_stdout(io.StringIO()):
-            self.assertEqual(main(['generate', *common, '--output-dir', str(output),
-                                   '--manifests', '--thumbnails', '--manifest-base-url', base_url]), 0)
+            self.assertEqual(
+                main(
+                    [
+                        'generate',
+                        *common,
+                        '--output-dir',
+                        str(output),
+                        '--manifests',
+                        '--thumbnails',
+                        '--manifest-base-url',
+                        base_url,
+                    ]
+                ),
+                0,
+            )
         reference = json.loads((output / '.workbench-run.json').read_text())
         run_path = Path(reference['run_path'])
-        with patch('workbench_lite.cli.create_s3_client', return_value=Storage()), \
-             contextlib.redirect_stdout(io.StringIO()):
-            self.assertEqual(main(['push', *common, '--execute', '--generated-dir', str(output)]), 0)
+        with (
+            patch('workbench_lite.cli.create_s3_client', return_value=Storage()),
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            self.assertEqual(
+                main(['push', *common, '--execute', '--generated-dir', str(output)]), 0
+            )
         inventory = build_inventory(run_path)
         self.assertEqual(len(inventory['manifest_urls']), 1)
         manifest = output / inventory['manifest_urls'][0]['key']
-        self.assertEqual(inventory['manifest_urls'][0]['url'], json.loads(manifest.read_text())['@id'])
+        self.assertEqual(
+            inventory['manifest_urls'][0]['url'], json.loads(manifest.read_text())['@id']
+        )
 
 
 if __name__ == '__main__':

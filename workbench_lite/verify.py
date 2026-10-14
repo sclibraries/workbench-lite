@@ -25,21 +25,21 @@ class ServiceVerificationResult:
     content_type: Optional[str]
     width: Optional[int]
     height: Optional[int]
-    message: str = ""
+    message: str = ''
 
     def to_dict(self) -> Dict[str, object]:
         return {
-            "manifest_path": self.manifest_path,
-            "object_id": self.object_id,
-            "canvas_id": self.canvas_id,
-            "service_id": self.service_id,
-            "info_url": self.info_url,
-            "ok": self.ok,
-            "status_code": self.status_code,
-            "content_type": self.content_type,
-            "width": self.width,
-            "height": self.height,
-            "message": self.message,
+            'manifest_path': self.manifest_path,
+            'object_id': self.object_id,
+            'canvas_id': self.canvas_id,
+            'service_id': self.service_id,
+            'info_url': self.info_url,
+            'ok': self.ok,
+            'status_code': self.status_code,
+            'content_type': self.content_type,
+            'width': self.width,
+            'height': self.height,
+            'message': self.message,
         }
 
 
@@ -52,10 +52,10 @@ class CantaloupeVerifyReport:
 
     def to_dict(self) -> Dict[str, object]:
         return {
-            "tested_count": self.tested_count,
-            "passed_count": self.passed_count,
-            "failed_count": self.failed_count,
-            "results": [result.to_dict() for result in self.results],
+            'tested_count': self.tested_count,
+            'passed_count': self.passed_count,
+            'failed_count': self.failed_count,
+            'results': [result.to_dict() for result in self.results],
         }
 
 
@@ -72,26 +72,40 @@ def verify_manifest_service_urls(
         payload = _load_manifest_json(path)
         service_entries = _iter_service_entries(payload)
         if not service_entries:
-            raise ConfigError(f"Manifest has no canvas service IDs: {path}")
+            raise ConfigError(f'Manifest has no canvas service IDs: {path}')
         for _, service_id in service_entries:
             resolved = _resolve_service_id(service_id, base_url_override)
             try:
                 url = urlsplit(resolved)
-                valid = url.scheme in {"http", "https"} and bool(url.hostname)
-                url.port
+                port = url.port
+                valid = (
+                    url.scheme in {'http', 'https'}
+                    and bool(url.hostname)
+                    and (port is None or 0 <= port <= 65535)
+                )
             except ValueError:
                 valid = False
             if not valid:
-                raise ConfigError(f"Manifest service IDs need valid HTTP(S) URLs or a base override: {path}")
-        prepared.append((path, str(payload.get("@id", path.stem)), service_entries))
+                raise ConfigError(
+                    f'Manifest service IDs need valid HTTP(S) URLs or a base override: {path}'
+                )
+        prepared.append((path, str(payload.get('@id', path.stem)), service_entries))
 
-    results = RecordedResults(journal, "verify-cantaloupe")
+    results = RecordedResults(journal, 'verify-cantaloupe')
     for path, object_id, service_entries in prepared:
         for canvas_id, service_id in service_entries:
-            resolved_service_id = _resolve_service_id(service_id, base_url_override=base_url_override)
+            resolved_service_id = _resolve_service_id(
+                service_id, base_url_override=base_url_override
+            )
             info_url = _info_url(resolved_service_id)
-            results.begin({'manifest_path': str(path), 'object_id': object_id,
-                           'canvas_id': canvas_id, 'info_url': info_url})
+            results.begin(
+                {
+                    'manifest_path': str(path),
+                    'object_id': object_id,
+                    'canvas_id': canvas_id,
+                    'info_url': info_url,
+                }
+            )
             is_ok, status_code, content_type, width, height, message = _fetch_info_json(
                 info_url,
                 timeout_seconds,
@@ -125,19 +139,19 @@ def verify_manifest_service_urls(
 
 def _load_manifest_json(path: Path) -> dict:
     if not path.is_file():
-        raise ConfigError(f"Manifest file not found: {path}")
+        raise ConfigError(f'Manifest file not found: {path}')
     try:
-        with path.open("r", encoding="utf-8") as handle:
+        with path.open('r', encoding='utf-8') as handle:
             payload = json.load(handle)
     except (json.JSONDecodeError, UnicodeDecodeError) as exc:
-        raise ConfigError(f"Manifest did not contain valid JSON: {path}") from exc
+        raise ConfigError(f'Manifest did not contain valid JSON: {path}') from exc
     if not isinstance(payload, dict):
-        raise ConfigError(f"Manifest must be a JSON object: {path}")
+        raise ConfigError(f'Manifest must be a JSON object: {path}')
     return payload
 
 
-def _iter_service_entries(payload: dict) -> List[tuple[str, str]]:
-    sequences = payload.get("sequences", [])
+def _iter_service_entries(payload: dict) -> List[tuple[str, str]]:  # noqa: C901
+    sequences = payload.get('sequences', [])
     if not isinstance(sequences, list):
         return []
 
@@ -145,7 +159,7 @@ def _iter_service_entries(payload: dict) -> List[tuple[str, str]]:
     for sequence in sequences:
         if not isinstance(sequence, dict):
             continue
-        canvases = sequence.get("canvases", [])
+        canvases = sequence.get('canvases', [])
         if not isinstance(canvases, list):
             continue
 
@@ -153,21 +167,21 @@ def _iter_service_entries(payload: dict) -> List[tuple[str, str]]:
             if not isinstance(canvas, dict):
                 continue
 
-            canvas_id = str(canvas.get("@id", "unknown"))
-            images = canvas.get("images", [])
+            canvas_id = str(canvas.get('@id', 'unknown'))
+            images = canvas.get('images', [])
             if not isinstance(images, list):
                 continue
             for image in images:
                 if not isinstance(image, dict):
                     continue
-                resource = image.get("resource", {})
+                resource = image.get('resource', {})
                 if not isinstance(resource, dict):
                     continue
-                service = resource.get("service")
+                service = resource.get('service')
                 if not isinstance(service, dict):
                     continue
 
-                service_id = service.get("@id")
+                service_id = service.get('@id')
                 if isinstance(service_id, str) and service_id:
                     entries.append((canvas_id, service_id))
     return entries
@@ -178,20 +192,20 @@ def _fetch_info_json(
     timeout_seconds: int,
 ) -> tuple[bool, Optional[int], Optional[str], Optional[int], Optional[int], str]:
     try:
-        request = Request(info_url, method="GET")
+        request = Request(info_url, method='GET')
         with urlopen(request, timeout=timeout_seconds) as response:
             status_code = _get_status_code(response)
             content_type = _get_content_type(response)
             width, height = _extract_dimensions(response)
             if status_code == 200:
-                return True, status_code, content_type, width, height, ""
+                return True, status_code, content_type, width, height, ''
             return (
                 False,
                 status_code,
                 content_type,
                 width,
                 height,
-                f"Unexpected status {status_code}",
+                f'Unexpected status {status_code}',
             )
     except HTTPError as exc:
         return (
@@ -200,7 +214,7 @@ def _fetch_info_json(
             _get_content_type(exc),
             None,
             None,
-            f"HTTP status {exc.code}",
+            f'HTTP status {exc.code}',
         )
     except URLError as exc:
         return False, None, None, None, None, operation_error(exc)
@@ -210,17 +224,17 @@ def _fetch_info_json(
 
 
 def _resolve_service_id(service_id: str, base_url_override: str | None = None) -> str:
-    if service_id.startswith("http://") or service_id.startswith("https://"):
+    if service_id.startswith('http://') or service_id.startswith('https://'):
         return service_id
 
     if base_url_override is None:
         return service_id
 
-    normalized_base = base_url_override.rstrip("/")
-    if service_id.startswith("/"):
-        return f"{normalized_base}{service_id}"
+    normalized_base = base_url_override.rstrip('/')
+    if service_id.startswith('/'):
+        return f'{normalized_base}{service_id}'
 
-    return f"{normalized_base}/{service_id}"
+    return f'{normalized_base}/{service_id}'
 
 
 def _extract_dimensions(response) -> tuple[Optional[int], Optional[int]]:
@@ -236,36 +250,36 @@ def _extract_dimensions(response) -> tuple[Optional[int], Optional[int]]:
         return None, None
 
     try:
-        payload = json.loads(content.decode("utf-8"))
+        payload = json.loads(content.decode('utf-8'))
     except (ValueError, UnicodeDecodeError):
         return None, None
 
     if not isinstance(payload, dict):
         return None, None
 
-    width = payload.get("width")
-    height = payload.get("height")
+    width = payload.get('width')
+    height = payload.get('height')
     if isinstance(width, int) and isinstance(height, int):
         return width, height
     return None, None
 
 
 def _get_status_code(response) -> Optional[int]:
-    if hasattr(response, "status"):
+    if hasattr(response, 'status'):
         return int(response.status)
     return response.getcode()
 
 
 def _get_content_type(response) -> Optional[str]:
-    if hasattr(response, "headers"):
+    if hasattr(response, 'headers'):
         headers = response.headers
         if isinstance(headers, dict):
-            return headers.get("Content-Type") or headers.get("content-type")
-        if hasattr(headers, "get_content_type"):
+            return headers.get('Content-Type') or headers.get('content-type')
+        if hasattr(headers, 'get_content_type'):
             return headers.get_content_type()
-        return headers.get("Content-Type") if hasattr(headers, "get") else None
+        return headers.get('Content-Type') if hasattr(headers, 'get') else None
     return None
 
 
 def _info_url(service_id: str) -> str:
-    return f"{service_id.rstrip('/')}/info.json"
+    return f'{service_id.rstrip("/")}/info.json'

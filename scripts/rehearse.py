@@ -32,9 +32,7 @@ def parse_args(argv=None):
     args = parser.parse_args(argv)
     validate_target(args.endpoint, args.private_bucket, args.public_bucket)
     if set(dict(args.sample)) != {'single', 'triple', 'large'}:
-        parser.error(
-            'provide exactly one sample for each alias: single, triple, and large'
-        )
+        parser.error('provide exactly one sample for each alias: single, triple, and large')
     return args
 
 

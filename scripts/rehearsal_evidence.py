@@ -41,9 +41,7 @@ class EvidenceWriter:
         self.results.append(record)
 
     def write_summary(self, path, args, cleanup, prefix, copied, error, resources):
-        lines = _summary_header(
-            path, args, prefix, copied, resources, git_commit(self.root)
-        )
+        lines = _summary_header(path, args, prefix, copied, resources, git_commit(self.root))
         lines.extend(_scenario_table(self.results))
         lines.extend(_findings_section(self.findings))
         lines.extend(_timing_section(resources.get('timing')))
@@ -53,9 +51,7 @@ class EvidenceWriter:
 
 
 def _summary_header(path, args, prefix, copied, resources, commit):
-    copied_samples = ', '.join(
-        f'`{alias}` ({size:,} bytes)' for alias, size in copied.items()
-    )
+    copied_samples = ', '.join(f'`{alias}` ({size:,} bytes)' for alias, size in copied.items())
     elapsed = resources.get('elapsed_seconds')
     resource_line = '- Resource use: unavailable.'
     if elapsed is not None:
@@ -93,11 +89,7 @@ def _scenario_table(results):
         '|---|---:|---|---|---|---|---|---|',
     ]
     for result in results:
-        status = (
-            'finding'
-            if result['finding'] or not result['sentinels_unchanged']
-            else 'recorded'
-        )
+        status = 'finding' if result['finding'] or not result['sentinels_unchanged'] else 'recorded'
         expected = result['expected']
         observed = result['observed']
         expected_state = _state_label(expected)
@@ -123,9 +115,7 @@ def _findings_section(findings):
     if not findings:
         return lines + ['None observed.']
     for finding in findings:
-        observed = finding.get('reproduction', {}).get(
-            'observed_error', finding.get('observed')
-        )
+        observed = finding.get('reproduction', {}).get('observed_error', finding.get('observed'))
         lines.append(
             f'- Sample `{finding.get("sample_alias")}`, '
             f'scenario {finding.get("scenario")}: {observed}'
@@ -140,8 +130,7 @@ def _timing_section(timing):
         '',
         '## Local timing',
         '',
-        '| Operation | Previous local baseline | Current local rehearsal | '
-        'Difference |',
+        '| Operation | Previous local baseline | Current local rehearsal | Difference |',
         '|---|---:|---:|---:|',
     ]
     if not timing:
@@ -175,10 +164,8 @@ def _command_notes(error, results):
         '',
         '## Commands and limitations',
         '',
-        '- Commands for each scenario are stored in that scenario directory as '
-        '`command-*.json`;',
-        '  raw per-file journal events and before/after storage listings are in '
-        '`result.json`.',
+        '- Commands for each scenario are stored in that scenario directory as `command-*.json`;',
+        '  raw per-file journal events and before/after storage listings are in `result.json`.',
         '- The source samples were copied before any fault was applied; only those '
         'copies were modified.',
         '- LocalStack rehearsal does not establish production IAM, versioning, or '
@@ -192,9 +179,7 @@ def _command_notes(error, results):
 
 
 def git_commit(root):
-    result = subprocess.run(
-        ['git', 'rev-parse', 'HEAD'], cwd=root, capture_output=True, text=True
-    )
+    result = subprocess.run(['git', 'rev-parse', 'HEAD'], cwd=root, capture_output=True, text=True)
     return result.stdout.strip() if result.returncode == 0 else 'unavailable'
 
 

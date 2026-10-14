@@ -44,9 +44,7 @@ class RehearsalScenarioTests(unittest.TestCase):
             'sentinels/preexisting.txt',
             b'fixed preexisting sentinel',
         )
-        self.store.seed(
-            TEST_PUBLIC_BUCKET, 'sentinels/unrelated.txt', b'fixed unrelated sentinel'
-        )
+        self.store.seed(TEST_PUBLIC_BUCKET, 'sentinels/unrelated.txt', b'fixed unrelated sentinel')
         self.sentinels = {
             (TEST_PRIVATE_BUCKET, 'sentinels/preexisting.txt'): self.store.listing(
                 TEST_PRIVATE_BUCKET, 'sentinels/'
@@ -62,9 +60,7 @@ class RehearsalScenarioTests(unittest.TestCase):
     def assert_sentinels(self):
         for (bucket, key), checksum in self.sentinels.items():
             found = self.store.listing(bucket, key)
-            self.assertEqual(
-                found[key]['sha256'], checksum, f'sentinel changed: {bucket}/{key}'
-            )
+            self.assertEqual(found[key]['sha256'], checksum, f'sentinel changed: {bucket}/{key}')
 
     def invoke(self, *arguments, mode=None, extra_patches=()):
         return invoke_cli(
@@ -94,9 +90,7 @@ class RehearsalScenarioTests(unittest.TestCase):
         reference = json.loads((output / '.workbench-run.json').read_text())
         return output, Path(reference['run_path'])
 
-    def push(
-        self, output, *, resume=False, mode=None, extra_patches=(), run_dir_name='runs'
-    ):
+    def push(self, output, *, resume=False, mode=None, extra_patches=(), run_dir_name='runs'):
         arguments = [
             'push',
             '--config',
@@ -122,13 +116,9 @@ class RehearsalScenarioTests(unittest.TestCase):
         output, run_path = self.generate()
         pushed = self.push(output)
         self.assertEqual(pushed['exit'], 0, pushed['stdout'] + pushed['stderr'])
-        self.assertEqual(
-            inspect_run(run_path)['publication']['state'], 'ready_for_review'
-        )
+        self.assertEqual(inspect_run(run_path)['publication']['state'], 'ready_for_review')
         inventory = self.invoke('rollback-inventory', run_path, '--format', 'json')
-        self.assertEqual(
-            inventory['exit'], 0, inventory['stdout'] + inventory['stderr']
-        )
+        self.assertEqual(inventory['exit'], 0, inventory['stdout'] + inventory['stderr'])
         self.assertFalse(inventory['payload']['deletion_authorized'])
         self.assertTrue(self.store.listing(TEST_PRIVATE_BUCKET, 'run/'))
         self.assertTrue(self.store.listing(TEST_PUBLIC_BUCKET, 'run/'))
@@ -162,9 +152,7 @@ class RehearsalScenarioTests(unittest.TestCase):
         self.assertEqual(
             set(self.store.listing(TEST_PRIVATE_BUCKET)), {'sentinels/preexisting.txt'}
         )
-        self.assertEqual(
-            set(self.store.listing(TEST_PUBLIC_BUCKET)), {'sentinels/unrelated.txt'}
-        )
+        self.assertEqual(set(self.store.listing(TEST_PUBLIC_BUCKET)), {'sentinels/unrelated.txt'})
         self.assert_sentinels()
 
     def test_scenario_03_denied_storage(self):
@@ -205,9 +193,7 @@ class RehearsalScenarioTests(unittest.TestCase):
                         operation_id=operation_id,
                         attempt=attempt,
                     )
-            return original(
-                journal, stage, identity, operation_id=operation_id, attempt=attempt
-            )
+            return original(journal, stage, identity, operation_id=operation_id, attempt=attempt)
 
         replacement = patch.object(RunJournal, 'intent', new=fail_push_intent)
         result = self.push(output, extra_patches=(replacement,))
@@ -259,9 +245,7 @@ class RehearsalScenarioTests(unittest.TestCase):
         self._assert_interrupted_upload(output)
 
     def _assert_interrupted_upload(self, output):
-        run_path = Path(
-            json.loads((output / '.workbench-run.json').read_text())['run_path']
-        )
+        run_path = Path(json.loads((output / '.workbench-run.json').read_text())['run_path'])
         summary = inspect_run(run_path)
         self.assertEqual(summary['state'], 'interrupted')
         self.assertEqual(summary['counts'].get('uploaded'), 1)
@@ -307,29 +291,22 @@ class RehearsalScenarioTests(unittest.TestCase):
     def _assert_dead_locks_removed(self, removed, operation):
         self.assertTrue(
             removed,
-            f'lock root contents after {operation} SIGKILL: '
-            f'{list(self.lock_root.iterdir())}',
+            f'lock root contents after {operation} SIGKILL: {list(self.lock_root.iterdir())}',
         )
 
     def _reconcile_and_resume_push(self, output, run_path):
         reconciled = self.invoke('reconcile', run_path, '--format', 'json')
-        self.assertEqual(
-            reconciled['exit'], 0, reconciled['stdout'] + reconciled['stderr']
-        )
+        self.assertEqual(reconciled['exit'], 0, reconciled['stdout'] + reconciled['stderr'])
         resumed = self.push(output, resume=True)
         self.assertEqual(resumed['exit'], 0, resumed['stdout'] + resumed['stderr'])
-        self.assertEqual(
-            inspect_run(run_path)['publication']['state'], 'ready_for_review'
-        )
+        self.assertEqual(inspect_run(run_path)['publication']['state'], 'ready_for_review')
         self._assert_single_put_intent(run_path)
 
     def _assert_single_put_intent(self, run_path):
         events, error = read_events(run_path)
         self.assertIsNone(error)
         first_push = next(
-            event
-            for event in events
-            if event['kind'] == 'intent' and event.get('stage') == 'push'
+            event for event in events if event['kind'] == 'intent' and event.get('stage') == 'push'
         )
         self.assertEqual(
             sum(
@@ -360,9 +337,7 @@ class RehearsalScenarioTests(unittest.TestCase):
         first = self.push(first_output)
         self.assertEqual(first['exit'], 0, first['stdout'] + first['stderr'])
         entries = json.loads((first_run / 'upload-plan.json').read_text())['entries']
-        manifest_key = next(
-            entry['key'] for entry in entries if entry['role'] == 'manifest'
-        )
+        manifest_key = next(entry['key'] for entry in entries if entry['role'] == 'manifest')
         manifest_path = self.store._path(TEST_PUBLIC_BUCKET, manifest_key)
         original_manifest = manifest_path.read_bytes()
 
@@ -382,9 +357,7 @@ class RehearsalScenarioTests(unittest.TestCase):
         )
         self.assertEqual(generated['exit'], 0)
         unchanged = self.push(unchanged_output, run_dir_name='unused-runs')
-        self.assertEqual(
-            unchanged['exit'], 0, unchanged['stdout'] + unchanged['stderr']
-        )
+        self.assertEqual(unchanged['exit'], 0, unchanged['stdout'] + unchanged['stderr'])
         return manifest_path, original_manifest
 
     def _stored_keys(self):
@@ -395,16 +368,12 @@ class RehearsalScenarioTests(unittest.TestCase):
     def _append_synthetic_page(self):
         image_path = self.package_root / 'page-2.tif'
         Image.new('RGB', (12, 10), (90, 20, 100)).save(image_path)
-        with (self.package_root / 'input.csv').open(
-            'a', encoding='utf-8', newline=''
-        ) as handle:
+        with (self.package_root / 'input.csv').open('a', encoding='utf-8', newline='') as handle:
             csv.writer(handle).writerow(
                 ['Synthetic page 2', 'page-2', 'Page', 'package', '2', image_path.name]
             )
 
-    def _assert_additive_version_held(
-        self, config, manifest_path, original_manifest, keys_before
-    ):
+    def _assert_additive_version_held(self, config, manifest_path, original_manifest, keys_before):
         output = self.root / 'additive-generated'
         generated = self.invoke(
             'generate',
@@ -423,9 +392,7 @@ class RehearsalScenarioTests(unittest.TestCase):
         additive = self.push(output, run_dir_name='unused-additive-runs')
         self.assertEqual(additive['exit'], 1)
         self.assertEqual(manifest_path.read_bytes(), original_manifest)
-        run_path = Path(
-            json.loads((output / '.workbench-run.json').read_text())['run_path']
-        )
+        run_path = Path(json.loads((output / '.workbench-run.json').read_text())['run_path'])
         self.assertEqual(inspect_run(run_path)['publication']['state'], 'held')
         self.assertTrue(self._stored_keys() - keys_before)
 
@@ -480,14 +447,10 @@ class RehearsalScenarioTests(unittest.TestCase):
 
     def _invoke_refused_contender(self, output, child, ready):
         deadline = time.monotonic() + 20
-        while (
-            time.monotonic() < deadline and child.poll() is None and not ready.exists()
-        ):
+        while time.monotonic() < deadline and child.poll() is None and not ready.exists():
             time.sleep(0.02)
         self.assertTrue(ready.exists(), 'winner did not reach first upload')
-        result = self.invoke(
-            *self._push_arguments(self.config, output, 'second-push-runs')
-        )
+        result = self.invoke(*self._push_arguments(self.config, output, 'second-push-runs'))
         self.assertEqual(result['exit'], 1)
         return result
 
@@ -498,17 +461,11 @@ class RehearsalScenarioTests(unittest.TestCase):
         self.assertEqual(result['exit'], 0, result['stdout'] + result['stderr'])
         events, error = read_events(run_path)
         self.assertIsNone(error)
-        reconciled = [
-            event
-            for event in events
-            if event.get('disposition') == 'reconciled_written'
-        ]
+        reconciled = [event for event in events if event.get('disposition') == 'reconciled_written']
         self.assertTrue(reconciled)
         first_identity = (reconciled[0]['bucket'], reconciled[0]['key'])
         self.assertEqual(self.store.put_calls.count(first_identity), 1)
-        self.assertEqual(
-            inspect_run(run_path)['publication']['state'], 'ready_for_review'
-        )
+        self.assertEqual(inspect_run(run_path)['publication']['state'], 'ready_for_review')
         self.assert_sentinels()
 
     def test_scenario_12_retry_exhaustion_then_resume(self):
@@ -534,9 +491,7 @@ class RehearsalScenarioTests(unittest.TestCase):
         self.assertIn(2, attempts)
         self.assertIn(3, attempts)
         self.assertIn(4, attempts)
-        self.assertEqual(
-            inspect_run(run_path)['publication']['state'], 'ready_for_review'
-        )
+        self.assertEqual(inspect_run(run_path)['publication']['state'], 'ready_for_review')
         self.assert_sentinels()
 
     def test_scenario_13_rollback_preview_execute_repeat_and_resume(self):

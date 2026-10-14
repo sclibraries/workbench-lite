@@ -1,4 +1,5 @@
 """Publication gates protect existing keys and require complete durable evidence."""
+
 import contextlib
 import hashlib
 import io
@@ -26,9 +27,9 @@ class TransientStorage(Storage):
         self.failures = list(failures)
         self.head_error_key = head_error_key
         self.head_calls = []
-        self.client = SimpleNamespace(meta=SimpleNamespace(
-            endpoint_url='http://s3.test', region_name='us-east-1'
-        ))
+        self.client = SimpleNamespace(
+            meta=SimpleNamespace(endpoint_url='http://s3.test', region_name='us-east-1')
+        )
 
     def upload_file(self, source, bucket, key, checksum):
         self.calls.append(key)
@@ -41,20 +42,32 @@ class TransientStorage(Storage):
                 raise EndpointConnectionError(endpoint_url='http://s3.test')
             if failure == 'precondition_own_write':
                 self.written[key] = Path(source).read_bytes()
-                raise ClientError({'Error': {'Code': 'PreconditionFailed'},
-                                   'ResponseMetadata': {'HTTPStatusCode': 412}}, 'PutObject')
+                raise ClientError(
+                    {
+                        'Error': {'Code': 'PreconditionFailed'},
+                        'ResponseMetadata': {'HTTPStatusCode': 412},
+                    },
+                    'PutObject',
+                )
             if failure == 'precondition_conflict':
                 self.written[key] = b'competing content'
-                raise ClientError({'Error': {'Code': 'PreconditionFailed'},
-                                   'ResponseMetadata': {'HTTPStatusCode': 412}}, 'PutObject')
+                raise ClientError(
+                    {
+                        'Error': {'Code': 'PreconditionFailed'},
+                        'ResponseMetadata': {'HTTPStatusCode': 412},
+                    },
+                    'PutObject',
+                )
             if failure in {'access_denied', 'bad_digest', 'invalid_digest'}:
                 code, status = {
                     'access_denied': ('AccessDenied', 403),
                     'bad_digest': ('BadDigest', 500),
                     'invalid_digest': ('InvalidDigest', 503),
                 }[failure]
-                raise ClientError({'Error': {'Code': code},
-                                   'ResponseMetadata': {'HTTPStatusCode': status}}, 'PutObject')
+                raise ClientError(
+                    {'Error': {'Code': code}, 'ResponseMetadata': {'HTTPStatusCode': status}},
+                    'PutObject',
+                )
         self.written[key] = Path(source).read_bytes()
 
     def inspect_object(self, bucket, key):
@@ -70,36 +83,88 @@ class PublicationTests(unittest.TestCase):
         self.addCleanup(self.tmp.cleanup)
         self.root = Path(self.tmp.name)
         self.config = package(self.root)
-        self.output = self.root/'generated'
-        self.args = ['--config', str(self.config), '--run-dir', str(self.root/'runs')]
+        self.output = self.root / 'generated'
+        self.args = ['--config', str(self.config), '--run-dir', str(self.root / 'runs')]
         with contextlib.redirect_stdout(io.StringIO()):
-            self.assertEqual(main(['generate', *self.args, '--output-dir', str(self.output), '--manifests', '--thumbnails']), 0)
-        self.run = Path(json.loads((self.output/'.workbench-run.json').read_text())['run_path'])
+            self.assertEqual(
+                main(
+                    [
+                        'generate',
+                        *self.args,
+                        '--output-dir',
+                        str(self.output),
+                        '--manifests',
+                        '--thumbnails',
+                    ]
+                ),
+                0,
+            )
+        self.run = Path(json.loads((self.output / '.workbench-run.json').read_text())['run_path'])
         self.plan = run_check(self.config, run_id=self.run.name).upload_plan
 
     def execute(self, store):
-        with patch('workbench_lite.cli.create_s3_client', return_value=store), contextlib.redirect_stdout(io.StringIO()):
+        with (
+            patch('workbench_lite.cli.create_s3_client', return_value=store),
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
             return main(['push', *self.args, '--execute', '--generated-dir', str(self.output)])
 
     def execute_at_endpoint(self, store, *, resume=False, endpoint='http://s3.test'):
         output = io.StringIO()
-        command = ['push', *self.args, '--endpoint-url', endpoint,
-                   '--region', 'us-east-1', '--execute', '--generated-dir', str(self.output)]
+        command = [
+            'push',
+            *self.args,
+            '--endpoint-url',
+            endpoint,
+            '--region',
+            'us-east-1',
+            '--execute',
+            '--generated-dir',
+            str(self.output),
+        ]
         if resume:
             command.append('--resume')
-        with patch('workbench_lite.cli.create_s3_client', return_value=store), contextlib.redirect_stdout(output):
+        with (
+            patch('workbench_lite.cli.create_s3_client', return_value=store),
+            contextlib.redirect_stdout(output),
+        ):
             return main(command)
 
     def execute_json(self, store):
         output = io.StringIO()
-        with patch('workbench_lite.cli.create_s3_client', return_value=store), contextlib.redirect_stdout(output):
-            code = main(['push', *self.args, '--execute', '--generated-dir', str(self.output), '--format', 'json'])
+        with (
+            patch('workbench_lite.cli.create_s3_client', return_value=store),
+            contextlib.redirect_stdout(output),
+        ):
+            code = main(
+                [
+                    'push',
+                    *self.args,
+                    '--execute',
+                    '--generated-dir',
+                    str(self.output),
+                    '--format',
+                    'json',
+                ]
+            )
         return code, json.loads(output.getvalue())
 
     def regenerate(self):
         with contextlib.redirect_stdout(io.StringIO()):
-            self.assertEqual(main(['generate', *self.args, '--output-dir', str(self.output), '--manifests', '--thumbnails']), 0)
-        self.run = Path(json.loads((self.output/'.workbench-run.json').read_text())['run_path'])
+            self.assertEqual(
+                main(
+                    [
+                        'generate',
+                        *self.args,
+                        '--output-dir',
+                        str(self.output),
+                        '--manifests',
+                        '--thumbnails',
+                    ]
+                ),
+                0,
+            )
+        self.run = Path(json.loads((self.output / '.workbench-run.json').read_text())['run_path'])
         self.plan = run_check(self.config, run_id=self.run.name).upload_plan
 
     def test_existing_serving_key_blocks_entire_batch_without_writes(self):
@@ -119,9 +184,13 @@ class PublicationTests(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertEqual(store.calls.count(first_key), 2)
         events, error = read_events(self.run)
-        attempts = [event for event in events
-                    if event['kind'] == 'result' and event['stage'] == 'push'
-                    and event.get('key') == first_key]
+        attempts = [
+            event
+            for event in events
+            if event['kind'] == 'result'
+            and event['stage'] == 'push'
+            and event.get('key') == first_key
+        ]
         self.assertEqual([event['attempt'] for event in attempts], [1, 2])
         self.assertEqual(attempts[0]['disposition'], 'retrying')
         self.assertEqual(attempts[0]['delay_before_next_attempt'], 0.25)
@@ -136,8 +205,13 @@ class PublicationTests(unittest.TestCase):
             self.assertEqual(self.execute(store), 1)
         self.assertEqual(store.calls.count(first_key), 3)
         events, error = read_events(self.run)
-        attempts = [event for event in events if event['kind'] == 'result'
-                    and event['stage'] == 'push' and event.get('key') == first_key]
+        attempts = [
+            event
+            for event in events
+            if event['kind'] == 'result'
+            and event['stage'] == 'push'
+            and event.get('key') == first_key
+        ]
         self.assertEqual([event['attempt'] for event in attempts], [1, 2, 3])
         self.assertEqual(attempts[-1]['disposition'], 'retries_exhausted')
 
@@ -151,8 +225,13 @@ class PublicationTests(unittest.TestCase):
                     self.assertEqual(self.execute(store), 1)
                 self.assertEqual(store.calls, [first_key])
                 events, error = read_events(self.run)
-                attempt = next(event for event in events if event['kind'] == 'result'
-                               and event['stage'] == 'push' and event.get('key') == first_key)
+                attempt = next(
+                    event
+                    for event in events
+                    if event['kind'] == 'result'
+                    and event['stage'] == 'push'
+                    and event.get('key') == first_key
+                )
                 self.assertEqual(attempt['disposition'], 'not_retryable')
                 sleep.assert_not_called()
 
@@ -162,8 +241,13 @@ class PublicationTests(unittest.TestCase):
         self.assertEqual(self.execute(store), 0)
         self.assertEqual(store.calls.count(first_key), 1)
         events, error = read_events(self.run)
-        attempt = next(event for event in events if event['kind'] == 'result'
-                       and event['stage'] == 'push' and event.get('key') == first_key)
+        attempt = next(
+            event
+            for event in events
+            if event['kind'] == 'result'
+            and event['stage'] == 'push'
+            and event.get('key') == first_key
+        )
         self.assertEqual(attempt['disposition'], 'reconciled_written')
         self.assertTrue(attempt['reconciled'])
         self.assertEqual(inspect_run(self.run)['publication']['state'], 'ready_for_review')
@@ -174,8 +258,13 @@ class PublicationTests(unittest.TestCase):
         self.assertEqual(self.execute(store), 1)
         self.assertEqual(store.calls, [first_key])
         events, error = read_events(self.run)
-        attempt = next(event for event in events if event['kind'] == 'result'
-                       and event['stage'] == 'push' and event.get('key') == first_key)
+        attempt = next(
+            event
+            for event in events
+            if event['kind'] == 'result'
+            and event['stage'] == 'push'
+            and event.get('key') == first_key
+        )
         self.assertEqual(attempt['http_status'], 412)
         self.assertEqual(attempt['disposition'], 'conflict')
 
@@ -185,8 +274,13 @@ class PublicationTests(unittest.TestCase):
         self.assertEqual(self.execute(store), 0)
         self.assertEqual(store.calls.count(first_key), 1)
         events, error = read_events(self.run)
-        attempt = next(event for event in events if event['kind'] == 'result'
-                       and event['stage'] == 'push' and event.get('key') == first_key)
+        attempt = next(
+            event
+            for event in events
+            if event['kind'] == 'result'
+            and event['stage'] == 'push'
+            and event.get('key') == first_key
+        )
         self.assertEqual(attempt['http_status'], 412)
         self.assertEqual(attempt['disposition'], 'reconciled_written')
         self.assertTrue(attempt['reconciled'])
@@ -194,16 +288,23 @@ class PublicationTests(unittest.TestCase):
     def test_run_retry_wait_budget_uses_slow_clock_without_real_sleep(self):
         store = TransientStorage(['connection', 'connection'])
         first_key = next(entry.key for entry in self.plan if entry.role != 'manifest')
-        with patch('workbench_lite.push.RUN_RETRY_WAIT_BUDGET_SECONDS', 1.0), \
-                patch('workbench_lite.push.time.sleep') as sleep, \
-                patch('workbench_lite.push.time.monotonic', side_effect=[0.0, 1.5]), \
-                patch('workbench_lite.push.random.uniform', return_value=0.75):
+        with (
+            patch('workbench_lite.push.RUN_RETRY_WAIT_BUDGET_SECONDS', 1.0),
+            patch('workbench_lite.push.time.sleep') as sleep,
+            patch('workbench_lite.push.time.monotonic', side_effect=[0.0, 1.5]),
+            patch('workbench_lite.push.random.uniform', return_value=0.75),
+        ):
             self.assertEqual(self.execute(store), 1)
         self.assertEqual(store.calls, [first_key])
         sleep.assert_called_once_with(0.75)
         events, error = read_events(self.run)
-        attempt = next(event for event in events if event['kind'] == 'result'
-                       and event['stage'] == 'push' and event.get('key') == first_key)
+        attempt = next(
+            event
+            for event in events
+            if event['kind'] == 'result'
+            and event['stage'] == 'push'
+            and event.get('key') == first_key
+        )
         self.assertEqual(attempt['disposition'], 'retries_exhausted')
         self.assertEqual(attempt['actual_retry_wait_seconds'], 1.5)
 
@@ -219,8 +320,13 @@ class PublicationTests(unittest.TestCase):
         self.assertEqual(store.calls.count(first_key), 5)
         self.assertEqual(inspect_run(self.run)['publication']['state'], 'ready_for_review')
         events, error = read_events(self.run)
-        attempts = [event for event in events if event['kind'] == 'result'
-                    and event['stage'] == 'push' and event.get('key') == first_key]
+        attempts = [
+            event
+            for event in events
+            if event['kind'] == 'result'
+            and event['stage'] == 'push'
+            and event.get('key') == first_key
+        ]
         self.assertEqual([event['attempt'] for event in attempts], [1, 2, 3, 4, 5])
         receipts = [event for event in events if event.get('publication_receipt')]
         self.assertEqual(len(receipts), 1)
@@ -228,10 +334,12 @@ class PublicationTests(unittest.TestCase):
     def test_resume_retries_entry_after_wait_budget_with_continuing_attempt_numbers(self):
         store = TransientStorage(['connection'])
         first_key = next(entry.key for entry in self.plan if entry.role != 'manifest')
-        with patch('workbench_lite.push.RUN_RETRY_WAIT_BUDGET_SECONDS', 300.0), \
-                patch('workbench_lite.push.time.sleep'), \
-                patch('workbench_lite.push.time.monotonic', side_effect=[0.0, 300.5]), \
-                patch('workbench_lite.push.random.uniform', return_value=0.75):
+        with (
+            patch('workbench_lite.push.RUN_RETRY_WAIT_BUDGET_SECONDS', 300.0),
+            patch('workbench_lite.push.time.sleep'),
+            patch('workbench_lite.push.time.monotonic', side_effect=[0.0, 300.5]),
+            patch('workbench_lite.push.random.uniform', return_value=0.75),
+        ):
             self.assertEqual(self.execute_at_endpoint(store), 1)
         self.assertEqual(store.calls, [first_key])
 
@@ -241,8 +349,13 @@ class PublicationTests(unittest.TestCase):
         self.assertEqual(store.calls.count(first_key), 3)
         self.assertEqual(inspect_run(self.run)['publication']['state'], 'ready_for_review')
         events, error = read_events(self.run)
-        attempts = [event for event in events if event['kind'] == 'result'
-                    and event['stage'] == 'push' and event.get('key') == first_key]
+        attempts = [
+            event
+            for event in events
+            if event['kind'] == 'result'
+            and event['stage'] == 'push'
+            and event.get('key') == first_key
+        ]
         self.assertEqual([event['attempt'] for event in attempts], [1, 2, 3])
         receipts = [event for event in events if event.get('publication_receipt')]
         self.assertEqual(len(receipts), 1)
@@ -255,31 +368,49 @@ class PublicationTests(unittest.TestCase):
         self.assertEqual(self.execute_at_endpoint(store), 1)
         self.assertTrue(inspect_run(self.run)['unknown_operations'])
         self.assertIn(first_key, store.written)
-        old_journal = (self.run/'events.jsonl').read_bytes()
+        old_journal = (self.run / 'events.jsonl').read_bytes()
         put_calls = list(store.calls)
         store.head_error_key = None
-        lock_root = self.root/'command-locks'
+        lock_root = self.root / 'command-locks'
         lock_root.mkdir(mode=0o700)
         output = io.StringIO()
-        with patch('workbench_lite.cli.create_s3_client', return_value=store), contextlib.redirect_stdout(output):
-            code = cli_main(['reconcile', str(self.run), '--format', 'json'],
-                            lock_factory=lambda: WriterLocks(lock_root))
+        with (
+            patch('workbench_lite.cli.create_s3_client', return_value=store),
+            contextlib.redirect_stdout(output),
+        ):
+            code = cli_main(
+                ['reconcile', str(self.run), '--format', 'json'],
+                lock_factory=lambda: WriterLocks(lock_root),
+            )
         self.assertEqual(code, 0)
-        self.assertTrue((self.run/'events.jsonl').read_bytes().startswith(old_journal))
+        self.assertTrue((self.run / 'events.jsonl').read_bytes().startswith(old_journal))
         self.assertEqual(store.calls, put_calls)
         summary = inspect_run(self.run)
         self.assertFalse(summary['unknown_operations'])
-        inventory = json.loads((self.run/'rollback-inventory.json').read_text())
+        inventory = json.loads((self.run / 'rollback-inventory.json').read_text())
         self.assertEqual(inventory['state'], 'reviewable')
         self.assertIn(first_key, {item['key'] for item in inventory['new_keys']})
 
         output = io.StringIO()
-        with patch('workbench_lite.cli.create_s3_client', return_value=store), contextlib.redirect_stdout(output):
-            rollback_code = cli_main([
-                'rollback', str(self.run), '--config', str(self.config),
-                '--endpoint-url', 'http://s3.test', '--region', 'us-east-1',
-                '--format', 'json',
-            ], lock_factory=lambda: WriterLocks(lock_root))
+        with (
+            patch('workbench_lite.cli.create_s3_client', return_value=store),
+            contextlib.redirect_stdout(output),
+        ):
+            rollback_code = cli_main(
+                [
+                    'rollback',
+                    str(self.run),
+                    '--config',
+                    str(self.config),
+                    '--endpoint-url',
+                    'http://s3.test',
+                    '--region',
+                    'us-east-1',
+                    '--format',
+                    'json',
+                ],
+                lock_factory=lambda: WriterLocks(lock_root),
+            )
         self.assertEqual(rollback_code, 0)
         rollback_report = json.loads(output.getvalue())
         self.assertEqual(rollback_report['mode'], 'preview')
@@ -297,17 +428,24 @@ class PublicationTests(unittest.TestCase):
                 before_objects = dict(store.written)
                 put_calls = list(store.calls)
                 store.head_error_key = None
-                locks = self.root/('locks-'+expected)
+                locks = self.root / ('locks-' + expected)
                 locks.mkdir(mode=0o700)
                 output = io.StringIO()
-                with patch('workbench_lite.cli.create_s3_client', return_value=store), contextlib.redirect_stdout(output):
-                    code = cli_main(['reconcile', str(self.run), '--format', 'json'],
-                                    lock_factory=lambda: WriterLocks(locks))
+                with (
+                    patch('workbench_lite.cli.create_s3_client', return_value=store),
+                    contextlib.redirect_stdout(output),
+                ):
+                    code = cli_main(
+                        ['reconcile', str(self.run), '--format', 'json'],
+                        lock_factory=lambda locks=locks: WriterLocks(locks),
+                    )
                 self.assertEqual(code, 0)
                 self.assertEqual(store.written, before_objects)
                 self.assertEqual(store.calls, put_calls)
                 events, error = read_events(self.run)
-                resolved = [event for event in events if event.get('reconciliation_stage') == 'reconcile']
+                resolved = [
+                    event for event in events if event.get('reconciliation_stage') == 'reconcile'
+                ]
                 self.assertEqual(resolved[-1]['status'], expected)
                 self.assertFalse(inspect_run(self.run)['unknown_operations'])
 
@@ -322,13 +460,17 @@ class PublicationTests(unittest.TestCase):
         self.assertEqual(self.execute_at_endpoint(store, resume=True), 0)
         self.assertEqual(store.calls.count(first_key), previous_calls.count(first_key))
         self.assertEqual(inspect_run(self.run)['publication']['state'], 'ready_for_review')
-        inventory = json.loads((self.run/'rollback-inventory.json').read_text())
+        inventory = json.loads((self.run / 'rollback-inventory.json').read_text())
         self.assertEqual(inventory['state'], 'reviewable')
-        self.assertEqual({item['key'] for item in inventory['new_keys']},
-                         {entry.key for entry in self.plan})
+        self.assertEqual(
+            {item['key'] for item in inventory['new_keys']}, {entry.key for entry in self.plan}
+        )
         events, error = read_events(self.run)
-        resume_stage = [event for event in events if event['kind'] == 'stage_started'
-                        and event['stage'] == 'push'][-1]
+        resume_stage = [
+            event
+            for event in events
+            if event['kind'] == 'stage_started' and event['stage'] == 'push'
+        ][-1]
         self.assertTrue(resume_stage['options']['resume'])
 
     def test_resume_stops_when_a_previously_written_object_is_missing_or_changed(self):
@@ -347,9 +489,13 @@ class PublicationTests(unittest.TestCase):
                 self.assertEqual(self.execute_at_endpoint(store, resume=True), 1)
                 self.assertEqual(store.calls, previous_calls)
                 events, error = read_events(self.run)
-                check = [event for event in events if event['kind'] == 'result'
-                         and event['stage'] == 'destination-check'
-                         and event.get('key') == first_key][-1]
+                check = [
+                    event
+                    for event in events
+                    if event['kind'] == 'result'
+                    and event['stage'] == 'destination-check'
+                    and event.get('key') == first_key
+                ][-1]
                 self.assertEqual(check['status'], 'conflict')
                 self.assertFalse(inspect_run(self.run)['unknown_operations'])
 
@@ -367,56 +513,70 @@ class PublicationTests(unittest.TestCase):
         self.assertEqual(summary['publication']['state'], 'ready_for_review')
         self.assertFalse(summary['unknown_operations'])
 
-    def test_resume_refuses_receipt_pending_marker_rollback_hold_and_changed_evidence(self):
+    def test_resume_refuses_receipt_pending_marker_rollback_hold_and_changed_evidence(self):  # noqa: C901, PLR0915
         original_config = self.config.read_bytes()
-        original_csv = (self.root/'input.csv').read_bytes()
-        refusal_cases = ('config', 'csv', 'snapshot', 'plan', 'source',
-                         'pending', 'rollback_hold', 'endpoint', 'buckets', 'reference')
+        original_csv = (self.root / 'input.csv').read_bytes()
+        refusal_cases = (
+            'config',
+            'csv',
+            'snapshot',
+            'plan',
+            'source',
+            'pending',
+            'rollback_hold',
+            'endpoint',
+            'buckets',
+            'reference',
+        )
         for case in refusal_cases:
             with self.subTest(case=case):
                 self.config.write_bytes(original_config)
-                (self.root/'input.csv').write_bytes(original_csv)
+                (self.root / 'input.csv').write_bytes(original_csv)
                 self.regenerate()
                 store = TransientStorage(['access_denied'])
                 self.assertEqual(self.execute_at_endpoint(store), 1)
-                event_bytes = (self.run/'events.jsonl').read_bytes()
+                event_bytes = (self.run / 'events.jsonl').read_bytes()
                 endpoint = 'http://s3.test'
                 if case == 'config':
-                    self.config.write_text(self.config.read_text()+'# changed\n')
+                    self.config.write_text(self.config.read_text() + '# changed\n')
                 elif case == 'csv':
-                    (self.root/'input.csv').write_text((self.root/'input.csv').read_text()+'\n')
+                    (self.root / 'input.csv').write_text(
+                        (self.root / 'input.csv').read_text() + '\n'
+                    )
                 elif case == 'snapshot':
-                    (self.run/'input.csv').write_text('changed snapshot\n')
+                    (self.run / 'input.csv').write_text('changed snapshot\n')
                 elif case == 'plan':
-                    (self.run/'upload-plan.json').write_text('{}')
+                    (self.run / 'upload-plan.json').write_text('{}')
                 elif case == 'source':
-                    metadata = json.loads((self.run/'run.json').read_text())
-                    metadata['software']['source_sha256'] = '0'*64
-                    (self.run/'run.json').write_text(json.dumps(metadata))
+                    metadata = json.loads((self.run / 'run.json').read_text())
+                    metadata['software']['source_sha256'] = '0' * 64
+                    (self.run / 'run.json').write_text(json.dumps(metadata))
                 elif case == 'pending':
-                    (self.run/'publication-pending').write_text('{}')
+                    (self.run / 'publication-pending').write_text('{}')
                 elif case == 'rollback_hold':
-                    (self.run/'rollback-hold.json').write_text('{}')
+                    (self.run / 'rollback-hold.json').write_text('{}')
                 elif case == 'endpoint':
                     endpoint = 'http://other.test'
                 elif case == 'buckets':
-                    self.config.write_text(self.config.read_text()+'s3_private_bucket: other-bucket\n')
+                    self.config.write_text(
+                        self.config.read_text() + 's3_private_bucket: other-bucket\n'
+                    )
                 elif case == 'reference':
-                    (self.output/'.workbench-run.json').unlink()
+                    (self.output / '.workbench-run.json').unlink()
 
                 if case == 'endpoint':
                     store.client.meta.endpoint_url = endpoint
                 self.assertEqual(self.execute_at_endpoint(store, resume=True, endpoint=endpoint), 1)
-                self.assertEqual((self.run/'events.jsonl').read_bytes(), event_bytes)
+                self.assertEqual((self.run / 'events.jsonl').read_bytes(), event_bytes)
 
         self.config.write_bytes(original_config)
-        (self.root/'input.csv').write_bytes(original_csv)
+        (self.root / 'input.csv').write_bytes(original_csv)
         self.regenerate()
         store = TransientStorage()
         self.assertEqual(self.execute_at_endpoint(store), 0)
-        event_bytes = (self.run/'events.jsonl').read_bytes()
+        event_bytes = (self.run / 'events.jsonl').read_bytes()
         self.assertEqual(self.execute_at_endpoint(store, resume=True), 1)
-        self.assertEqual((self.run/'events.jsonl').read_bytes(), event_bytes)
+        self.assertEqual((self.run / 'events.jsonl').read_bytes(), event_bytes)
 
     def test_unchanged_package_reuses_verified_objects_and_uploads_only_new_audit(self):
         store = Storage()
@@ -429,17 +589,30 @@ class PublicationTests(unittest.TestCase):
 
         self.assertEqual(code, 0)
         audit = next(entry for entry in self.plan if entry.role == 'audit')
-        self.assertEqual(store.calls[len(prior_calls):], [audit.key])
+        self.assertEqual(store.calls[len(prior_calls) :], [audit.key])
         self.assertTrue(all(store.written[key] == value for key, value in prior_objects.items()))
         classifications = {row['key']: row['classification'] for row in report['results']}
         self.assertEqual(classifications[audit.key], 'new')
-        self.assertTrue(all(value == 'previously_published' for key, value in classifications.items() if key != audit.key))
-        self.assertEqual(report['classification_counts']['previously_published'], len(self.plan) - 1)
+        self.assertTrue(
+            all(
+                value == 'previously_published'
+                for key, value in classifications.items()
+                if key != audit.key
+            )
+        )
+        self.assertEqual(
+            report['classification_counts']['previously_published'], len(self.plan) - 1
+        )
         summary = inspect_run(self.run)
         self.assertEqual(summary['publication']['state'], 'ready_for_review')
-        self.assertTrue(all(item['classification'] == 'previously_published'
-                            for item in summary['push_artifacts'] if item['status'] == 'unchanged'))
-        self.assertIn('previously_published (unchanged)', (self.run/'summary.txt').read_text())
+        self.assertTrue(
+            all(
+                item['classification'] == 'previously_published'
+                for item in summary['push_artifacts']
+                if item['status'] == 'unchanged'
+            )
+        )
+        self.assertIn('previously_published (unchanged)', (self.run / 'summary.txt').read_text())
 
     def test_inspection_rejects_mismatched_checksum_for_reused_key(self):
         store = Storage()
@@ -449,10 +622,17 @@ class PublicationTests(unittest.TestCase):
 
         events, error = read_events(self.run)
         self.assertIsNone(error)
-        reused = next(event for event in events if event['kind'] == 'result'
-                      and event['stage'] == 'destination-check' and event.get('status') == 'unchanged')
+        reused = next(
+            event
+            for event in events
+            if event['kind'] == 'result'
+            and event['stage'] == 'destination-check'
+            and event.get('status') == 'unchanged'
+        )
         reused['observed_checksum'] = '0' * 64
-        (self.run/'events.jsonl').write_text(''.join(json.dumps(event)+'\n' for event in events))
+        (self.run / 'events.jsonl').write_text(
+            ''.join(json.dumps(event) + '\n' for event in events)
+        )
 
         summary = inspect_run(self.run)
         self.assertEqual(summary['publication']['state'], 'held')
@@ -464,7 +644,9 @@ class PublicationTests(unittest.TestCase):
         for event in events:
             if event.get('stage') == 'verify-upload':
                 event.pop('checksum_type', None)
-        (self.run/'events.jsonl').write_text(''.join(json.dumps(event)+'\n' for event in events))
+        (self.run / 'events.jsonl').write_text(
+            ''.join(json.dumps(event) + '\n' for event in events)
+        )
 
         self.assertEqual(inspect_run(self.run)['publication']['state'], 'ready_for_review')
 
@@ -475,8 +657,8 @@ class PublicationTests(unittest.TestCase):
         old_manifest = next(entry.key for entry in self.plan if entry.role == 'manifest')
         old_manifest_bytes = store.written[old_manifest]
 
-        Image.new('RGB', (9, 7), (20, 40, 60)).save(self.root/'page2.tif')
-        with (self.root/'input.csv').open('a', encoding='utf-8') as handle:
+        Image.new('RGB', (9, 7), (20, 40, 60)).save(self.root / 'page2.tif')
+        with (self.root / 'input.csv').open('a', encoding='utf-8') as handle:
             handle.write('Later page,page2,Page,parent,2,page2.tif\n')
         self.regenerate()
         code, report = self.execute_json(store)
@@ -484,22 +666,31 @@ class PublicationTests(unittest.TestCase):
         self.assertEqual(code, 1)
         new_entries = {entry.key for entry in self.plan if entry.page_id == 'page2'}
         audit_key = next(entry.key for entry in self.plan if entry.role == 'audit')
-        self.assertEqual(set(store.calls[len(prior_calls):]), new_entries | {audit_key})
+        self.assertEqual(set(store.calls[len(prior_calls) :]), new_entries | {audit_key})
         self.assertEqual(store.written[old_manifest], old_manifest_bytes)
         manifest = next(row for row in report['results'] if row['key'] == old_manifest)
         self.assertEqual(manifest['status'], 'held')
         self.assertEqual(manifest['classification'], 'held')
-        self.assertEqual(manifest['previous_checksum'], hashlib.sha256(old_manifest_bytes).hexdigest())
-        self.assertEqual(manifest['checksum'], hashlib.sha256((self.output/old_manifest).read_bytes()).hexdigest())
+        self.assertEqual(
+            manifest['previous_checksum'], hashlib.sha256(old_manifest_bytes).hexdigest()
+        )
+        self.assertEqual(
+            manifest['checksum'],
+            hashlib.sha256((self.output / old_manifest).read_bytes()).hexdigest(),
+        )
         self.assertIn('manifest replacement required', manifest['message'])
         summary = inspect_run(self.run)
         self.assertEqual(summary['publication']['state'], 'held')
-        held_summary = next(item for item in summary['push_artifacts'] if item['key'] == old_manifest)
+        held_summary = next(
+            item for item in summary['push_artifacts'] if item['key'] == old_manifest
+        )
         self.assertEqual(held_summary['classification'], 'held')
         self.assertEqual(held_summary['previous_checksum'], manifest['previous_checksum'])
         self.assertEqual(held_summary['checksum'], manifest['checksum'])
-        inventory = json.loads((self.run/'rollback-inventory.json').read_text())
-        self.assertEqual({entry['key'] for entry in inventory['new_keys']}, new_entries | {audit_key})
+        inventory = json.loads((self.run / 'rollback-inventory.json').read_text())
+        self.assertEqual(
+            {entry['key'] for entry in inventory['new_keys']}, new_entries | {audit_key}
+        )
         self.assertIn(old_manifest, {entry['key'] for entry in inventory['held_keys']})
 
     def test_appended_page_leaves_other_parent_manifests_untouched(self):
@@ -507,11 +698,13 @@ class PublicationTests(unittest.TestCase):
         store = Storage()
         self.assertEqual(self.execute(store), 0)
         prior_calls = list(store.calls)
-        manifest_keys = {entry.object_id: entry.key for entry in self.plan if entry.role == 'manifest'}
+        manifest_keys = {
+            entry.object_id: entry.key for entry in self.plan if entry.role == 'manifest'
+        }
         prior_manifests = {key: store.written[key] for key in manifest_keys.values()}
 
-        Image.new('RGB', (11, 6), (35, 55, 75)).save(self.root/'page2b.tif')
-        with (self.root/'input.csv').open('a', encoding='utf-8') as handle:
+        Image.new('RGB', (11, 6), (35, 55, 75)).save(self.root / 'page2b.tif')
+        with (self.root / 'input.csv').open('a', encoding='utf-8') as handle:
             handle.write('Inserted page,page2b,Page,parent2,2,page2b.tif\n')
         self.regenerate()
         code, report = self.execute_json(store)
@@ -521,19 +714,22 @@ class PublicationTests(unittest.TestCase):
         unchanged_manifests = set(manifest_keys.values()) - {changed_manifest}
         new_entries = {entry.key for entry in self.plan if entry.page_id == 'page2b'}
         audit_key = next(entry.key for entry in self.plan if entry.role == 'audit')
-        self.assertEqual(set(store.calls[len(prior_calls):]), new_entries | {audit_key})
+        self.assertEqual(set(store.calls[len(prior_calls) :]), new_entries | {audit_key})
         self.assertTrue(all(store.written[key] == value for key, value in prior_manifests.items()))
-        self.assertFalse(unchanged_manifests.intersection(store.calls[len(prior_calls):]))
-        self.assertEqual(next(row for row in report['results'] if row['key'] == changed_manifest)['status'], 'held')
+        self.assertFalse(unchanged_manifests.intersection(store.calls[len(prior_calls) :]))
+        self.assertEqual(
+            next(row for row in report['results'] if row['key'] == changed_manifest)['status'],
+            'held',
+        )
 
     def test_new_parent_manifest_uses_new_key_and_can_complete_batch(self):
         store = Storage()
         self.assertEqual(self.execute(store), 0)
         prior_calls = list(store.calls)
 
-        (self.root/'parent2.pdf').write_bytes(b'%PDF-1.4\n%%EOF\n')
-        Image.new('RGB', (7, 8), (70, 40, 20)).save(self.root/'page2.tif')
-        with (self.root/'input.csv').open('a', encoding='utf-8') as handle:
+        (self.root / 'parent2.pdf').write_bytes(b'%PDF-1.4\n%%EOF\n')
+        Image.new('RGB', (7, 8), (70, 40, 20)).save(self.root / 'page2.tif')
+        with (self.root / 'input.csv').open('a', encoding='utf-8') as handle:
             handle.write('Another parent,parent2,Paged Content,,,parent2.pdf\n')
             handle.write('Another page,page2,Page,parent2,1,page2.tif\n')
         self.regenerate()
@@ -542,8 +738,12 @@ class PublicationTests(unittest.TestCase):
         self.assertEqual(code, 0)
         new_entries = {entry.key for entry in self.plan if entry.object_id == 'parent2'}
         audit_key = next(entry.key for entry in self.plan if entry.role == 'audit')
-        self.assertEqual(set(store.calls[len(prior_calls):]), new_entries | {audit_key})
-        new_manifest = next(entry.key for entry in self.plan if entry.role == 'manifest' and entry.object_id == 'parent2')
+        self.assertEqual(set(store.calls[len(prior_calls) :]), new_entries | {audit_key})
+        new_manifest = next(
+            entry.key
+            for entry in self.plan
+            if entry.role == 'manifest' and entry.object_id == 'parent2'
+        )
         manifest_result = next(row for row in report['results'] if row['key'] == new_manifest)
         self.assertEqual(manifest_result['classification'], 'new')
         self.assertEqual(manifest_result['status'], 'uploaded')
@@ -555,7 +755,7 @@ class PublicationTests(unittest.TestCase):
         prior_calls = list(store.calls)
         before = dict(store.written)
 
-        Image.new('RGB', (10, 10), (90, 10, 30)).save(self.root/'page.tif')
+        Image.new('RGB', (10, 10), (90, 10, 30)).save(self.root / 'page.tif')
         self.regenerate()
         code, report = self.execute_json(store)
 
@@ -602,14 +802,26 @@ class PublicationTests(unittest.TestCase):
         self.assertEqual(publication['receipt']['publication_owner'], 'workbench-lite')
 
     def multi_package(self):
-        csv_path = self.root/'input.csv'
+        csv_path = self.root / 'input.csv'
         with csv_path.open('a') as handle:
             for number in range(2, 5):
                 handle.write(f'Parent {number},parent{number},Paged Content,,,parent.pdf\n')
                 handle.write(f'Page {number},page{number},Page,parent{number},1,page.tif\n')
         with contextlib.redirect_stdout(io.StringIO()):
-            self.assertEqual(main(['generate', *self.args, '--output-dir', str(self.output), '--manifests', '--thumbnails']), 0)
-        self.run = Path(json.loads((self.output/'.workbench-run.json').read_text())['run_path'])
+            self.assertEqual(
+                main(
+                    [
+                        'generate',
+                        *self.args,
+                        '--output-dir',
+                        str(self.output),
+                        '--manifests',
+                        '--thumbnails',
+                    ]
+                ),
+                0,
+            )
+        self.run = Path(json.loads((self.output / '.workbench-run.json').read_text())['run_path'])
         self.plan = run_check(self.config, run_id=self.run.name).upload_plan
 
     def test_multi_manifest_batch_gets_receipt_only_when_every_object_succeeds(self):
@@ -635,10 +847,12 @@ class PublicationTests(unittest.TestCase):
 
     def test_final_receipt_failure_never_authorizes_handoff(self):
         original = RunJournal.append
+
         def fail(run, kind, **fields):
             if fields.get('publication_receipt'):
                 raise JournalError('injected receipt failure')
             return original(run, kind, **fields)
+
         with patch.object(RunJournal, 'append', fail):
             with self.assertRaises(SystemExit) as error:
                 self.execute(Storage())
@@ -656,10 +870,14 @@ class PublicationTests(unittest.TestCase):
 
     def test_summary_failure_after_uploads_holds_even_with_success_terminal_event(self):
         original = RunJournal.summarize
+
         def fail(run):
-            if run.stage == 'push' and any(e.get('verified_batch') for e in read_events(run.path)[0]):
+            if run.stage == 'push' and any(
+                e.get('verified_batch') for e in read_events(run.path)[0]
+            ):
                 raise JournalError('injected summary failure')
             return original(run)
+
         with patch.object(RunJournal, 'summarize', fail):
             with self.assertRaises(SystemExit):
                 self.execute(Storage())
@@ -667,10 +885,12 @@ class PublicationTests(unittest.TestCase):
 
     def test_verification_receipt_failure_stops_writes_and_keeps_upload_ack(self):
         original = RunJournal.append
+
         def fail(run, kind, **fields):
             if kind == 'result' and fields.get('stage') == 'verify-upload':
                 raise JournalError('injected verification receipt failure')
             return original(run, kind, **fields)
+
         store = Storage()
         with patch.object(RunJournal, 'append', fail):
             self.assertEqual(self.execute(store), 1)
@@ -684,17 +904,31 @@ class PublicationTests(unittest.TestCase):
         store = Storage()
         original = store.verify_file
         manifest = next(e.key for e in self.plan if e.role == 'manifest')
-        store.verify_file = lambda bucket, key, checksum, size: False if key == manifest else original(bucket, key, checksum, size)
+        store.verify_file = lambda bucket, key, checksum, size: (
+            False if key == manifest else original(bucket, key, checksum, size)
+        )
         self.assertEqual(self.execute(store), 1)
         self.assertIn(manifest, store.written)
         self.assertEqual(inspect_run(self.run)['publication']['state'], 'held')
 
     def test_no_receipt_for_dry_run_or_tampered_plan(self):
         with contextlib.redirect_stdout(io.StringIO()):
-            self.assertEqual(main(['push', *self.args, '--dry-run', '--offline', '--generated-dir', str(self.output)]), 0)
+            self.assertEqual(
+                main(
+                    [
+                        'push',
+                        *self.args,
+                        '--dry-run',
+                        '--offline',
+                        '--generated-dir',
+                        str(self.output),
+                    ]
+                ),
+                0,
+            )
         self.assertEqual(inspect_run(self.run)['publication']['state'], 'held')
         self.assertEqual(self.execute(Storage()), 0)
-        (self.run/'upload-plan.json').write_text('{}')
+        (self.run / 'upload-plan.json').write_text('{}')
         self.assertEqual(inspect_run(self.run)['publication']['state'], 'held')
 
     def test_oversized_source_is_rejected_before_any_write(self):
@@ -705,10 +939,13 @@ class PublicationTests(unittest.TestCase):
 
     def test_lock_release_failure_cannot_authorize_handoff(self):
         from workbench_lite.locks import WriterLocks, LockError
+
         original = WriterLocks.release
+
         def fail(locks):
             original(locks)
             raise LockError('injected release failure')
+
         with patch.object(WriterLocks, 'release', fail):
             with self.assertRaises(SystemExit):
                 self.execute(Storage())
@@ -716,11 +953,15 @@ class PublicationTests(unittest.TestCase):
 
     def test_completion_fsync_failure_cannot_authorize_handoff(self):
         original = RunJournal.append
+
         def fail(run, kind, **fields):
             if fields.get('publication_receipt'):
-                with patch('workbench_lite.runs.os.fsync', side_effect=OSError('injected sync failure')):
+                with patch(
+                    'workbench_lite.runs.os.fsync', side_effect=OSError('injected sync failure')
+                ):
                     return original(run, kind, **fields)
             return original(run, kind, **fields)
+
         with patch.object(RunJournal, 'append', fail):
             with self.assertRaises(SystemExit):
                 self.execute(Storage())
@@ -729,19 +970,25 @@ class PublicationTests(unittest.TestCase):
     def test_uncertain_commit_cannot_authorize_even_if_truncation_fails(self):
         original = RunJournal.append
         real_open = Path.open
+
         def no_truncate(path, mode='r', *args, **kwargs):
             if path.name == 'events.jsonl' and mode == 'r+b':
                 raise OSError('cannot truncate')
             return real_open(path, mode, *args, **kwargs)
+
         def fail(run, kind, **fields):
             if fields.get('publication_receipt'):
-                with patch('workbench_lite.runs.os.fsync', side_effect=OSError('sync failed')), patch.object(Path, 'open', no_truncate):
+                with (
+                    patch('workbench_lite.runs.os.fsync', side_effect=OSError('sync failed')),
+                    patch.object(Path, 'open', no_truncate),
+                ):
                     return original(run, kind, **fields)
             return original(run, kind, **fields)
+
         with patch.object(RunJournal, 'append', fail):
             with self.assertRaises(SystemExit):
                 self.execute(Storage())
-        self.assertTrue((self.run/'publication-pending').exists())
+        self.assertTrue((self.run / 'publication-pending').exists())
         self.assertEqual(inspect_run(self.run)['publication']['state'], 'held')
 
     def test_destination_read_failure_holds_before_uploads(self):
@@ -760,19 +1007,21 @@ class PublicationTests(unittest.TestCase):
 
     def test_hold_marker_removal_failure_cannot_authorize_handoff(self):
         original = Path.unlink
+
         def fail(path, *args, **kwargs):
             if path.name == 'publication-pending':
                 raise OSError('cannot clear hold')
             return original(path, *args, **kwargs)
+
         with patch.object(Path, 'unlink', fail):
             with self.assertRaises(SystemExit):
                 self.execute(Storage())
-        self.assertTrue((self.run/'publication-pending').exists())
+        self.assertTrue((self.run / 'publication-pending').exists())
         self.assertEqual(inspect_run(self.run)['publication']['state'], 'held')
 
     def test_restored_hold_marker_overrides_a_complete_receipt(self):
         self.assertEqual(self.execute(Storage()), 0)
-        (self.run/'publication-pending').write_text('{}')
+        (self.run / 'publication-pending').write_text('{}')
         self.assertEqual(inspect_run(self.run)['publication']['state'], 'held')
 
     def test_receipt_finalization_holds_locks_against_resume_and_second_writer(self):
@@ -780,12 +1029,18 @@ class PublicationTests(unittest.TestCase):
         import subprocess
         import sys
         import time
-        shared = self.root/'shared-locks'
+
+        shared = self.root / 'shared-locks'
         shared.mkdir(mode=0o770)
-        ready, release = self.root/'ready', self.root/'release'
+        ready, release = self.root / 'ready', self.root / 'release'
         package_root = Path(__file__).resolve().parents[1]
-        env = dict(os.environ, PYTHONPATH=str(package_root)+os.pathsep+str(package_root/'tests'),
-                   WBL_TEST_LOCK_DIR=str(shared), READY=str(ready), RELEASE=str(release))
+        env = dict(
+            os.environ,
+            PYTHONPATH=str(package_root) + os.pathsep + str(package_root / 'tests'),
+            WBL_TEST_LOCK_DIR=str(shared),
+            READY=str(ready),
+            RELEASE=str(release),
+        )
         script = """import os, time
 from pathlib import Path
 from cli_test_runner import cli, main
@@ -807,22 +1062,33 @@ cli.main = main
 raise SystemExit(cli.entrypoint())
 """
         common = ['push', *self.args, '--generated-dir', str(self.output)]
-        child = subprocess.Popen([sys.executable, '-c', script, *common, '--execute'], env=env,
-                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        child = subprocess.Popen(
+            [sys.executable, '-c', script, *common, '--execute'],
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
         try:
             deadline = time.monotonic() + 10
             while not ready.exists() and child.poll() is None and time.monotonic() < deadline:
-                time.sleep(.02)
+                time.sleep(0.02)
             self.assertTrue(ready.exists())
-            before = (self.run/'events.jsonl').read_bytes()
-            other_cwd = self.root/'other-cwd'
+            before = (self.run / 'events.jsonl').read_bytes()
+            other_cwd = self.root / 'other-cwd'
             other_cwd.mkdir()
             for mode in [['--execute'], ['--execute', '--resume']]:
-                contender = subprocess.run([sys.executable, '-m', 'cli_test_runner', *common, *mode],
-                                           env=env, cwd=other_cwd, capture_output=True, text=True, timeout=10)
+                contender = subprocess.run(
+                    [sys.executable, '-m', 'cli_test_runner', *common, *mode],
+                    env=env,
+                    cwd=other_cwd,
+                    capture_output=True,
+                    text=True,
+                    timeout=10,
+                )
                 self.assertEqual(contender.returncode, 1, contender.stderr)
                 self.assertIn('Writer lock is held', contender.stdout + contender.stderr)
-                self.assertEqual((self.run/'events.jsonl').read_bytes(), before)
+                self.assertEqual((self.run / 'events.jsonl').read_bytes(), before)
             release.touch()
             stdout, stderr = child.communicate(timeout=10)
             self.assertEqual(child.returncode, 0, stderr)
@@ -836,8 +1102,12 @@ raise SystemExit(cli.entrypoint())
         self.assertEqual(self.execute(Storage()), 0)
         events, error = read_events(self.run)
         event = next(e for e in events if e['kind'] == 'result' and e['stage'] == 'verify-upload')
-        event.update(verification_method='s3-sha256', observed_checksum='0'*64, observed_size_bytes=event['size_bytes'])
-        (self.run/'events.jsonl').write_text(''.join(json.dumps(e)+'\n' for e in events))
+        event.update(
+            verification_method='s3-sha256',
+            observed_checksum='0' * 64,
+            observed_size_bytes=event['size_bytes'],
+        )
+        (self.run / 'events.jsonl').write_text(''.join(json.dumps(e) + '\n' for e in events))
         self.assertEqual(inspect_run(self.run)['publication']['state'], 'held')
 
     def test_inspection_rejects_missing_verification_evidence(self):
@@ -846,9 +1116,13 @@ raise SystemExit(cli.entrypoint())
         for field in ['verification_method', 'observed_checksum', 'observed_size_bytes']:
             with self.subTest(field=field):
                 events = json.loads(json.dumps(original))
-                event = next(e for e in events if e['kind'] == 'result' and e['stage'] == 'verify-upload')
+                event = next(
+                    e for e in events if e['kind'] == 'result' and e['stage'] == 'verify-upload'
+                )
                 event.pop(field, None)
-                (self.run/'events.jsonl').write_text(''.join(json.dumps(e)+'\n' for e in events))
+                (self.run / 'events.jsonl').write_text(
+                    ''.join(json.dumps(e) + '\n' for e in events)
+                )
                 self.assertEqual(inspect_run(self.run)['publication']['state'], 'held')
 
     def test_bare_success_boolean_cannot_replace_checksum_evidence(self):
@@ -861,5 +1135,5 @@ raise SystemExit(cli.entrypoint())
         self.assertEqual(self.execute(Storage()), 0)
         events, error = read_events(self.run)
         events[-1]['publication_receipt'].pop('verification_contract')
-        (self.run/'events.jsonl').write_text(''.join(json.dumps(e)+'\n' for e in events))
+        (self.run / 'events.jsonl').write_text(''.join(json.dumps(e) + '\n' for e in events))
         self.assertEqual(inspect_run(self.run)['publication']['state'], 'held')

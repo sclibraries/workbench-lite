@@ -79,10 +79,7 @@ SCENARIO_EXPECTATIONS = [
             'steps': {'push_execute': 1},
             'run_state': 'failed',
             'publication': 'held',
-            'journal': (
-                'The denied remote access check is recorded; no push intent is '
-                'recorded.'
-            ),
+            'journal': ('The denied remote access check is recorded; no push intent is recorded.'),
             'storage': 'No planned object is written; sentinels are unchanged.',
             'recovery': 'Resolve access and use a new execute run.',
         },
@@ -99,12 +96,9 @@ SCENARIO_EXPECTATIONS = [
             'run_state': 'failed',
             'publication': 'held',
             'journal': (
-                'The failed destination readiness check is recorded; no push '
-                'intent is recorded.'
+                'The failed destination readiness check is recorded; no push intent is recorded.'
             ),
-            'storage': (
-                'No planned object is written; LocalStack sentinels are unchanged.'
-            ),
+            'storage': ('No planned object is written; LocalStack sentinels are unchanged.'),
             'recovery': 'Restore the endpoint and use a new execute run.',
         },
     },
@@ -124,9 +118,7 @@ SCENARIO_EXPECTATIONS = [
                 'affected remote write; incomplete evidence cannot certify '
                 'publication.'
             ),
-            'storage': (
-                'No object for the failed write is created; sentinels are unchanged.'
-            ),
+            'storage': ('No object for the failed write is created; sentinels are unchanged.'),
             'recovery': (
                 'Retain the run evidence, inspect its valid journal prefix, and do '
                 'not treat it as publishable.'
@@ -153,9 +145,7 @@ SCENARIO_EXPECTATIONS = [
                 'Prior confirmed writes may remain; no preexisting or unrelated '
                 'object changes; sentinels are unchanged.'
             ),
-            'recovery': (
-                'Reconcile unknown outcomes before any resume or rollback decision.'
-            ),
+            'recovery': ('Reconcile unknown outcomes before any resume or rollback decision.'),
         },
     },
     {
@@ -180,8 +170,7 @@ SCENARIO_EXPECTATIONS = [
                 'sentinels are unchanged.'
             ),
             'recovery': (
-                'Reconcile first, then resume the same run only when '
-                'reconciliation is clear.'
+                'Reconcile first, then resume the same run only when reconciliation is clear.'
             ),
         },
     },
@@ -237,9 +226,7 @@ SCENARIO_EXPECTATIONS = [
                 'The conflicting bytes remain; no other planned key is written; '
                 'sentinels are unchanged.'
             ),
-            'recovery': (
-                'Resolve the collision outside this run and start a new execute run.'
-            ),
+            'recovery': ('Resolve the collision outside this run and start a new execute run.'),
         },
     },
     {
@@ -257,9 +244,7 @@ SCENARIO_EXPECTATIONS = [
                 'The winning run records normal writes and receipt; the refused '
                 'run records its lock refusal and no push intent.'
             ),
-            'storage': (
-                'Exactly one run creates destination objects; sentinels are unchanged.'
-            ),
+            'storage': ('Exactly one run creates destination objects; sentinels are unchanged.'),
             'recovery': (
                 'No recovery is needed for the winner; retry the refused run only '
                 'after the destination lock is released and if its run state '
@@ -311,8 +296,7 @@ SCENARIO_EXPECTATIONS = [
                 'it once; sentinels are unchanged.'
             ),
             'recovery': (
-                'Resume the same run; the invocation receives fresh bounded retry '
-                'limits.'
+                'Resume the same run; the invocation receives fresh bounded retry limits.'
             ),
         },
     },
@@ -343,8 +327,7 @@ SCENARIO_EXPECTATIONS = [
                 'after resumed rollback; sentinels are unchanged.'
             ),
             'recovery': (
-                'Rerun rollback against the same source run; its rollback hold '
-                'remains permanent.'
+                'Rerun rollback against the same source run; its rollback hold remains permanent.'
             ),
         },
     },
@@ -373,37 +356,21 @@ SCENARIO_EXPECTATIONS = [
 ]
 
 
-SCENARIOS_BY_NUMBER = {
-    scenario['number']: scenario for scenario in SCENARIO_EXPECTATIONS
-}
+SCENARIOS_BY_NUMBER = {scenario['number']: scenario for scenario in SCENARIO_EXPECTATIONS}
 
 SCENARIO_INJECTIONS = {
     1: 'none; execute against the unique rehearsal prefix',
-    2: (
-        'unlink one copied source image; unlink and replace one copied '
-        'TIFF with invalid bytes'
-    ),
+    2: ('unlink one copied source image; unlink and replace one copied TIFF with invalid bytes'),
     3: 'S3-shaped wrapper returns AccessDenied with HTTP 403 at HeadBucket',
     4: 'client targets a closed loopback TCP port',
     5: 'RunJournal fsync raises OSError(ENOSPC) on the first push intent',
-    6: (
-        'subprocess pauses before upload two; parent sends SIGINT and '
-        'SIGTERM in separate runs'
-    ),
-    7: (
-        'subprocess writes object one then pauses before acknowledgment; '
-        'parent sends SIGKILL'
-    ),
+    6: ('subprocess pauses before upload two; parent sends SIGINT and SIGTERM in separate runs'),
+    7: ('subprocess writes object one then pauses before acknowledgment; parent sends SIGKILL'),
     8: 'execute initial version, unchanged version, then append one synthetic page',
     9: 'pre-place different bytes at a planned master key',
-    10: (
-        'winner pauses after destination lock acquisition; contender '
-        'starts before release'
-    ),
+    10: ('winner pauses after destination lock acquisition; contender starts before release'),
     11: 'wrapper writes object then raises a connection error before acknowledgment',
-    12: (
-        'wrapper returns HTTP 503 for three upload attempts; resume uses a fresh client'
-    ),
+    12: ('wrapper returns HTTP 503 for three upload attempts; resume uses a fresh client'),
     13: (
         'preview, execute, repeat; second rollback deletes one key then '
         'pauses before acknowledgment'
@@ -462,8 +429,7 @@ class FileS3Client:
             sum(
                 1
                 for path in bucket_root.rglob('*')
-                if path.is_file()
-                and path.relative_to(bucket_root).as_posix().startswith(prefix)
+                if path.is_file() and path.relative_to(bucket_root).as_posix().startswith(prefix)
             )
             if bucket_root.exists()
             else 0
@@ -574,9 +540,7 @@ class FaultClient:
             getattr(
                 client,
                 'meta',
-                SimpleNamespace(
-                    endpoint_url=self.endpoint_url, region_name=self.region_name
-                ),
+                SimpleNamespace(endpoint_url=self.endpoint_url, region_name=self.region_name),
             ),
         )
         self.put_calls = getattr(client, 'put_calls', [])
@@ -636,15 +600,12 @@ def make_synthetic_package(root, *, pages=2, batch_id='package', prefix='run'):
     lines.append(f'Synthetic package,{batch_id},Paged Content,,,parent.pdf')
     for index in range(1, pages + 1):
         lines.append(
-            f'Synthetic page {index},page-{index},Page,{batch_id},'
-            f'{index},page-{index}.tif'
+            f'Synthetic page {index},page-{index},Page,{batch_id},{index},page-{index}.tif'
         )
     (root / 'input.csv').write_text('\n'.join(lines) + '\n', encoding='utf-8')
     (root / 'parent.pdf').write_bytes(b'%PDF-1.4\nsynthetic\n%%EOF\n')
     for index in range(1, pages + 1):
-        Image.new('RGB', (12, 10), (index * 30, 20, 100)).save(
-            root / f'page-{index}.tif'
-        )
+        Image.new('RGB', (12, 10), (index * 30, 20, 100)).save(root / f'page-{index}.tif')
     config = root / 'package.yml'
     config.write_text(
         f'input_dir: {root}\ninput_csv: input.csv\n'
@@ -715,9 +676,7 @@ def _finish_worker(process, ready_file, timeout, kill_signal):
     if ready_file is not None:
         deadline = time.monotonic() + timeout
         while (
-            time.monotonic() < deadline
-            and process.poll() is None
-            and not Path(ready_file).exists()
+            time.monotonic() < deadline and process.poll() is None and not Path(ready_file).exists()
         ):
             time.sleep(0.02)
         if not Path(ready_file).exists():
@@ -746,9 +705,7 @@ def start_worker(
     """Start a test worker, leaving barriers under the caller's control."""
     root = Path(__file__).resolve().parents[1]
     tests = Path(__file__).resolve().parent
-    env = _worker_environment(
-        root, tests, storage_root, lock_root, fault, backend, hold_barrier
-    )
+    env = _worker_environment(root, tests, storage_root, lock_root, fault, backend, hold_barrier)
     if ready_file is not None:
         env['REHEARSAL_READY_FILE'] = str(ready_file)
     if release_file is not None:
@@ -757,12 +714,8 @@ def start_worker(
     return process, env
 
 
-def _worker_environment(
-    root, tests, storage_root, lock_root, fault, backend, hold_barrier
-):
-    env = {
-        key: value for key, value in os.environ.items() if not key.startswith('AWS_')
-    }
+def _worker_environment(root, tests, storage_root, lock_root, fault, backend, hold_barrier):
+    env = {key: value for key, value in os.environ.items() if not key.startswith('AWS_')}
     env.update(
         {
             'PYTHONPATH': os.pathsep.join((str(root), str(tests))),

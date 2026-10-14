@@ -1,4 +1,5 @@
 """Single-host writer exclusion. Production root is provisioned, never inferred."""
+
 import hashlib
 import json
 import os
@@ -29,13 +30,20 @@ class WriterLocks:
     def _validate_root(self):
         try:
             info = self.root.lstat()
-            if (not self.root.is_absolute() or not stat.S_ISDIR(info.st_mode)
-                    or self.root.is_symlink() or info.st_mode & 0o007
-                    or info.st_uid not in {0, os.getuid()}
-                    or not os.access(self.root, os.R_OK | os.W_OK | os.X_OK)):
+            if (
+                not self.root.is_absolute()
+                or not stat.S_ISDIR(info.st_mode)
+                or self.root.is_symlink()
+                or info.st_mode & 0o007
+                or info.st_uid not in {0, os.getuid()}
+                or not os.access(self.root, os.R_OK | os.W_OK | os.X_OK)
+            ):
                 raise LockError('Lock root is unsafe or inaccessible; check host provisioning.')
         except OSError as exc:
-            raise LockError('Persistent lock root unavailable; provision /var/lib/workbench-lite/locks. No fallback is allowed.') from exc
+            raise LockError(
+                'Persistent lock root unavailable; provision /var/lib/workbench-lite/locks. '
+                'No fallback is allowed.'
+            ) from exc
 
     def acquire(self, identity):
         self._validate_root()
@@ -46,17 +54,31 @@ class WriterLocks:
         try:
             path.mkdir(mode=0o770)
         except FileExistsError as exc:
-            raise LockError(f'Writer lock is held: {key}. Inspect ownership; stale locks require explicit recovery.') from exc
+            raise LockError(
+                f'Writer lock is held: {key}. Inspect ownership; '
+                'stale locks require explicit recovery.'
+            ) from exc
         except OSError as exc:
-            raise LockError('Cannot acquire writer lock; check shared operator permissions.') from exc
+            raise LockError(
+                'Cannot acquire writer lock; check shared operator permissions.'
+            ) from exc
         self.owned[key] = path
         try:
-            atomic_write(path/'owner.json', json_bytes({
-                'schema_version': 1, 'token': self.token, 'pid': os.getpid(),
-                'uid': os.getuid(), 'hostname': socket.gethostname(),
-                'created_at': now(), 'identity_sha256': key,
-            }))
-            (path/'owner.json').chmod(0o660)
+            atomic_write(
+                path / 'owner.json',
+                json_bytes(
+                    {
+                        'schema_version': 1,
+                        'token': self.token,
+                        'pid': os.getpid(),
+                        'uid': os.getuid(),
+                        'hostname': socket.gethostname(),
+                        'created_at': now(),
+                        'identity_sha256': key,
+                    }
+                ),
+            )
+            (path / 'owner.json').chmod(0o660)
             path.chmod(0o770)
         except Exception:
             # No operation is admitted until ownership is durably recorded.
@@ -67,7 +89,7 @@ class WriterLocks:
         failures = []
         for key, path in reversed(list(self.owned.items())):
             try:
-                owner = path/'owner.json'
+                owner = path / 'owner.json'
                 if owner.exists() and json.loads(owner.read_text())['token'] != self.token:
                     raise LockError('Lock ownership changed; manual inspection required.')
                 owner.unlink(missing_ok=True)
@@ -76,7 +98,10 @@ class WriterLocks:
             except (OSError, ValueError, KeyError, LockError):
                 failures.append(key)
         if failures:
-            raise LockError('Cannot release owned writer lock; explicit recovery required: ' + ', '.join(failures))
+            raise LockError(
+                'Cannot release owned writer lock; explicit recovery required: '
+                + ', '.join(failures)
+            )
 
     def __exit__(self, *args):
         self.release()
@@ -101,5 +126,9 @@ def lock_destination(locks, endpoint, entries):
         # A bucket-name guard also covers aliases for the same storage endpoint.
         locks.acquire('destination-bucket:' + bucket)
     for bucket in sorted({entry.bucket for entry in entries}):
-        prefix = os.path.commonpath([str(Path(entry.key).parent) for entry in entries if entry.bucket == bucket])
-        locks.acquire('destination:' + json.dumps([endpoint, bucket, prefix], separators=(',', ':')))
+        prefix = os.path.commonpath(
+            [str(Path(entry.key).parent) for entry in entries if entry.bucket == bucket]
+        )
+        locks.acquire(
+            'destination:' + json.dumps([endpoint, bucket, prefix], separators=(',', ':'))
+        )

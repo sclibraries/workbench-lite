@@ -44,8 +44,7 @@ def case_01(ctx, alias, directory, source, config, prefix):
     status = inspect_run(run_path)
     if status['publication']['state'] != 'ready_for_review':
         raise ScenarioMismatch(
-            'publication expected ready_for_review, observed '
-            f'{status["publication"]["state"]}'
+            f'publication expected ready_for_review, observed {status["publication"]["state"]}'
         )
     return {
         'steps': {
@@ -170,9 +169,7 @@ def case_05(ctx, alias, directory, source, config, prefix):
                 return original(
                     journal, stage, identity, operation_id=operation_id, attempt=attempt
                 )
-        return original(
-            journal, stage, identity, operation_id=operation_id, attempt=attempt
-        )
+        return original(journal, stage, identity, operation_id=operation_id, attempt=attempt)
 
     result = ctx.push(
         directory,
@@ -193,9 +190,7 @@ def case_05(ctx, alias, directory, source, config, prefix):
 def case_06(ctx, alias, directory, source, config, prefix):
     signals = (('SIGINT', 2, 130), ('SIGTERM', 15, 143))
     outcomes = {
-        label: _run_signal_fault(
-            ctx, directory, source, prefix, label, signal, expected
-        )
+        label: _run_signal_fault(ctx, directory, source, prefix, label, signal, expected)
         for label, signal, expected in signals
     }
     return {
@@ -231,15 +226,12 @@ def _run_signal_fault(ctx, directory, source, prefix, label, stop_signal, expect
 def _verify_interrupted_signal(ctx, label, run_path, child, expected):
     if child.returncode != expected:
         raise ScenarioMismatch(
-            f'{label}: expected {expected}, observed {child.returncode}; '
-            f'{child.stderr[-1000:]}'
+            f'{label}: expected {expected}, observed {child.returncode}; {child.stderr[-1000:]}'
         )
     status = inspect_run(run_path)
     interrupted = status['state'] == 'interrupted' and status['unknown_operations']
     if not interrupted:
-        raise ScenarioMismatch(
-            f'{label}: expected interrupted state and unknown intent'
-        )
+        raise ScenarioMismatch(f'{label}: expected interrupted state and unknown intent')
 
 
 def _push_argv(config, output, run_directory):
@@ -314,9 +306,7 @@ def case_08(ctx, alias, directory, source, config, prefix):
     additive, additive_status = _run_additive_version(
         ctx, directory, config, manifest_key, old_manifest_bytes
     )
-    unchanged_run = Path(
-        json.loads((output2 / '.workbench-run.json').read_text())['run_path']
-    )
+    unchanged_run = Path(json.loads((output2 / '.workbench-run.json').read_text())['run_path'])
     unchanged_state = inspect_run(unchanged_run)['publication']['state']
     return {
         'steps': {
@@ -354,9 +344,7 @@ def _append_synthetic_page(source, config):
     new_file = input_root / f'synthetic-added-page-{new_number}.tif'
     Image.new('RGB', (32, 24), (37, 91, 143)).save(new_file)
     fieldnames = list(rows[0])
-    parent_id = next(
-        row['id'] for row in rows if row.get('field_model') == 'Paged Content'
-    )
+    parent_id = next(row['id'] for row in rows if row.get('field_model') == 'Paged Content')
     row = {field: '' for field in fieldnames}
     row.update(
         {
@@ -381,12 +369,8 @@ def _run_additive_version(ctx, directory, config, manifest_key, original_manifes
     ctx.require_exit(result, 1, 'additive_execute')
     current_manifest = _read_object(ctx, ctx.args.public_bucket, manifest_key)
     if current_manifest != original_manifest:
-        raise ScenarioMismatch(
-            'additive rerun changed the previously published manifest'
-        )
-    run_path = Path(
-        json.loads((output / '.workbench-run.json').read_text())['run_path']
-    )
+        raise ScenarioMismatch('additive rerun changed the previously published manifest')
+    run_path = Path(json.loads((output / '.workbench-run.json').read_text())['run_path'])
     publication = inspect_run(run_path)['publication']['state']
     if publication != 'held':
         raise ScenarioMismatch('additive rerun unexpectedly has a publication receipt')
@@ -451,17 +435,13 @@ def _verify_contender_runs(outputs):
         winner_state['publication']['state'] != 'ready_for_review'
         or contender_state['publication']['state'] != 'held'
     ):
-        raise ScenarioMismatch(
-            'winner/contender publication states did not match lock outcome'
-        )
+        raise ScenarioMismatch('winner/contender publication states did not match lock outcome')
 
 
 def _contend_for_destination(ctx, directory, configs, outputs):
     ready, release = directory / 'winner-ready', directory / 'winner-release'
     child = _start_lock_winner(ctx, directory, configs[0], outputs[0], ready, release)
-    contender = _run_lock_contender(
-        ctx, directory, configs[1], outputs[1], child, ready, release
-    )
+    contender = _run_lock_contender(ctx, directory, configs[1], outputs[1], child, ready, release)
     stdout, stderr = child.communicate(timeout=60)
     _verify_lock_result(child.returncode, contender, ready, stdout, stderr)
     return child.returncode, contender
@@ -525,9 +505,7 @@ def case_11(ctx, alias, directory, source, config, prefix):
     result = ctx.push(directory, config, output, mode='lost_ack')
     ctx.require_exit(result, 0, 'push_execute')
     events, error = read_events(run_path)
-    if error or not any(
-        event.get('disposition') == 'reconciled_written' for event in events
-    ):
+    if error or not any(event.get('disposition') == 'reconciled_written' for event in events):
         raise ScenarioMismatch(
             'lost acknowledgment did not produce reconciled_written journal evidence'
         )
@@ -557,9 +535,7 @@ def case_12(ctx, alias, directory, source, config, prefix):
         if event['kind'] == 'intent' and event.get('stage') == 'push'
     ]
     if not {1, 2, 3, 4}.issubset(set(attempts)):
-        raise ScenarioMismatch(
-            f'attempt sequence did not continue across invocation: {attempts}'
-        )
+        raise ScenarioMismatch(f'attempt sequence did not continue across invocation: {attempts}')
     return {
         'steps': {'initial_execute': first['exit'], 'push_resume': resumed['exit']},
         'run_state': inspect_run(run_path)['state'],
@@ -574,9 +550,7 @@ def case_13(ctx, alias, directory, source, config, prefix):
     source_run = ctx.generate(directory, config, output)
     pushed = ctx.push(directory, config, output)
     ctx.require_exit(pushed, 0, 'initial_execute')
-    preview, execute, repeat = _run_rollback_cycle(
-        ctx, directory, config, source_run, prefix
-    )
+    preview, execute, repeat = _run_rollback_cycle(ctx, directory, config, source_run, prefix)
     resume, removed_locks = _resume_interrupted_rollback(ctx, directory, source, prefix)
     return {
         'steps': {
@@ -602,9 +576,7 @@ def _run_rollback_cycle(ctx, directory, config, source_run, prefix):
         raise ScenarioMismatch('rollback preview unexpectedly removed objects')
     execute = _rollback_command(ctx, directory, config, source_run, execute=True)
     ctx.require_exit(execute, 0, 'execute')
-    repeat = _rollback_command(
-        ctx, directory, config, source_run, execute=True, repeat=True
-    )
+    repeat = _rollback_command(ctx, directory, config, source_run, execute=True, repeat=True)
     ctx.require_exit(repeat, 0, 'repeat')
     return preview, execute, repeat
 
@@ -646,9 +618,7 @@ def _resume_interrupted_rollback(ctx, directory, source, prefix):
     ctx.require_exit(pushed, 0, 'interrupted_source_push')
     child = _interrupt_rollback(ctx, directory, config, run_path)
     if child.returncode != -9:
-        raise ScenarioMismatch(
-            f'rollback SIGKILL expected -9; observed {child.returncode}'
-        )
+        raise ScenarioMismatch(f'rollback SIGKILL expected -9; observed {child.returncode}')
     removed_locks = clear_dead_test_locks(ctx.lock_root, child.pid)
     resume = _rollback_command(
         ctx, directory, config, run_path, execute=True, label_suffix=' (resume)'
@@ -656,12 +626,8 @@ def _resume_interrupted_rollback(ctx, directory, source, prefix):
     ctx.require_exit(resume, 0, 'resume')
     if not (run_path / 'rollback-hold.json').exists():
         raise ScenarioMismatch('rollback source hold was not retained')
-    remaining = storage_listing(
-        ctx.storage, ctx.args.private_bucket, f'{prefix}/interrupted'
-    )
-    remaining.update(
-        storage_listing(ctx.storage, ctx.args.public_bucket, f'{prefix}/interrupted')
-    )
+    remaining = storage_listing(ctx.storage, ctx.args.private_bucket, f'{prefix}/interrupted')
+    remaining.update(storage_listing(ctx.storage, ctx.args.public_bucket, f'{prefix}/interrupted'))
     if remaining:
         raise ScenarioMismatch(
             f'resumed rollback left rehearsal objects behind: {sorted(remaining)[:3]}'

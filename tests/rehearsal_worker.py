@@ -61,14 +61,10 @@ def main(arguments):
     def factory(endpoint_url=None, region=None, profile=None, **kwargs):
         if backend == 'localstack':
             if endpoint_url != 'http://localhost:4566' or profile:
-                raise RuntimeError(
-                    'Rehearsal storage endpoint/profile guard refused this client.'
-                )
+                raise RuntimeError('Rehearsal storage endpoint/profile guard refused this client.')
             client = make_boto_client(endpoint_url, region, None, **kwargs)
         elif backend == 'file':
-            client = FileS3Client(
-                storage_root, endpoint=endpoint_url or 'http://synthetic.invalid'
-            )
+            client = FileS3Client(storage_root, endpoint=endpoint_url or 'http://synthetic.invalid')
         else:
             raise RuntimeError('Unknown rehearsal storage backend.')
         return WorkerClient(client, mode)

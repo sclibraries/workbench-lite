@@ -20,8 +20,12 @@ class VerificationResult:
         return self.matches
 
     def evidence(self):
-        return {'observed_checksum': self.checksum, 'observed_size_bytes': self.size_bytes,
-                'verification_method': self.method, 'checksum_type': self.checksum_type}
+        return {
+            'observed_checksum': self.checksum,
+            'observed_size_bytes': self.size_bytes,
+            'verification_method': self.method,
+            'checksum_type': self.checksum_type,
+        }
 
 
 @dataclass(frozen=True)
@@ -45,6 +49,7 @@ class Boto3S3Client:
 
     def object_exists(self, bucket, key):
         from botocore.exceptions import ClientError
+
         # Fail before any write when an older installed SDK lacks conditional PUT.
         model = self.client.meta.service_model.operation_model('PutObject')
         if 'IfNoneMatch' not in model.input_shape.members:
@@ -60,10 +65,9 @@ class Boto3S3Client:
     def inspect_object(self, bucket, key):
         """Read the current full-object checksum, size and ETag, or return None."""
         from botocore.exceptions import ClientError
+
         try:
-            metadata = self.client.head_object(
-                Bucket=bucket, Key=key, ChecksumMode='ENABLED'
-            )
+            metadata = self.client.head_object(Bucket=bucket, Key=key, ChecksumMode='ENABLED')
         except ClientError as exc:
             error = exc.response.get('Error', {})
             status = exc.response.get('ResponseMetadata', {}).get('HTTPStatusCode')
@@ -98,9 +102,14 @@ class Boto3S3Client:
         # A HEAD alone cannot prevent a competing writer replacing a serving key.
         # Conditional single PUT fails closed; never fall back to unconditional PUT.
         with Path(source_path).open('rb') as source:
-            self.client.put_object(Bucket=bucket, Key=key, Body=source, IfNoneMatch='*',
-                                   ChecksumAlgorithm='SHA256',
-                                   ChecksumSHA256=base64.b64encode(bytes.fromhex(checksum)).decode('ascii'))
+            self.client.put_object(
+                Bucket=bucket,
+                Key=key,
+                Body=source,
+                IfNoneMatch='*',
+                ChecksumAlgorithm='SHA256',
+                ChecksumSHA256=base64.b64encode(bytes.fromhex(checksum)).decode('ascii'),
+            )
 
     def verify_file(self, bucket, key, checksum, size_bytes):
         metadata = self.client.head_object(Bucket=bucket, Key=key, ChecksumMode='ENABLED')
@@ -125,8 +134,13 @@ class Boto3S3Client:
             for chunk in iter(lambda: body.read(1024 * 1024), b''):
                 length += len(chunk)
                 digest.update(chunk)
-            return VerificationResult(length == size_bytes and digest.hexdigest() == checksum,
-                                      digest.hexdigest(), length, 's3-sha256+readback', checksum_type)
+            return VerificationResult(
+                length == size_bytes and digest.hexdigest() == checksum,
+                digest.hexdigest(),
+                length,
+                's3-sha256+readback',
+                checksum_type,
+            )
         finally:
             body.close()
 
@@ -144,10 +158,11 @@ def create_s3_client(
         import boto3  # type: ignore
     except ImportError as error:
         raise RuntimeError(
-            "boto3 is required for push --execute. Install workbench-lite requirements first."
+            'boto3 is required for push --execute. Install workbench-lite requirements first.'
         ) from error
 
     from botocore.config import Config
+
     client_kwargs = {}
     if preflight:
         client_kwargs['config'] = Config(
@@ -160,14 +175,14 @@ def create_s3_client(
             retries={'total_max_attempts': 1},
         )
     if endpoint_url:
-        client_kwargs["endpoint_url"] = endpoint_url
+        client_kwargs['endpoint_url'] = endpoint_url
     if region:
-        client_kwargs["region_name"] = region
+        client_kwargs['region_name'] = region
 
     if profile:
         session = boto3.Session(profile_name=profile)
-        client = session.client("s3", **client_kwargs)
+        client = session.client('s3', **client_kwargs)
     else:
-        client = boto3.client("s3", **client_kwargs)
+        client = boto3.client('s3', **client_kwargs)
 
     return Boto3S3Client(client, full_readback=full_readback)
