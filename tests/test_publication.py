@@ -513,7 +513,7 @@ class PublicationTests(unittest.TestCase):
         self.assertEqual(summary['publication']['state'], 'ready_for_review')
         self.assertFalse(summary['unknown_operations'])
 
-    def test_resume_refuses_receipt_pending_marker_rollback_hold_and_changed_evidence(self):  # noqa: C901, PLR0915
+    def test_resume_refuses_receipt_pending_marker_rollback_hold_and_changed_evidence(self):
         original_config = self.config.read_bytes()
         original_csv = (self.root / 'input.csv').read_bytes()
         refusal_cases = (
@@ -530,45 +530,81 @@ class PublicationTests(unittest.TestCase):
         )
         for case in refusal_cases:
             with self.subTest(case=case):
-                self.config.write_bytes(original_config)
-                (self.root / 'input.csv').write_bytes(original_csv)
-                self.regenerate()
-                store = TransientStorage(['access_denied'])
-                self.assertEqual(self.execute_at_endpoint(store), 1)
-                event_bytes = (self.run / 'events.jsonl').read_bytes()
-                endpoint = 'http://s3.test'
-                if case == 'config':
-                    self.config.write_text(self.config.read_text() + '# changed\n')
-                elif case == 'csv':
-                    (self.root / 'input.csv').write_text(
-                        (self.root / 'input.csv').read_text() + '\n'
-                    )
-                elif case == 'snapshot':
-                    (self.run / 'input.csv').write_text('changed snapshot\n')
-                elif case == 'plan':
-                    (self.run / 'upload-plan.json').write_text('{}')
-                elif case == 'source':
-                    metadata = json.loads((self.run / 'run.json').read_text())
-                    metadata['software']['source_sha256'] = '0' * 64
-                    (self.run / 'run.json').write_text(json.dumps(metadata))
-                elif case == 'pending':
-                    (self.run / 'publication-pending').write_text('{}')
-                elif case == 'rollback_hold':
-                    (self.run / 'rollback-hold.json').write_text('{}')
-                elif case == 'endpoint':
-                    endpoint = 'http://other.test'
-                elif case == 'buckets':
-                    self.config.write_text(
-                        self.config.read_text() + 's3_private_bucket: other-bucket\n'
-                    )
-                elif case == 'reference':
-                    (self.output / '.workbench-run.json').unlink()
+                self._assert_resume_refuses_evidence_case(case, original_config, original_csv)
 
-                if case == 'endpoint':
-                    store.client.meta.endpoint_url = endpoint
-                self.assertEqual(self.execute_at_endpoint(store, resume=True, endpoint=endpoint), 1)
-                self.assertEqual((self.run / 'events.jsonl').read_bytes(), event_bytes)
+        self._assert_resume_refuses_replay_after_successful_upload(original_config, original_csv)
 
+    def _assert_resume_refuses_evidence_case(self, case, original_config, original_csv):
+        self.config.write_bytes(original_config)
+        (self.root / 'input.csv').write_bytes(original_csv)
+        self.regenerate()
+        store = TransientStorage(['access_denied'])
+        self.assertEqual(self.execute_at_endpoint(store), 1)
+        event_bytes = (self.run / 'events.jsonl').read_bytes()
+        endpoint = self._change_resume_evidence(case)
+        if case == 'endpoint':
+            store.client.meta.endpoint_url = endpoint
+        self.assertEqual(self.execute_at_endpoint(store, resume=True, endpoint=endpoint), 1)
+        self.assertEqual((self.run / 'events.jsonl').read_bytes(), event_bytes)
+
+    def _change_resume_evidence(self, case):
+        changes = {
+            'config': self._change_config_evidence,
+            'csv': self._change_csv_evidence,
+            'snapshot': self._change_snapshot_evidence,
+            'plan': self._change_plan_evidence,
+            'source': self._change_source_evidence,
+            'pending': self._add_pending_marker,
+            'rollback_hold': self._add_rollback_hold,
+            'endpoint': self._change_endpoint_evidence,
+            'buckets': self._change_bucket_evidence,
+            'reference': self._remove_run_reference,
+        }
+        return changes[case]()
+
+    def _change_config_evidence(self):
+        self.config.write_text(self.config.read_text() + '# changed\n')
+        return 'http://s3.test'
+
+    def _change_csv_evidence(self):
+        input_csv = self.root / 'input.csv'
+        input_csv.write_text(input_csv.read_text() + '\n')
+        return 'http://s3.test'
+
+    def _change_snapshot_evidence(self):
+        (self.run / 'input.csv').write_text('changed snapshot\n')
+        return 'http://s3.test'
+
+    def _change_plan_evidence(self):
+        (self.run / 'upload-plan.json').write_text('{}')
+        return 'http://s3.test'
+
+    def _change_source_evidence(self):
+        metadata = json.loads((self.run / 'run.json').read_text())
+        metadata['software']['source_sha256'] = '0' * 64
+        (self.run / 'run.json').write_text(json.dumps(metadata))
+        return 'http://s3.test'
+
+    def _add_pending_marker(self):
+        (self.run / 'publication-pending').write_text('{}')
+        return 'http://s3.test'
+
+    def _add_rollback_hold(self):
+        (self.run / 'rollback-hold.json').write_text('{}')
+        return 'http://s3.test'
+
+    def _change_endpoint_evidence(self):
+        return 'http://other.test'
+
+    def _change_bucket_evidence(self):
+        self.config.write_text(self.config.read_text() + 's3_private_bucket: other-bucket\n')
+        return 'http://s3.test'
+
+    def _remove_run_reference(self):
+        (self.output / '.workbench-run.json').unlink()
+        return 'http://s3.test'
+
+    def _assert_resume_refuses_replay_after_successful_upload(self, original_config, original_csv):
         self.config.write_bytes(original_config)
         (self.root / 'input.csv').write_bytes(original_csv)
         self.regenerate()
