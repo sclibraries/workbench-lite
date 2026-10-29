@@ -150,41 +150,59 @@ def _load_manifest_json(path: Path) -> dict:
     return payload
 
 
-def _iter_service_entries(payload: dict) -> List[tuple[str, str]]:  # noqa: C901
+def _iter_service_entries(payload: dict) -> List[tuple[str, str]]:
     sequences = payload.get('sequences', [])
     if not isinstance(sequences, list):
         return []
 
     entries: List[tuple[str, str]] = []
     for sequence in sequences:
-        if not isinstance(sequence, dict):
-            continue
-        canvases = sequence.get('canvases', [])
-        if not isinstance(canvases, list):
-            continue
-
-        for canvas in canvases:
-            if not isinstance(canvas, dict):
-                continue
-
-            canvas_id = str(canvas.get('@id', 'unknown'))
-            images = canvas.get('images', [])
-            if not isinstance(images, list):
-                continue
-            for image in images:
-                if not isinstance(image, dict):
-                    continue
-                resource = image.get('resource', {})
-                if not isinstance(resource, dict):
-                    continue
-                service = resource.get('service')
-                if not isinstance(service, dict):
-                    continue
-
-                service_id = service.get('@id')
-                if isinstance(service_id, str) and service_id:
-                    entries.append((canvas_id, service_id))
+        entries.extend(_iter_sequence_service_entries(sequence))
     return entries
+
+
+def _iter_sequence_service_entries(sequence: object) -> List[tuple[str, str]]:
+    if not isinstance(sequence, dict):
+        return []
+    canvases = sequence.get('canvases', [])
+    if not isinstance(canvases, list):
+        return []
+
+    entries: List[tuple[str, str]] = []
+    for canvas in canvases:
+        entries.extend(_iter_canvas_service_entries(canvas))
+    return entries
+
+
+def _iter_canvas_service_entries(canvas: object) -> List[tuple[str, str]]:
+    if not isinstance(canvas, dict):
+        return []
+    canvas_id = str(canvas.get('@id', 'unknown'))
+    images = canvas.get('images', [])
+    if not isinstance(images, list):
+        return []
+
+    entries: List[tuple[str, str]] = []
+    for image in images:
+        service_id = _service_id_from_image(image)
+        if service_id is not None:
+            entries.append((canvas_id, service_id))
+    return entries
+
+
+def _service_id_from_image(image: object) -> Optional[str]:
+    if not isinstance(image, dict):
+        return None
+    resource = image.get('resource', {})
+    if not isinstance(resource, dict):
+        return None
+    service = resource.get('service')
+    if not isinstance(service, dict):
+        return None
+    service_id = service.get('@id')
+    if isinstance(service_id, str) and service_id:
+        return service_id
+    return None
 
 
 def _fetch_info_json(
