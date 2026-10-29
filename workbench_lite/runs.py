@@ -152,110 +152,29 @@ def read_events(path):
     return events, error
 
 
-def publication_status(path, events, state, pending, error):  # noqa: C901
-    held = {
-        'state': 'held',
-        'reason': 'No durable complete-batch receipt; do not hand off to publication.',
-    }
-    try:
-        if (Path(path) / 'rollback-hold.json').exists():
-            return {
-                'state': 'held',
-                'reason': 'Rollback has started; this source run remains held permanently. '
-                'Republish with a new run.',
-            }
-    except OSError:
-        return held
-    if error or pending or state != 'completed' or not events:
-        return held
-    try:
-        if (Path(path) / 'publication-pending').exists():
-            return held
-    except OSError:
-        return held
+def _held_publication(reason='No durable complete-batch receipt; do not hand off to publication.'):
+    return {'state': 'held', 'reason': reason}
+
+
+def publication_status(path, events, state, pending, error):
+    rollback_hold = (
+        'Rollback has started; this source run remains held permanently. Republish with a new run.'
+    )
+    rollback_marker = _marker_state(path, 'rollback-hold.json')
+    if rollback_marker is None:
+        return _held_publication()
+    if rollback_marker:
+        return _held_publication(rollback_hold)
+    if not _publication_prerequisites(events, state, pending, error):
+        return _held_publication()
+    pending_marker = _marker_state(path, 'publication-pending')
+    if pending_marker is not False:
+        return _held_publication()
     receipt = events[-1].get('publication_receipt')
-    if (
-        not receipt
-        or events[-1].get('stage') != 'push'
-        or events[-1]['kind'] != 'stage_finished'
-        or events[-1].get('exit_code') != 0
-    ):
-        return held
-    if receipt.get('verification_contract') != 's3-sha256-v1':
-        return held
-    try:
-        plan_path = Path(path) / 'upload-plan.json'
-        if digest(plan_path) != receipt['plan_sha256']:
-            return held
-        plan = json.loads(plan_path.read_text())['entries']
-        expected = {(e['bucket'], e['key']) for e in plan}
-        start = max(
-            i for i, e in enumerate(events) if e['kind'] == 'stage_started' and e['stage'] == 'push'
-        )
-        results = [e for e in events[start:] if e['kind'] == 'result']
-        destination_checks = [e for e in results if e['stage'] == 'destination-check']
-        destinations = {(e['bucket'], e['key']): e.get('status') for e in destination_checks}
-        if (
-            len(destinations) != len(destination_checks)
-            or set(destinations) != expected
-            or any(status not in {'absent', 'unchanged'} for status in destinations.values())
-        ):
-            return held
-        uploads = {
-            (e['bucket'], e['key']): (e['checksum'], e['size_bytes'])
-            for e in results
-            if e['stage'] == 'push' and e.get('status') == 'uploaded'
-        }
-        reused = {}
-        for event in results:
-            if event['stage'] != 'destination-check' or event.get('status') != 'unchanged':
-                continue
-            if (
-                event.get('verification_method') not in {'s3-sha256', 's3-sha256+readback'}
-                or event.get('checksum_type') != 'FULL_OBJECT'
-                or event.get('observed_checksum') != event.get('checksum')
-                or event.get('observed_size_bytes') != event.get('size_bytes')
-            ):
-                return held
-            reused[(event['bucket'], event['key'])] = (event['checksum'], event['size_bytes'])
-        verified_events = [
-            event
-            for event in results
-            if event['stage'] == 'verify-upload' and event.get('status') == 'verified'
-        ]
-        for event in results:
-            if event['stage'] == 'verify-upload' and event.get('status') == 'verified':
-                if (
-                    event.get('verification_method') not in {'s3-sha256', 's3-sha256+readback'}
-                    # Before checksum_type was journaled, verified uploads
-                    # already required a FULL_OBJECT S3 checksum.
-                    or event.get('checksum_type', 'FULL_OBJECT') != 'FULL_OBJECT'
-                    or event.get('observed_checksum') != event['checksum']
-                    or event.get('observed_size_bytes') != event['size_bytes']
-                ):
-                    return held
-        verified = {
-            (e['bucket'], e['key']): (e['checksum'], e['size_bytes']) for e in verified_events
-        }
-        absent = {identity for identity, status in destinations.items() if status == 'absent'}
-        previously_published = {
-            identity for identity, status in destinations.items() if status == 'unchanged'
-        }
-        if (
-            not expected
-            or set(uploads) != absent
-            or set(reused) != previously_published
-            or set(uploads).intersection(reused)
-            or set(uploads) | set(reused) != expected
-            or verified != uploads
-            or len(verified_events) != len(uploads)
-            or receipt['verified_count'] != len(plan)
-            or sum(e['role'] == 'manifest' for e in plan) < 1
-            or receipt['manifest_count'] != sum(e['role'] == 'manifest' for e in plan)
-        ):
-            return held
-    except (OSError, ValueError, KeyError, TypeError):
-        return held
+    if not _valid_receipt_event(events[-1], receipt):
+        return _held_publication()
+    if not _valid_publication_receipt(path, events, receipt):
+        return _held_publication()
     return {
         'state': 'ready_for_review',
         'receipt': receipt,
@@ -263,88 +182,160 @@ def publication_status(path, events, state, pending, error):  # noqa: C901
     }
 
 
-def inspect_run(path):  # noqa: C901, PLR0915
-    events, error = read_events(path)
-    pending = {}
-    state, code, active = 'interrupted', None, None
-    counts = {}
-    for event in events:
-        kind = event['kind']
-        if kind == 'stage_started':
-            state, code, active = 'running', None, event
-        elif kind == 'stage_finished':
-            state, code, active = event['state'], event['exit_code'], None
-        elif kind == 'intent':
-            pending[event['operation_id']] = event
-        elif kind == 'result':
-            if event.get('remote_outcome') == 'unknown':
-                pending[event['operation_id']] = event
-            else:
-                pending.pop(event.get('operation_id'), None)
-            status = event.get('status', 'unknown')
-            counts[status] = counts.get(status, 0) + 1
-    retry_count = sum(
-        1
-        for event in events
-        if event['kind'] == 'intent'
+def _marker_state(path, marker):
+    try:
+        return (Path(path) / marker).exists()
+    except OSError:
+        return None
+
+
+def _publication_prerequisites(events, state, pending, error):
+    return not error and not pending and state == 'completed' and bool(events)
+
+
+def _valid_receipt_event(event, receipt):
+    return (
+        receipt
         and event.get('stage') == 'push'
-        and event.get('attempt', 1) > 1
+        and event['kind'] == 'stage_finished'
+        and event.get('exit_code') == 0
     )
-    push_starts = [
+
+
+def _valid_publication_receipt(path, events, receipt):
+    if receipt.get('verification_contract') != 's3-sha256-v1':
+        return False
+    try:
+        plan_path = Path(path) / 'upload-plan.json'
+        if digest(plan_path) != receipt['plan_sha256']:
+            return False
+        plan = json.loads(plan_path.read_text())['entries']
+        results = _push_stage_results(events)
+        expected = {(entry['bucket'], entry['key']) for entry in plan}
+        destinations = _destination_statuses(results, expected)
+        if destinations is None:
+            return False
+        uploads = _uploaded_identities(results)
+        reused = _verified_reused_identities(results)
+        if reused is None:
+            return False
+        verified = _verified_upload_identities(results)
+        if verified is None:
+            return False
+        verified_events, verified_identities = verified
+        return _receipt_matches_plan(
+            plan,
+            expected,
+            destinations,
+            uploads,
+            reused,
+            verified_events,
+            verified_identities,
+            receipt,
+        )
+    except (OSError, ValueError, KeyError, TypeError):
+        return False
+
+
+def _push_stage_results(events):
+    start = max(
         index
         for index, event in enumerate(events)
-        if event['kind'] == 'stage_started' and event['stage'] in {'push', 'push-dry-run'}
+        if event['kind'] == 'stage_started' and event['stage'] == 'push'
+    )
+    return [event for event in events[start:] if event['kind'] == 'result']
+
+
+def _destination_statuses(results, expected):
+    checks = [event for event in results if event['stage'] == 'destination-check']
+    destinations = {(event['bucket'], event['key']): event.get('status') for event in checks}
+    if (
+        len(destinations) != len(checks)
+        or set(destinations) != expected
+        or any(status not in {'absent', 'unchanged'} for status in destinations.values())
+    ):
+        return None
+    return destinations
+
+
+def _uploaded_identities(results):
+    return {
+        (event['bucket'], event['key']): (event['checksum'], event['size_bytes'])
+        for event in results
+        if event['stage'] == 'push' and event.get('status') == 'uploaded'
+    }
+
+
+def _verified_reused_identities(results):
+    reused = {}
+    for event in results:
+        if event['stage'] != 'destination-check' or event.get('status') != 'unchanged':
+            continue
+        if (
+            event.get('verification_method') not in {'s3-sha256', 's3-sha256+readback'}
+            or event.get('checksum_type') != 'FULL_OBJECT'
+            or event.get('observed_checksum') != event.get('checksum')
+            or event.get('observed_size_bytes') != event.get('size_bytes')
+        ):
+            return None
+        reused[(event['bucket'], event['key'])] = (event['checksum'], event['size_bytes'])
+    return reused
+
+
+def _verified_upload_identities(results):
+    verified_events = [
+        event
+        for event in results
+        if event['stage'] == 'verify-upload' and event.get('status') == 'verified'
     ]
-    push_artifacts = []
-    if push_starts:
-        start = push_starts[-1]
-        for event in events[start:]:
-            if (
-                event['kind'] != 'result'
-                or event.get('stage') != 'push'
-                or not event.get('classification')
-            ):
-                continue
-            push_artifacts.append(
-                {
-                    key: event[key]
-                    for key in (
-                        'bucket',
-                        'key',
-                        'role',
-                        'object_id',
-                        'page_id',
-                        'status',
-                        'classification',
-                        'checksum',
-                        'previous_checksum',
-                        'previous_checksum_type',
-                        'observed_checksum',
-                        'size_bytes',
-                        'observed_size_bytes',
-                        'verification_method',
-                        'message',
-                    )
-                    if key in event
-                }
-            )
-    classification_counts = {}
-    for artifact in push_artifacts:
-        classification = artifact['classification']
-        classification_counts[classification] = classification_counts.get(classification, 0) + 1
+    for event in verified_events:
+        if (
+            event.get('verification_method') not in {'s3-sha256', 's3-sha256+readback'}
+            # Before checksum_type was journaled, verified uploads
+            # already required a FULL_OBJECT S3 checksum.
+            or event.get('checksum_type', 'FULL_OBJECT') != 'FULL_OBJECT'
+            or event.get('observed_checksum') != event['checksum']
+            or event.get('observed_size_bytes') != event['size_bytes']
+        ):
+            return None
+    verified = {
+        (event['bucket'], event['key']): (event['checksum'], event['size_bytes'])
+        for event in verified_events
+    }
+    return verified_events, verified
+
+
+def _receipt_matches_plan(
+    plan, expected, destinations, uploads, reused, verified_events, verified, receipt
+):
+    absent = {identity for identity, status in destinations.items() if status == 'absent'}
+    previously_published = {
+        identity for identity, status in destinations.items() if status == 'unchanged'
+    }
+    manifest_count = sum(entry['role'] == 'manifest' for entry in plan)
+    return not (
+        not expected
+        or set(uploads) != absent
+        or set(reused) != previously_published
+        or set(uploads).intersection(reused)
+        or set(uploads) | set(reused) != expected
+        or verified != uploads
+        or len(verified_events) != len(uploads)
+        or receipt['verified_count'] != len(plan)
+        or manifest_count < 1
+        or receipt['manifest_count'] != manifest_count
+    )
+
+
+def inspect_run(path):
+    events, error = read_events(path)
+    state, code, active, pending, counts = _summarize_events(events)
+    retry_count = _retry_count(events)
+    push_artifacts = _latest_push_artifacts(events)
+    classification_counts = _classification_counts(push_artifacts)
     incomplete = active is not None or not events
-    if active:
-        alive = False
-        if active.get('hostname') == socket.gethostname():
-            try:
-                os.kill(active['pid'], 0)
-                alive = True
-            except ProcessLookupError:
-                pass
-            except PermissionError:
-                alive = True
-        if not alive:
-            state = 'interrupted'
+    if active and not _active_run_alive(active):
+        state = 'interrupted'
     if error:
         state, code = 'failed', 1
     return {
@@ -363,6 +354,104 @@ def inspect_run(path):  # noqa: C901, PLR0915
         'publication': publication_status(path, events, state, pending, error),
         'unknown_operations': [{**event, 'outcome': 'unknown'} for event in pending.values()],
     }
+
+
+def _summarize_events(events):
+    pending = {}
+    state, code, active = 'interrupted', None, None
+    counts = {}
+    for event in events:
+        kind = event['kind']
+        if kind == 'stage_started':
+            state, code, active = 'running', None, event
+        elif kind == 'stage_finished':
+            state, code, active = event['state'], event['exit_code'], None
+        elif kind == 'intent':
+            pending[event['operation_id']] = event
+        elif kind == 'result':
+            if event.get('remote_outcome') == 'unknown':
+                pending[event['operation_id']] = event
+            else:
+                pending.pop(event.get('operation_id'), None)
+            status = event.get('status', 'unknown')
+            counts[status] = counts.get(status, 0) + 1
+    return state, code, active, pending, counts
+
+
+def _retry_count(events):
+    return sum(
+        1
+        for event in events
+        if event['kind'] == 'intent'
+        and event.get('stage') == 'push'
+        and event.get('attempt', 1) > 1
+    )
+
+
+def _latest_push_artifacts(events):
+    starts = [
+        index
+        for index, event in enumerate(events)
+        if event['kind'] == 'stage_started' and event['stage'] in {'push', 'push-dry-run'}
+    ]
+    if not starts:
+        return []
+    return _push_artifacts_after(events, starts[-1])
+
+
+def _push_artifacts_after(events, start):
+    push_artifacts = []
+    for event in events[start:]:
+        if (
+            event['kind'] != 'result'
+            or event.get('stage') != 'push'
+            or not event.get('classification')
+        ):
+            continue
+        push_artifacts.append(
+            {
+                key: event[key]
+                for key in (
+                    'bucket',
+                    'key',
+                    'role',
+                    'object_id',
+                    'page_id',
+                    'status',
+                    'classification',
+                    'checksum',
+                    'previous_checksum',
+                    'previous_checksum_type',
+                    'observed_checksum',
+                    'size_bytes',
+                    'observed_size_bytes',
+                    'verification_method',
+                    'message',
+                )
+                if key in event
+            }
+        )
+    return push_artifacts
+
+
+def _classification_counts(push_artifacts):
+    classification_counts = {}
+    for artifact in push_artifacts:
+        classification = artifact['classification']
+        classification_counts[classification] = classification_counts.get(classification, 0) + 1
+    return classification_counts
+
+
+def _active_run_alive(active):
+    if active.get('hostname') != socket.gethostname():
+        return False
+    try:
+        os.kill(active['pid'], 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
 
 
 class RunJournal:
