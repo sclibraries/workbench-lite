@@ -42,7 +42,16 @@ def load_config(config_path: Path) -> Dict[str, object]:
     return _validate_config(loaded)
 
 
-def _validate_config(config: Dict[str, object]) -> Dict[str, object]:  # noqa: C901
+def _validate_config(config: Dict[str, object]) -> Dict[str, object]:
+    _validate_string_settings(config)
+    _validate_boolean_settings(config)
+    _validate_key_segments(config)
+    _validate_bucket_names(config)
+    _validate_additional_files(config)
+    return config
+
+
+def _validate_string_settings(config):
     # Validate consumed scalar types before any generation/upload side effects.
     for name in (
         'input_dir',
@@ -56,8 +65,14 @@ def _validate_config(config: Dict[str, object]) -> Dict[str, object]:  # noqa: C
     ):
         if name in config and not isinstance(config[name], str):
             raise ConfigError(f'Configuration {name} must be a string.')
+
+
+def _validate_boolean_settings(config):
     if 'allow_missing_files' in config and not isinstance(config['allow_missing_files'], bool):
         raise ConfigError('Configuration allow_missing_files must be a boolean.')
+
+
+def _validate_key_segments(config):
     for name in ('s3_prefix', 'batch_id'):
         if name in config:
             value = config[name]
@@ -68,9 +83,15 @@ def _validate_config(config: Dict[str, object]) -> Dict[str, object]:  # noqa: C
                 or '\x00' in value
             ):
                 raise ConfigError(f'Configuration {name} contains an unsafe key segment.')
+
+
+def _validate_bucket_names(config):
     for name in ('s3_private_bucket', 's3_public_bucket'):
         if name in config and not re.fullmatch(r'[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]', config[name]):
             raise ConfigError(f'Configuration {name} must be a DNS-style S3 bucket name.')
+
+
+def _validate_additional_files(config):
     additional = config.get('additional_files', [])
     if not isinstance(additional, list) or any(
         not isinstance(item, dict) or len(item) != 1 for item in additional
@@ -79,7 +100,6 @@ def _validate_config(config: Dict[str, object]) -> Dict[str, object]:  # noqa: C
     keys = [key for item in additional for key in item]
     if any(not isinstance(key, str) or not key for key in keys) or len(keys) != len(set(keys)):
         raise ConfigError('Configuration additional_files needs unique, nonempty field names.')
-    return config
 
 
 def normalize_additional_files(config: Dict[str, object]) -> Dict[str, object]:
