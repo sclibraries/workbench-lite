@@ -79,16 +79,11 @@ class LockTests(unittest.TestCase):
                     second.acquire('taken')
             self.assertEqual(len(list(self.root.iterdir())), 1)
 
-    def test_cli_shared_output_races_are_excluded_before_journal_open(self):  # noqa: PLR0915
+    def test_cli_shared_output_races_are_excluded_before_journal_open(self):
         import contextlib
         import io
-        import os
-        import subprocess
-        import time
-        import shutil
         from cli_test_runner import main
         from test_outcomes import package
-        from workbench_lite.runs import read_events
 
         config = package(self.root)
         output = self.root / 'generated'
@@ -109,7 +104,7 @@ class LockTests(unittest.TestCase):
                 ),
                 0,
             )
-        reference = json.loads((output / '.workbench-run.json').read_text())
+        json.loads((output / '.workbench-run.json').read_text())
         script = """import os, time
 from pathlib import Path
 from cli_test_runner import cli, main
@@ -130,93 +125,112 @@ raise SystemExit(cli.entrypoint())
 """
         for second_mode, alias in [('--execute', False), ('--dry-run', False), ('--execute', True)]:
             with self.subTest(mode=second_mode, alias=alias):
-                with contextlib.redirect_stdout(io.StringIO()):
-                    self.assertEqual(
-                        main(
-                            [
-                                'generate',
-                                '--config',
-                                str(config),
-                                '--output-dir',
-                                str(output),
-                                '--manifests',
-                                '--thumbnails',
-                                '--run-dir',
-                                str(self.root / 'runs'),
-                            ]
-                        ),
-                        0,
-                    )
-                reference = json.loads((output / '.workbench-run.json').read_text())
-                shared = self.root / 'locks'
-                shared.mkdir(exist_ok=True)
-                shared.chmod(0o770)
-                ready, release = self.root / 'ready', self.root / 'release'
-                ready.unlink(missing_ok=True)
-                release.unlink(missing_ok=True)
-                cwd_a, cwd_b = self.root / 'cwd-a', self.root / 'cwd-b'
-                cwd_a.mkdir(exist_ok=True)
-                cwd_b.mkdir(exist_ok=True)
-                other = output
-                if alias:
-                    other = self.root / 'other-generated'
-                    other.mkdir(exist_ok=True)
-                    shutil.copyfile(output / '.workbench-run.json', other / '.workbench-run.json')
-                env = {
-                    **os.environ,
-                    'PYTHONPATH': str(Path(__file__).resolve().parents[1])
-                    + os.pathsep
-                    + str(Path(__file__).parent),
-                    'WBL_TEST_LOCK_DIR': str(shared),
-                    'READY': str(ready),
-                    'RELEASE': str(release),
-                    'HOLD': 'yes',
-                }
-                base = [sys.executable, '-c', script, 'push', '--config', str(config)]
-                first = subprocess.Popen(
-                    [*base, '--execute', '--generated-dir', str(output), '--run-dir', 'logs-a'],
-                    cwd=cwd_a,
-                    env=env,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    text=True,
-                )
-                try:
-                    deadline = time.monotonic() + 10
-                    while (
-                        not ready.exists() and time.monotonic() < deadline and first.poll() is None
-                    ):
-                        time.sleep(0.02)
-                    self.assertTrue(ready.exists())
-                    second = subprocess.run(
-                        [
-                            *base,
-                            second_mode,
-                            '--generated-dir',
-                            str(other),
-                            '--run-dir',
-                            'logs-b',
-                            '--endpoint-url',
-                            'http://different-destination:4566',
-                        ],
-                        cwd=cwd_b,
-                        env={**env, 'HOLD': 'no'},
-                        capture_output=True,
-                        text=True,
-                        timeout=10,
-                    )
-                    self.assertEqual(second.returncode, 1, second.stdout + second.stderr)
-                    self.assertIn('Writer lock is held', second.stdout)
-                finally:
-                    release.touch()
-                    stdout, stderr = first.communicate(timeout=10)
-                self.assertEqual(first.returncode, 0, stdout + stderr)
-                events, error = read_events(reference['run_path'])
-                self.assertIsNone(error)
-                self.assertEqual(
-                    sum(e['kind'] == 'stage_started' and e['stage'] == 'push' for e in events), 1
-                )
-                self.assertEqual(list(shared.iterdir()), [])
+                self._assert_cli_shared_output_race(config, output, script, second_mode, alias)
+
+    def _assert_cli_shared_output_race(self, config, output, script, second_mode, alias):
+        import contextlib
+        import io
+        import subprocess
+        import time
+        from cli_test_runner import main
+        from workbench_lite.runs import read_events
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(
+                main(
+                    [
+                        'generate',
+                        '--config',
+                        str(config),
+                        '--output-dir',
+                        str(output),
+                        '--manifests',
+                        '--thumbnails',
+                        '--run-dir',
+                        str(self.root / 'runs'),
+                    ]
+                ),
+                0,
+            )
+
+        reference, shared, ready, release, cwd_b, other, env, base = (
+            self._prepare_cli_shared_output_race(config, output, script, alias)
+        )
+        cwd_a = self.root / 'cwd-a'
+        first = subprocess.Popen(
+            [*base, '--execute', '--generated-dir', str(output), '--run-dir', 'logs-a'],
+            cwd=cwd_a,
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        try:
+            deadline = time.monotonic() + 10
+            while not ready.exists() and time.monotonic() < deadline and first.poll() is None:
+                time.sleep(0.02)
+            self.assertTrue(ready.exists())
+            second = subprocess.run(
+                [
+                    *base,
+                    second_mode,
+                    '--generated-dir',
+                    str(other),
+                    '--run-dir',
+                    'logs-b',
+                    '--endpoint-url',
+                    'http://different-destination:4566',
+                ],
+                cwd=cwd_b,
+                env={**env, 'HOLD': 'no'},
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            self.assertEqual(second.returncode, 1, second.stdout + second.stderr)
+            self.assertIn('Writer lock is held', second.stdout)
+        finally:
+            release.touch()
+            stdout, stderr = first.communicate(timeout=10)
+        self.assertEqual(first.returncode, 0, stdout + stderr)
+        events, error = read_events(reference['run_path'])
+        self.assertIsNone(error)
+        self.assertEqual(
+            sum(e['kind'] == 'stage_started' and e['stage'] == 'push' for e in events), 1
+        )
+        self.assertEqual(list(shared.iterdir()), [])
+
+    def _prepare_cli_shared_output_race(self, config, output, script, alias):
+        import os
+        import shutil
+
+        reference = json.loads((output / '.workbench-run.json').read_text())
+        shared = self.root / 'locks'
+        shared.mkdir(exist_ok=True)
+        shared.chmod(0o770)
+        ready, release = self.root / 'ready', self.root / 'release'
+        ready.unlink(missing_ok=True)
+        release.unlink(missing_ok=True)
+        cwd_a, cwd_b = self.root / 'cwd-a', self.root / 'cwd-b'
+        cwd_a.mkdir(exist_ok=True)
+        cwd_b.mkdir(exist_ok=True)
+        other = output
+        if alias:
+            other = self.root / 'other-generated'
+            other.mkdir(exist_ok=True)
+            shutil.copyfile(output / '.workbench-run.json', other / '.workbench-run.json')
+        env = {
+            **os.environ,
+            'PYTHONPATH': str(Path(__file__).resolve().parents[1])
+            + os.pathsep
+            + str(Path(__file__).parent),
+            'WBL_TEST_LOCK_DIR': str(shared),
+            'READY': str(ready),
+            'RELEASE': str(release),
+            'HOLD': 'yes',
+        }
+        base = [sys.executable, '-c', script, 'push', '--config', str(config)]
+        return reference, shared, ready, release, cwd_b, other, env, base
 
     def test_production_entrypoint_ignores_test_lock_environment(self):
         import os
