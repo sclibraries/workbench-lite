@@ -275,12 +275,35 @@ def write_inventory_csv(rows: Sequence[InventoryRow], path: Path) -> None:
             writer.writerow(asdict(row))
 
 
-def main(argv=None) -> int:  # noqa: C901, PLR0915
+def main(argv=None) -> int:
+    parser = _build_parser()
+    args = parser.parse_args(argv)
+    _validate_execution_options(args, parser)
+    nodes = read_node_requests(args.nodes)
+    ssl_context = build_ssl_context(args.insecure_skip_tls_verify)
+    s3_client = _s3_client_for_args(args)
+    rows, errors = _collect_inventory_rows(args, nodes, ssl_context, s3_client)
+    rows = _resolve_inventory_sources(rows, args, s3_client)
+    if args.execute:
+        download_inventory_rows(rows, args.download_dir, s3_client)
+    _write_inventory_outputs(args, rows, nodes)
+    _print_inventory_errors(errors)
+    return _inventory_exit_status(errors, rows)
+
+
+def _build_parser():
     parser = argparse.ArgumentParser(
         description=(
             'Inventory and optionally download S3 objects referenced by Compass IIIF manifests.'
         )
     )
+    _add_input_arguments(parser)
+    _add_inventory_arguments(parser)
+    _add_s3_arguments(parser)
+    return parser
+
+
+def _add_input_arguments(parser):
     parser.add_argument(
         '--nodes', required=True, type=Path, help='CSV or text file containing Compass node IDs.'
     )
@@ -296,6 +319,9 @@ def main(argv=None) -> int:  # noqa: C901, PLR0915
             'Use only for controlled exports.'
         ),
     )
+
+
+def _add_inventory_arguments(parser):
     parser.add_argument('--inventory-json', type=Path, default=None)
     parser.add_argument('--inventory-csv', type=Path, default=None)
     parser.add_argument(
@@ -306,6 +332,9 @@ def main(argv=None) -> int:  # noqa: C901, PLR0915
         action='store_true',
         help='Actually download S3 objects. Default is inventory-only.',
     )
+
+
+def _add_s3_arguments(parser):
     parser.add_argument('--system-files-bucket', default=DEFAULT_SYSTEM_FILES_BUCKET)
     parser.add_argument('--system-files-prefix', default=DEFAULT_SYSTEM_FILES_PREFIX)
     parser.add_argument(
@@ -334,92 +363,106 @@ def main(argv=None) -> int:  # noqa: C901, PLR0915
         help='Optional S3 endpoint URL, useful for LocalStack tests.',
     )
     parser.add_argument('--region', default=None, help='Optional AWS region for the boto3 client.')
-    args = parser.parse_args(argv)
 
+
+def _validate_execution_options(args, parser):
     if args.execute and args.download_dir is None:
         parser.error('--execute requires --download-dir')
 
-    nodes = read_node_requests(args.nodes)
-    ssl_context = build_ssl_context(args.insecure_skip_tls_verify)
-    s3_client = None
-    if args.execute or args.include_private_prefix_sweep:
-        s3_client = _create_s3_client(args.endpoint_url, args.region)
 
+def _s3_client_for_args(args):
+    if args.execute or args.include_private_prefix_sweep:
+        return _create_s3_client(args.endpoint_url, args.region)
+    return None
+
+
+def _collect_inventory_rows(args, nodes, ssl_context, s3_client):
     rows: List[InventoryRow] = []
     errors = []
     for node_request in nodes:
-        node_rows: List[InventoryRow] = []
-        try:
-            manifest = fetch_manifest(
-                node_request.node_id, args.compass_base_url, args.timeout, ssl_context
-            )
-            node_rows.extend(
-                build_inventory_rows(
-                    node_request,
-                    manifest,
-                    args.compass_base_url,
-                    args.system_files_bucket,
-                    args.system_files_prefix,
-                )
-            )
-        except Exception as error:
-            errors.append(f'node {node_request.node_id}: {error}')
+        rows.extend(_collect_node_rows(node_request, args, ssl_context, s3_client, errors))
+    return rows, errors
 
+
+def _collect_node_rows(node_request, args, ssl_context, s3_client, errors):
+    node_rows: List[InventoryRow] = []
+    try:
+        manifest = fetch_manifest(
+            node_request.node_id, args.compass_base_url, args.timeout, ssl_context
+        )
         node_rows.extend(
-            build_inventory_rows_from_sources(
+            build_inventory_rows(
                 node_request,
-                node_request.supplemental_sources,
+                manifest,
                 args.compass_base_url,
                 args.system_files_bucket,
                 args.system_files_prefix,
             )
         )
-
-        if args.include_node_page_sources:
-            try:
-                node_page = fetch_node_page(
-                    node_request.node_id, args.compass_base_url, args.timeout, ssl_context
-                )
-                node_rows.extend(
-                    build_inventory_rows_from_node_page(
-                        node_request,
-                        node_page,
-                        args.compass_base_url,
-                        args.system_files_bucket,
-                        args.system_files_prefix,
-                    )
-                )
-            except Exception as error:
-                errors.append(f'node {node_request.node_id} page sources: {error}')
-
-        if args.include_private_prefix_sweep:
-            try:
-                node_rows.extend(
-                    build_private_sweep_inventory_rows(
-                        node_request,
-                        args.compass_base_url,
-                        s3_client,
-                        args.private_sweep_bucket,
-                        args.private_sweep_prefix,
-                    )
-                )
-            except Exception as error:
-                errors.append(f'node {node_request.node_id} private sweep: {error}')
-
-        rows.extend(_dedupe_inventory_rows(node_rows))
-
-    if s3_client is not None:
-        resolve_system_file_rows_with_s3(
-            rows,
-            s3_client,
+    except Exception as error:
+        errors.append(f'node {node_request.node_id}: {error}')
+    node_rows.extend(
+        build_inventory_rows_from_sources(
+            node_request,
+            node_request.supplemental_sources,
+            args.compass_base_url,
+            args.system_files_bucket,
             args.system_files_prefix,
-            (args.system_files_private_prefix,),
         )
-        rows = _dedupe_inventory_rows(rows)
+    )
+    if args.include_node_page_sources:
+        _append_node_page_rows(node_rows, node_request, args, ssl_context, errors)
+    if args.include_private_prefix_sweep:
+        _append_private_sweep_rows(node_rows, node_request, args, s3_client, errors)
+    return _dedupe_inventory_rows(node_rows)
 
-    if args.execute:
-        download_inventory_rows(rows, args.download_dir, s3_client)
 
+def _append_node_page_rows(node_rows, node_request, args, ssl_context, errors):
+    try:
+        node_page = fetch_node_page(
+            node_request.node_id, args.compass_base_url, args.timeout, ssl_context
+        )
+        node_rows.extend(
+            build_inventory_rows_from_node_page(
+                node_request,
+                node_page,
+                args.compass_base_url,
+                args.system_files_bucket,
+                args.system_files_prefix,
+            )
+        )
+    except Exception as error:
+        errors.append(f'node {node_request.node_id} page sources: {error}')
+
+
+def _append_private_sweep_rows(node_rows, node_request, args, s3_client, errors):
+    try:
+        node_rows.extend(
+            build_private_sweep_inventory_rows(
+                node_request,
+                args.compass_base_url,
+                s3_client,
+                args.private_sweep_bucket,
+                args.private_sweep_prefix,
+            )
+        )
+    except Exception as error:
+        errors.append(f'node {node_request.node_id} private sweep: {error}')
+
+
+def _resolve_inventory_sources(rows, args, s3_client):
+    if s3_client is None:
+        return rows
+    resolve_system_file_rows_with_s3(
+        rows,
+        s3_client,
+        args.system_files_prefix,
+        (args.system_files_private_prefix,),
+    )
+    return _dedupe_inventory_rows(rows)
+
+
+def _write_inventory_outputs(args, rows, nodes):
     if args.inventory_json:
         write_inventory_json(rows, args.inventory_json, nodes)
     if args.inventory_csv:
@@ -428,8 +471,13 @@ def main(argv=None) -> int:  # noqa: C901, PLR0915
         json.dump([asdict(row) for row in rows], sys.stdout, indent=2)
         print()
 
+
+def _print_inventory_errors(errors):
     for error in errors:
         print(f'ERROR: {error}', file=sys.stderr)
+
+
+def _inventory_exit_status(errors, rows):
     return 1 if errors or any(row.status.endswith('failed') for row in rows) else 0
 
 
