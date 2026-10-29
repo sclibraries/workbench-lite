@@ -13,7 +13,7 @@ from .preflight import safe_source, validate_content
 REQUIRED_COLUMNS = ['title', 'id', 'field_model', 'parent_id', 'field_weight', 'file']
 
 
-def run_check(  # noqa: C901, PLR0915
+def run_check(
     config_path: Path,
     input_csv_override: Optional[Path] = None,
     allow_dummy_files: bool = False,
@@ -27,77 +27,27 @@ def run_check(  # noqa: C901, PLR0915
     validation_errors: List[str] = []
     validation_warnings: List[str] = []
     validation_errors.extend(csv_errors)
-
-    _validate_duplicate_headers(fieldnames, validation_errors)
-    _validate_required_columns(fieldnames, validation_errors)
-    _validate_duplicate_ids(rows, validation_errors)
-    for row_number, row in enumerate(rows, 2):
-        if not row.get('id', '').strip():
-            validation_errors.append(f'CSV row {row_number} needs a nonempty id.')
-        if row.get('field_model') == 'Page' and not row.get('file', '').strip():
-            validation_errors.append(
-                f'CSV row {row_number} ({row.get("id", "")}) needs a page image file.'
-            )
-        if row.get('field_model') not in {'Page', 'Paged Content'}:
-            validation_errors.append(f'CSV row {row_number} has an unsupported field_model.')
-
-    parent_rows = [row for row in rows if row.get('field_model') == 'Paged Content']
-    page_rows = [row for row in rows if row.get('field_model') == 'Page']
-    parent_ids = {row.get('id', '') for row in parent_rows}
-    child_parent_ids = {row.get('parent_id', '') for row in page_rows if row.get('parent_id', '')}
-
-    _validate_child_parent_ids(page_rows, parent_ids, validation_errors)
-    bad_child_weight_count = _validate_child_weights(page_rows, validation_errors)
-    _validate_duplicate_weights(page_rows, validation_errors)
-
-    additional_files = normalize_additional_files(config)
-    # hOCR is consumed by the object builder even without legacy YAML mapping.
-    if 'hocr' in fieldnames:
-        additional_files.setdefault('hocr', None)
-    _validate_file_extensions(parent_rows, page_rows, additional_files.keys(), validation_errors)
     input_dir = _resolve_input_dir(config_path, config)
-    for row_number, row in enumerate(rows, 2):
-        for column in ['file', *additional_files]:
-            value = row.get(column, '').strip()
-            if value and not safe_source(value, input_dir):
-                validation_errors.append(
-                    f'CSV row {row_number} ({row.get("id", "")}) column {column}: '
-                    'unsafe source path; must remain within input_dir.'
-                )
-    if not allow_dummy_files:
-        _validate_file_paths(
-            rows=rows,
-            input_dir=input_dir,
-            additional_file_columns=additional_files.keys(),
-            errors=validation_errors,
-            warnings=validation_warnings,
-            allow_missing_files=bool(config.get('allow_missing_files', False)),
-        )
-
+    parent_rows, page_rows, child_parent_ids, bad_child_weight_count = _validate_csv_rows(
+        rows, fieldnames, validation_errors
+    )
+    additional_files = _additional_file_columns(config, fieldnames)
+    _validate_source_rows(
+        rows,
+        parent_rows,
+        page_rows,
+        input_dir,
+        additional_files,
+        allow_dummy_files,
+        config,
+        validation_errors,
+        validation_warnings,
+    )
     objects = _build_objects(parent_rows, page_rows)
     file_counts = _count_file_roles(rows, additional_files.keys())
     upload_plan = build_upload_plan(objects, config, config_path, input_dir, run_id=run_id)
     _validate_upload_plan_collisions(upload_plan, validation_errors)
-    if not allow_dummy_files:
-        seen_files = set()
-        for entry in upload_plan:
-            if entry.generated:
-                continue
-            if not safe_source(entry.source_path, input_dir):
-                validation_errors.append(
-                    f'{entry.object_id}/{entry.page_id}: unsafe planned source path.'
-                )
-                continue
-            path = Path(entry.source_path)
-            path = path if path.is_absolute() else input_dir / path
-            identity = (path, entry.role)
-            if path.is_file() and identity not in seen_files:
-                seen_files.add(identity)
-                error = validate_content(path, entry.role)
-                if error:
-                    validation_errors.append(
-                        f'{entry.object_id}/{entry.page_id}: {entry.source_path}: {error}'
-                    )
+    _validate_planned_content(upload_plan, input_dir, allow_dummy_files, validation_errors)
 
     return CheckReport(
         row_count=len(rows),
@@ -112,6 +62,94 @@ def run_check(  # noqa: C901, PLR0915
         objects=objects,
         upload_plan=upload_plan,
     )
+
+
+def _validate_csv_rows(rows, fieldnames, errors):
+    _validate_duplicate_headers(fieldnames, errors)
+    _validate_required_columns(fieldnames, errors)
+    _validate_duplicate_ids(rows, errors)
+    _validate_row_fields(rows, errors)
+    parent_rows = [row for row in rows if row.get('field_model') == 'Paged Content']
+    page_rows = [row for row in rows if row.get('field_model') == 'Page']
+    parent_ids = {row.get('id', '') for row in parent_rows}
+    child_parent_ids = {row.get('parent_id', '') for row in page_rows if row.get('parent_id', '')}
+    _validate_child_parent_ids(page_rows, parent_ids, errors)
+    bad_child_weight_count = _validate_child_weights(page_rows, errors)
+    _validate_duplicate_weights(page_rows, errors)
+    return parent_rows, page_rows, child_parent_ids, bad_child_weight_count
+
+
+def _validate_row_fields(rows, errors):
+    for row_number, row in enumerate(rows, 2):
+        if not row.get('id', '').strip():
+            errors.append(f'CSV row {row_number} needs a nonempty id.')
+        if row.get('field_model') == 'Page' and not row.get('file', '').strip():
+            errors.append(f'CSV row {row_number} ({row.get("id", "")}) needs a page image file.')
+        if row.get('field_model') not in {'Page', 'Paged Content'}:
+            errors.append(f'CSV row {row_number} has an unsupported field_model.')
+
+
+def _additional_file_columns(config, fieldnames):
+    additional_files = normalize_additional_files(config)
+    # hOCR is consumed by the object builder even without legacy YAML mapping.
+    if 'hocr' in fieldnames:
+        additional_files.setdefault('hocr', None)
+    return additional_files
+
+
+def _validate_source_rows(
+    rows,
+    parent_rows,
+    page_rows,
+    input_dir,
+    additional_files,
+    allow_dummy_files,
+    config,
+    errors,
+    warnings,
+):
+    _validate_file_extensions(parent_rows, page_rows, additional_files.keys(), errors)
+    _validate_row_source_paths(rows, additional_files, input_dir, errors)
+    if not allow_dummy_files:
+        _validate_file_paths(
+            rows=rows,
+            input_dir=input_dir,
+            additional_file_columns=additional_files.keys(),
+            errors=errors,
+            warnings=warnings,
+            allow_missing_files=bool(config.get('allow_missing_files', False)),
+        )
+
+
+def _validate_row_source_paths(rows, additional_files, input_dir, errors):
+    for row_number, row in enumerate(rows, 2):
+        for column in ['file', *additional_files]:
+            value = row.get(column, '').strip()
+            if value and not safe_source(value, input_dir):
+                errors.append(
+                    f'CSV row {row_number} ({row.get("id", "")}) column {column}: '
+                    'unsafe source path; must remain within input_dir.'
+                )
+
+
+def _validate_planned_content(upload_plan, input_dir, allow_dummy_files, errors):
+    if allow_dummy_files:
+        return
+    seen_files = set()
+    for entry in upload_plan:
+        if entry.generated:
+            continue
+        if not safe_source(entry.source_path, input_dir):
+            errors.append(f'{entry.object_id}/{entry.page_id}: unsafe planned source path.')
+            continue
+        path = Path(entry.source_path)
+        path = path if path.is_absolute() else input_dir / path
+        identity = (path, entry.role)
+        if path.is_file() and identity not in seen_files:
+            seen_files.add(identity)
+            error = validate_content(path, entry.role)
+            if error:
+                errors.append(f'{entry.object_id}/{entry.page_id}: {entry.source_path}: {error}')
 
 
 def _resolve_csv_path(
