@@ -1,7 +1,13 @@
 import importlib.util
+import contextlib
+import csv
+import hashlib
+import io
+import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -16,6 +22,109 @@ def load_script_module():
 
 
 class CompassS3ExportScriptTest(unittest.TestCase):
+    def test_main_inventory_only_emits_rows_without_creating_s3_client(self):
+        script = load_script_module()
+        row = script.InventoryRow(
+            node_id='12345',
+            ingest_date='',
+            label='',
+            manifest_url='https://example.invalid/node/12345/manifest',
+            bucket='synthetic-bucket',
+            key='synthetic-prefix/file.tif',
+            role='master_image',
+            source_url='https://example.invalid/file.tif',
+        )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            nodes = Path(temp_dir) / 'nodes.txt'
+            nodes.write_text('12345\n', encoding='utf-8')
+            output = io.StringIO()
+            with (
+                patch.object(script, 'fetch_manifest', return_value={}),
+                patch.object(script, 'build_inventory_rows', return_value=[row]),
+                patch.object(script, '_create_s3_client') as create_client,
+                contextlib.redirect_stdout(output),
+            ):
+                result = script.main(['--nodes', str(nodes)])
+
+        self.assertEqual(result, 0)
+        self.assertEqual(json.loads(output.getvalue()), [script.asdict(row)])
+        create_client.assert_not_called()
+
+    def test_main_execute_requires_download_directory_before_reading_nodes(self):
+        script = load_script_module()
+        with patch.object(script, 'read_node_requests') as read_nodes:
+            with contextlib.redirect_stderr(io.StringIO()):
+                with self.assertRaises(SystemExit) as raised:
+                    script.main(['--nodes', 'not-read.txt', '--execute'])
+
+        self.assertEqual(raised.exception.code, 2)
+        read_nodes.assert_not_called()
+
+    def test_main_execute_downloads_and_writes_requested_inventories(self):
+        script = load_script_module()
+        row = script.InventoryRow(
+            node_id='12345',
+            ingest_date='',
+            label='',
+            manifest_url='https://example.invalid/node/12345/manifest',
+            bucket='synthetic-bucket',
+            key='synthetic-prefix/file.tif',
+            role='master_image',
+            source_url='https://example.invalid/file.tif',
+        )
+
+        class FakeS3Client:
+            def download_file(self, bucket, key, path):
+                Path(path).write_bytes(b'synthetic image bytes')
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            nodes = root / 'nodes.txt'
+            nodes.write_text('12345\n', encoding='utf-8')
+            download_dir = root / 'download'
+            inventory_json = root / 'inventory.json'
+            inventory_csv = root / 'inventory.csv'
+            stdout = io.StringIO()
+            with (
+                patch.object(script, 'fetch_manifest', return_value={}),
+                patch.object(script, 'build_inventory_rows', return_value=[row]),
+                patch.object(script, 'resolve_system_file_rows_with_s3'),
+                patch.object(
+                    script, '_create_s3_client', return_value=FakeS3Client()
+                ) as create_client,
+                contextlib.redirect_stdout(stdout),
+            ):
+                result = script.main(
+                    [
+                        '--nodes',
+                        str(nodes),
+                        '--execute',
+                        '--download-dir',
+                        str(download_dir),
+                        '--inventory-json',
+                        str(inventory_json),
+                        '--inventory-csv',
+                        str(inventory_csv),
+                    ]
+                )
+
+            local_path = download_dir / 'synthetic-bucket' / 'synthetic-prefix' / 'file.tif'
+            exported_json = json.loads(inventory_json.read_text(encoding='utf-8'))
+            with inventory_csv.open(encoding='utf-8', newline='') as handle:
+                exported_csv = list(csv.DictReader(handle))
+            downloaded_bytes = local_path.read_bytes()
+
+        self.assertEqual(result, 0)
+        self.assertEqual(downloaded_bytes, b'synthetic image bytes')
+        self.assertEqual(exported_json['rows'][0]['status'], 'downloaded')
+        self.assertEqual(
+            exported_json['rows'][0]['sha256'], hashlib.sha256(b'synthetic image bytes').hexdigest()
+        )
+        self.assertEqual(exported_csv[0]['status'], 'downloaded')
+        self.assertEqual(stdout.getvalue(), '')
+        create_client.assert_called_once_with(None, None)
+
     def test_extract_s3_references_finds_direct_and_nested_manifest_urls(self):
         script = load_script_module()
         manifest = {
