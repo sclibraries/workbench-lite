@@ -1170,6 +1170,46 @@ class FakeClient:
             'http://localhost:8182/iiif/2/workbench-lite%2Fpackage%20dir%2Fobjects%2Fobj%20name%2Fpage_001.tif',
         )
 
+    def test_manifest_service_entry_traversal_skips_invalid_shapes_and_keeps_order(self):
+        from workbench_lite.verify import _iter_service_entries
+
+        payload = {
+            'sequences': [
+                None,
+                'invalid sequence',
+                {'canvases': 'invalid canvases'},
+                {
+                    'canvases': [
+                        None,
+                        {'@id': None, 'images': 'invalid images'},
+                        {
+                            '@id': 'canvas-1',
+                            'images': [
+                                None,
+                                'invalid image',
+                                {'resource': None},
+                                {'resource': {'service': []}},
+                                {'resource': {'service': {'@id': 1}}},
+                                {'resource': {'service': {'@id': ''}}},
+                                {'resource': {'service': {'@id': '/first'}}},
+                                {'resource': {'service': {'@id': '/second'}}},
+                            ],
+                        },
+                        {
+                            '@id': 'canvas-2',
+                            'images': [{'resource': {'service': {'@id': '/third'}}}],
+                        },
+                    ]
+                },
+            ]
+        }
+
+        self.assertEqual(
+            _iter_service_entries(payload),
+            [('canvas-1', '/first'), ('canvas-1', '/second'), ('canvas-2', '/third')],
+        )
+        self.assertEqual(_iter_service_entries({'sequences': {}}), [])
+
     def test_verify_manifest_service_urls_reports_successful_info_json(self):
         import workbench_lite.verify as verify
 
