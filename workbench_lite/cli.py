@@ -33,28 +33,53 @@ from .rollback import run_rollback
 from .storage_plan import DEFAULT_PRIVATE_BUCKET, DEFAULT_PUBLIC_BUCKET
 
 
-def main(argv=None, *, lock_factory=WriterLocks) -> int:  # noqa: C901, PLR0915
+def main(argv=None, *, lock_factory=WriterLocks) -> int:
+    parser = _build_parser()
+    args = parser.parse_args(argv)
+    _validate_cli_args(args, parser)
+    early_result = _run_early_command(args, lock_factory)
+    if early_result is not None:
+        return early_result
+    return _run_locked_command(args, parser, lock_factory)
+
+
+def _build_parser():
     parser = argparse.ArgumentParser(prog='workbench-lite')
     subparsers = parser.add_subparsers(dest='command', required=True)
+    package_parsers = [
+        _add_check_parser(subparsers),
+        _add_push_parser(subparsers),
+        _add_generate_parser(subparsers),
+        _add_verify_parser(subparsers),
+    ]
+    _add_run_management_parsers(subparsers)
+    for command_parser in package_parsers:
+        command_parser.add_argument('--run-dir', type=Path, default=Path('workbench-lite-runs'))
+    return parser
 
-    check_parser = subparsers.add_parser('check', help='Validate a Workbench-lite package')
-    check_parser.add_argument('--config', required=True, type=Path)
-    check_parser.add_argument('--input-csv', type=Path, default=None)
-    check_parser.add_argument('--allow-dummy-files', action='store_true')
-    check_parser.add_argument('--format', choices=['text', 'json'], default='text')
 
-    push_parser = subparsers.add_parser('push', help='Upload or dry-run a Workbench-lite package')
-    push_parser.add_argument('--config', required=True, type=Path)
-    push_parser.add_argument('--input-csv', type=Path, default=None)
-    push_parser.add_argument('--allow-dummy-files', action='store_true')
-    push_parser.add_argument('--dry-run', action='store_true')
-    push_parser.add_argument('--execute', action='store_true')
-    push_parser.add_argument(
+def _add_check_parser(subparsers):
+    parser = subparsers.add_parser('check', help='Validate a Workbench-lite package')
+    parser.add_argument('--config', required=True, type=Path)
+    parser.add_argument('--input-csv', type=Path, default=None)
+    parser.add_argument('--allow-dummy-files', action='store_true')
+    parser.add_argument('--format', choices=['text', 'json'], default='text')
+    return parser
+
+
+def _add_push_parser(subparsers):
+    parser = subparsers.add_parser('push', help='Upload or dry-run a Workbench-lite package')
+    parser.add_argument('--config', required=True, type=Path)
+    parser.add_argument('--input-csv', type=Path, default=None)
+    parser.add_argument('--allow-dummy-files', action='store_true')
+    parser.add_argument('--dry-run', action='store_true')
+    parser.add_argument('--execute', action='store_true')
+    parser.add_argument(
         '--resume',
         action='store_true',
         help='Resume a held execute run after verifying its recorded state',
     )
-    push_parser.add_argument(
+    parser.add_argument(
         '--verify-readback',
         action='store_true',
         help=(
@@ -62,55 +87,64 @@ def main(argv=None, *, lock_factory=WriterLocks) -> int:  # noqa: C901, PLR0915
             'after S3 checksum verification'
         ),
     )
-    push_parser.add_argument(
+    parser.add_argument(
         '--offline',
         action='store_true',
         help='Dry-run only: skip credential/access checks, explicitly unverified',
     )
-    push_parser.add_argument('--endpoint-url', default=None)
-    push_parser.add_argument('--region', default=None)
-    push_parser.add_argument('--profile', default=None)
-    push_parser.add_argument('--generated-dir', type=Path, default=None)
-    push_parser.add_argument('--rollback-file', type=Path, default=None)
-    push_parser.add_argument('--format', choices=['text', 'json'], default='text')
+    parser.add_argument('--endpoint-url', default=None)
+    parser.add_argument('--region', default=None)
+    parser.add_argument('--profile', default=None)
+    parser.add_argument('--generated-dir', type=Path, default=None)
+    parser.add_argument('--rollback-file', type=Path, default=None)
+    parser.add_argument('--format', choices=['text', 'json'], default='text')
+    return parser
 
-    generate_parser = subparsers.add_parser(
+
+def _add_generate_parser(subparsers):
+    parser = subparsers.add_parser(
         'generate', help='Generate local derivative files from source images'
     )
-    generate_parser.add_argument('--config', required=True, type=Path)
-    generate_parser.add_argument('--input-csv', type=Path, default=None)
-    generate_parser.add_argument('--allow-dummy-files', action='store_true')
-    generate_parser.add_argument('--output-dir', type=Path, default=None)
-    generate_parser.add_argument('--manifests', action='store_true')
-    generate_parser.add_argument('--cantaloupe-base-url', default=None)
-    generate_parser.add_argument('--manifest-base-url', default=None)
-    generate_parser.add_argument('--thumbnails', action='store_true')
-    generate_parser.add_argument('--max-long-side', type=int, default=2000)
-    generate_parser.add_argument('--quality', type=int, default=82)
-    generate_parser.add_argument('--format', choices=['text', 'json'], default='text')
+    parser.add_argument('--config', required=True, type=Path)
+    parser.add_argument('--input-csv', type=Path, default=None)
+    parser.add_argument('--allow-dummy-files', action='store_true')
+    parser.add_argument('--output-dir', type=Path, default=None)
+    parser.add_argument('--manifests', action='store_true')
+    parser.add_argument('--cantaloupe-base-url', default=None)
+    parser.add_argument('--manifest-base-url', default=None)
+    parser.add_argument('--thumbnails', action='store_true')
+    parser.add_argument('--max-long-side', type=int, default=2000)
+    parser.add_argument('--quality', type=int, default=82)
+    parser.add_argument('--format', choices=['text', 'json'], default='text')
+    return parser
 
-    verify_parser = subparsers.add_parser(
+
+def _add_verify_parser(subparsers):
+    parser = subparsers.add_parser(
         'verify-cantaloupe', help='Verify manifest image service IDs against Cantaloupe'
     )
-    verify_parser.add_argument(
+    parser.add_argument(
         '--manifest',
         action='append',
         default=[],
         type=Path,
         help='One or more manifest files to verify',
     )
-    verify_parser.add_argument(
+    parser.add_argument(
         '--manifest-dir',
         type=Path,
         help='Directory to scan for *.json manifests',
     )
-    verify_parser.add_argument('--timeout', type=int, default=5)
-    verify_parser.add_argument(
+    parser.add_argument('--timeout', type=int, default=5)
+    parser.add_argument(
         '--cantaloupe-base-url',
         help='Base URL to prepend for relative service IDs in manifests',
     )
-    verify_parser.add_argument('--format', choices=['text', 'json'], default='text')
+    parser.add_argument('--format', choices=['text', 'json'], default='text')
+    return parser
 
+
+def _add_run_management_parsers(subparsers):
     inspect_parser = subparsers.add_parser(
         'inspect-run', help='Read evidence without retrying operations'
     )
@@ -147,10 +181,9 @@ def main(argv=None, *, lock_factory=WriterLocks) -> int:  # noqa: C901, PLR0915
     rollback_parser.add_argument('--region', default=None)
     rollback_parser.add_argument('--profile', default=None)
     rollback_parser.add_argument('--format', choices=['text', 'json'], default='text')
-    for command_parser in [check_parser, push_parser, generate_parser, verify_parser]:
-        command_parser.add_argument('--run-dir', type=Path, default=Path('workbench-lite-runs'))
 
-    args = parser.parse_args(argv)
+
+def _validate_cli_args(args, parser):
     if args.command == 'push':
         if args.offline and args.execute:
             parser.error('--offline is only valid with --dry-run')
@@ -164,6 +197,9 @@ def main(argv=None, *, lock_factory=WriterLocks) -> int:  # noqa: C901, PLR0915
             parser.error('push accepts only one of --dry-run or --execute')
         if not args.dry_run and not args.execute:
             parser.error('push currently requires --dry-run or --execute')
+
+
+def _run_early_command(args, lock_factory):
     if args.command == 'inspect-run':
         summary = inspect_run(args.path)
         print(
@@ -209,96 +245,126 @@ def main(argv=None, *, lock_factory=WriterLocks) -> int:  # noqa: C901, PLR0915
         )
     if args.command == 'rollback':
         return _run_rollback_command(args, lock_factory)
-    journal = None
+
+    return None
+
+
+def _run_locked_command(args, parser, lock_factory):
     locks = lock_factory()
     args.locks = locks
-    code = 1
-    terminal_error = None
+    state = {'journal': None, 'code': 1, 'terminal_error': None}
     try:
-        if args.command == 'generate':
-            config = load_config(args.config)
-            output = args.output_dir or (_resolve_input_dir(args.config, config) / 'generated')
-            lock_output_and_run(locks, output)
-        elif args.command == 'push' and args.generated_dir is not None:
-            lock_output_and_run(locks, args.generated_dir)
-        journal = _open_run(args)
-        args.journal = journal
-        _print_safe(f'Run directory: {journal.path}', file=sys.stderr)
-        journal.start(
-            'push-dry-run' if args.command == 'push' and not args.execute else args.command,
-            options={
-                key: str(value) if isinstance(value, Path) else value
-                for key, value in vars(args).items()
-                if key not in {'journal', 'locks'}
-            },
-        )
-        code = _run(args, parser)
-        return code
+        return _run_locked_body(args, parser, locks, state)
+    finally:
+        _close_locked_command(args, locks, state)
+
+
+def _run_locked_body(args, parser, locks, state):
+    try:
+        _prepare_locked_run(args, locks, state)
+        state['code'] = _run(args, parser)
+        return state['code']
     except (ConfigError, UnicodeDecodeError, csv.Error) as exc:
         message = (
             str(exc) if isinstance(exc, ConfigError) else 'Invalid input encoding or CSV syntax.'
         )
-        terminal_error = message
+        state['terminal_error'] = message
         _print_error(args, message, validation=True)
-        code = 3
-        return code
+        state['code'] = 3
+        return state['code']
     except (JournalError, LockError) as exc:
-        terminal_error = str(exc)
+        state['terminal_error'] = str(exc)
         _print_error(args, str(exc))
         return 1
     except STORAGE_ERRORS as exc:
-        terminal_error = operation_error(exc)
-        _print_error(args, terminal_error)
+        state['terminal_error'] = operation_error(exc)
+        _print_error(args, state['terminal_error'])
         return 1
     except KeyboardInterrupt:
-        code = 130
+        state['code'] = 130
         raise
     except SystemExit as exc:
-        code = exc.code if isinstance(exc.code, int) else 1
+        state['code'] = exc.code if isinstance(exc.code, int) else 1
         raise
     except Exception as exc:
-        terminal_error = f'Fatal {type(exc).__name__}; command aborted.'
+        state['terminal_error'] = f'Fatal {type(exc).__name__}; command aborted.'
         raise
-    finally:
-        try:
-            if journal is not None:
-                try:
-                    journal.finish(code, error=terminal_error)
-                    if args.command == 'push' and (journal.path / 'upload-plan.json').exists():
-                        write_inventory(journal.path)
-                        if args.rollback_file:
-                            write_inventory(journal.path, args.rollback_file)
-                    if (
-                        journal is not None
-                        and code == 0
-                        and args.command == 'push'
-                        and args.execute
-                    ):
-                        journal.complete_publication()
-                        if (journal.path / 'upload-plan.json').exists():
-                            try:
-                                write_inventory(journal.path)
-                                if args.rollback_file:
-                                    write_inventory(journal.path, args.rollback_file)
-                            except JournalError as exc:
-                                _print_error(args, f'Rollback inventory refresh failed: {exc}')
-                except JournalError as exc:
-                    _print_error(args, str(exc))
-                    raise SystemExit(1) from exc
-        finally:
+
+
+def _prepare_locked_run(args, locks, state):
+    if args.command == 'generate':
+        config = load_config(args.config)
+        output = args.output_dir or (_resolve_input_dir(args.config, config) / 'generated')
+        lock_output_and_run(locks, output)
+    elif args.command == 'push' and args.generated_dir is not None:
+        lock_output_and_run(locks, args.generated_dir)
+    journal = _open_run(args)
+    state['journal'] = journal
+    args.journal = journal
+    _print_safe(f'Run directory: {journal.path}', file=sys.stderr)
+    journal.start(
+        'push-dry-run' if args.command == 'push' and not args.execute else args.command,
+        options={
+            key: str(value) if isinstance(value, Path) else value
+            for key, value in vars(args).items()
+            if key not in {'journal', 'locks'}
+        },
+    )
+
+
+def _close_locked_command(args, locks, state):
+    journal = state['journal']
+    code = state['code']
+    try:
+        if journal is not None:
             try:
-                locks.release()
-            except LockError as exc:
-                if journal is not None and code == 0 and args.command == 'push' and args.execute:
-                    try:
-                        atomic_write(
-                            journal.path / 'publication-pending',
-                            json_bytes({'run_id': journal.run_id}),
-                        )
-                    except JournalError:
-                        pass
+                journal.finish(code, error=state['terminal_error'])
+                _finish_push_run(args, journal, code)
+            except JournalError as exc:
                 _print_error(args, str(exc))
                 raise SystemExit(1) from exc
+    finally:
+        _release_run_locks(args, journal, locks, code)
+
+
+def _finish_push_run(args, journal, code):
+    if args.command != 'push':
+        return
+    if (journal.path / 'upload-plan.json').exists():
+        write_inventory(journal.path)
+        if args.rollback_file:
+            write_inventory(journal.path, args.rollback_file)
+    if code != 0 or not args.execute:
+        return
+    journal.complete_publication()
+    if (journal.path / 'upload-plan.json').exists():
+        try:
+            write_inventory(journal.path)
+            if args.rollback_file:
+                write_inventory(journal.path, args.rollback_file)
+        except JournalError as exc:
+            _print_error(args, f'Rollback inventory refresh failed: {exc}')
+
+
+def _release_run_locks(args, journal, locks, code):
+    try:
+        locks.release()
+    except LockError as exc:
+        _restore_publication_hold(args, journal, code)
+        _print_error(args, str(exc))
+        raise SystemExit(1) from exc
+
+
+def _restore_publication_hold(args, journal, code):
+    if journal is None or code != 0 or args.command != 'push' or not args.execute:
+        return
+    try:
+        atomic_write(
+            journal.path / 'publication-pending',
+            json_bytes({'run_id': journal.run_id}),
+        )
+    except JournalError:
+        pass
 
 
 def _run_rollback_command(args, lock_factory) -> int:
@@ -527,60 +593,78 @@ def _print_rollback_report(report, output_format):
     _print_safe(f'State: {report["state"]}; exit: {report["exit_code"]}')
 
 
-def _open_run(args):  # noqa: C901
+def _open_run(args):
     if args.command == 'push' and args.generated_dir is not None:
-        reference = args.generated_dir / '.workbench-run.json'
-        if args.resume and not reference.exists():
-            raise JournalError(
-                'Resume requires the generated directory to reference an existing run.'
-            )
-        if reference.exists():
-            try:
-                info = json.loads(reference.read_text())
-                run = RunJournal.open(info['run_path'])
-                if run.run_id != info['run_id']:
-                    raise JournalError('Generated output has a conflicting run reference.')
-            except (ValueError, KeyError, TypeError, OSError) as exc:
-                raise JournalError('Cannot read generated output run reference.') from exc
-            events, _ = read_events(run.path)
-            prior_pushes = [
-                e for e in events if e['kind'] == 'stage_started' and e['stage'] == 'push'
-            ]
-            if prior_pushes and not args.resume:
-                raise JournalError(
-                    'This run already attempted execute; inspect it before reconciliation.'
-                )
-            generation = [
-                e
-                for e in events
-                if e['stage'] == 'generate' and e['kind'] in {'stage_started', 'stage_finished'}
-            ]
-            if generation:
-                # Read-only stages cannot invalidate or certify generation.
-                completed = (
-                    generation[-1]['kind'] == 'stage_finished'
-                    and generation[-1]['state'] == 'completed'
-                )
-            else:
-                # Legacy generated directories may first attach during dry-run.
-                latest = inspect_run(run.path)
-                completed = not latest['incomplete_stage'] and latest['state'] == 'completed'
-            if not completed:
-                raise JournalError(
-                    'Generation did not complete cleanly; create a new generation run.'
-                )
-            config = load_config(args.config)
-            csv_path = _resolve_csv_path(args.config, config, args.input_csv)
-            if not csv_path.is_file():
-                raise ConfigError(f'CSV file not found: {csv_path}')
-            run.inputs(args.config, config, csv_path)
-            if args.resume:
-                _validate_resume(args, run, events, prior_pushes, config, csv_path)
+        run = _open_attached_run(args)
+        if run is not None:
             return run
     return RunJournal.create(args.run_dir)
 
 
-def _validate_resume(args, run, events, prior_pushes, config, csv_path):  # noqa: C901, PLR0915
+def _open_attached_run(args):
+    reference = args.generated_dir / '.workbench-run.json'
+    if args.resume and not reference.exists():
+        raise JournalError('Resume requires the generated directory to reference an existing run.')
+    if not reference.exists():
+        return None
+    run = _read_generated_run(reference)
+    events, _ = read_events(run.path)
+    prior_pushes = [
+        event for event in events if event['kind'] == 'stage_started' and event['stage'] == 'push'
+    ]
+    if prior_pushes and not args.resume:
+        raise JournalError('This run already attempted execute; inspect it before reconciliation.')
+    if not _generation_completed(run, events):
+        raise JournalError('Generation did not complete cleanly; create a new generation run.')
+    config = load_config(args.config)
+    csv_path = _current_csv_path(args, config)
+    run.inputs(args.config, config, csv_path)
+    if args.resume:
+        _validate_resume(args, run, events, prior_pushes, config, csv_path)
+    return run
+
+
+def _read_generated_run(reference):
+    try:
+        info = json.loads(reference.read_text())
+        run = RunJournal.open(info['run_path'])
+        if run.run_id != info['run_id']:
+            raise JournalError('Generated output has a conflicting run reference.')
+    except (ValueError, KeyError, TypeError, OSError) as exc:
+        raise JournalError('Cannot read generated output run reference.') from exc
+    return run
+
+
+def _generation_completed(run, events):
+    generation = [
+        event
+        for event in events
+        if event['stage'] == 'generate' and event['kind'] in {'stage_started', 'stage_finished'}
+    ]
+    if generation:
+        # Read-only stages cannot invalidate or certify generation.
+        return generation[-1]['kind'] == 'stage_finished' and generation[-1]['state'] == 'completed'
+    # Legacy generated directories may first attach during dry-run.
+    latest = inspect_run(run.path)
+    return not latest['incomplete_stage'] and latest['state'] == 'completed'
+
+
+def _current_csv_path(args, config):
+    csv_path = _resolve_csv_path(args.config, config, args.input_csv)
+    if not csv_path.is_file():
+        raise ConfigError(f'CSV file not found: {csv_path}')
+    return csv_path
+
+
+def _validate_resume(args, run, events, prior_pushes, config, csv_path):
+    _require_resumable_run(run, events, prior_pushes)
+    _validate_software_and_snapshots(run)
+    _validate_resume_destination(args, run, config)
+    _validate_prior_upload_results(events)
+    _validate_current_plan(args, run, config, csv_path)
+
+
+def _require_resumable_run(run, events, prior_pushes):
     if not prior_pushes:
         raise JournalError('Resume requires a previous execute attempt in this run.')
     if (run.path / 'publication-pending').exists():
@@ -602,6 +686,8 @@ def _validate_resume(args, run, events, prior_pushes, config, csv_path):  # noqa
     ):
         raise JournalError('Resume refused: this execute run is already complete.')
 
+
+def _validate_software_and_snapshots(run):
     metadata = json.loads((run.path / 'run.json').read_text())
     package = Path(__file__).parent
     source_hash = hashlib.sha256(
@@ -624,6 +710,8 @@ def _validate_resume(args, run, events, prior_pushes, config, csv_path):  # noqa
     ) != metadata.get('plan_sha256'):
         raise JournalError('Resume refused: immutable upload plan changed or is unavailable.')
 
+
+def _validate_resume_destination(args, run, config):
     expected_buckets = {
         str(config.get('s3_private_bucket') or DEFAULT_PRIVATE_BUCKET),
         str(config.get('s3_public_bucket') or DEFAULT_PUBLIC_BUCKET),
@@ -655,6 +743,8 @@ def _validate_resume(args, run, events, prior_pushes, config, csv_path):  # noqa
     if requested_region and prior_region and requested_region != prior_region:
         raise JournalError('Resume refused: S3 region differs from the recorded run.')
 
+
+def _validate_prior_upload_results(events):
     latest_by_identity = {}
     for event in events:
         if event['kind'] == 'result' and event.get('stage') == 'push':
@@ -662,6 +752,8 @@ def _validate_resume(args, run, events, prior_pushes, config, csv_path):  # noqa
     if any(event.get('disposition') == 'conflict' for event in latest_by_identity.values()):
         raise JournalError('Resume refused: a prior upload is in conflict; review the run.')
 
+
+def _validate_current_plan(args, run, config, csv_path):
     report = run_check(args.config, args.input_csv, args.allow_dummy_files, run_id=run.run_id)
     if report.validation_errors:
         raise JournalError(
@@ -729,297 +821,353 @@ def _print_check(report, output_format, journal=None) -> None:
         _print_text_report(report)
 
 
-def _run(args, parser) -> int:  # noqa: C901, PLR0915
+def _run(args, parser) -> int:
     if args.command == 'check':
-        report = _checked(args)
-        _print_check(report, args.format, args.journal)
-        return 3 if report.validation_errors else 0
-
+        return _run_check(args)
     if args.command == 'push':
-        check_report = _checked(args)
-        if check_report.validation_errors:
-            _print_check(check_report, args.format, args.journal)
-            return 3
-        if (
-            args.execute
-            and args.generated_dir is None
-            and any(entry.generated for entry in check_report.upload_plan)
-        ):
-            parser.error('push --execute requires --generated-dir for planned generated artifacts')
-        config = load_config(args.config)
-        input_dir = _resolve_input_dir(args.config, config)
-        dry_run = not args.execute
-        new_audit = (
-            args.generated_dir is not None
-            and not (args.generated_dir / '.workbench-run.json').exists()
-        )
-        local = output_readiness(
-            check_report.upload_plan, input_dir, args.generated_dir, new_audit=new_audit
-        )
-        args.preflight = {'local': local}
-        args.journal.append('context', stage=args.journal.stage, preflight=args.preflight)
-        if local['errors']:
-            _print_preflight(args)
-            return 1
-        if args.generated_dir is not None:
-            reference = args.generated_dir / '.workbench-run.json'
-            if not reference.exists():
-                args.generated_dir.mkdir(parents=True, exist_ok=True)
-                args.journal.write_audit(check_report.upload_plan, args.generated_dir)
-                args.journal.attach(args.generated_dir)
-            else:
-                audit = next(e for e in check_report.upload_plan if e.role == 'audit')
-                audit_path = args.generated_dir / audit.key
-                if audit_path.exists() and digest(audit_path) != digest(
-                    args.journal.path / 'upload-plan.json'
-                ):
-                    raise JournalError('Audit snapshot changed since generation; upload blocked.')
-        preflight_client = (
-            None
-            if args.offline
-            else create_s3_client(args.endpoint_url, args.region, args.profile, preflight=True)
-        )
-        sdk_meta = getattr(getattr(preflight_client, 'client', None), 'meta', None)
-        if not dry_run:
-            endpoint = (
-                getattr(sdk_meta, 'endpoint_url', None)
-                or args.endpoint_url
-                or os.environ.get('AWS_ENDPOINT_URL_S3')
-                or os.environ.get('AWS_ENDPOINT_URL')
-                or 'aws-s3'
-            )
-            lock_destination(args.locks, endpoint.rstrip('/').lower(), check_report.upload_plan)
-            if args.resume:
-                recorded = _recorded_storage(args.journal.path)
-                prior_endpoint = recorded.get('effective_endpoint_url') or recorded.get(
-                    'configured_endpoint_url'
-                )
-                prior_region = recorded.get('effective_region') or recorded.get('configured_region')
-                if (
-                    not prior_endpoint
-                    or prior_endpoint.rstrip('/').lower() != endpoint.rstrip('/').lower()
-                ):
-                    raise JournalError('Resume refused: S3 endpoint differs from the recorded run.')
-                current_region = (
-                    getattr(sdk_meta, 'region_name', None)
-                    or args.region
-                    or os.environ.get('AWS_DEFAULT_REGION')
-                    or os.environ.get('AWS_REGION')
-                )
-                if prior_region and current_region and prior_region != current_region:
-                    raise JournalError('Resume refused: S3 region differs from the recorded run.')
-        args.journal.append(
-            'context',
-            stage='push',
-            storage={
-                'effective_endpoint_url': getattr(sdk_meta, 'endpoint_url', None),
-                'effective_region': getattr(sdk_meta, 'region_name', None),
-                'configured_endpoint_url': args.endpoint_url
-                or os.environ.get('AWS_ENDPOINT_URL_S3')
-                or os.environ.get('AWS_ENDPOINT_URL'),
-                'configured_region': args.region
-                or os.environ.get('AWS_DEFAULT_REGION')
-                or os.environ.get('AWS_REGION'),
-                'configured_profile': args.profile or os.environ.get('AWS_PROFILE') or 'default',
-            },
-        )
-        if args.resume:
-            unknown, conflicts = _reconcile_pending(args.journal, preflight_client)
-            if unknown or conflicts:
-                _print_error(
-                    args,
-                    'Resume stopped because reconciliation found an unknown outcome or conflict.',
-                )
-                return 1
-        endpoint = (
-            getattr(sdk_meta, 'endpoint_url', None)
-            or args.endpoint_url
-            or os.environ.get('AWS_ENDPOINT_URL_S3')
-            or os.environ.get('AWS_ENDPOINT_URL')
-            or 'aws-s3 (SDK default)'
-        )
-        remote = storage_readiness(
-            preflight_client,
-            check_report.upload_plan,
-            endpoint,
-            offline=args.offline,
-            journal=args.journal,
-        )
-        args.preflight['storage'] = remote
-        args.journal.append('context', stage=args.journal.stage, preflight=args.preflight)
-        if remote['errors']:
-            _print_preflight(args)
-            return 1
-        s3_client = (
-            None
-            if dry_run
-            else create_s3_client(
-                args.endpoint_url,
-                args.region,
-                args.profile,
-                full_readback=args.verify_readback,
-                upload=True,
-            )
-        )
-        push_report = push_upload_plan(
-            check_report.upload_plan,
-            input_dir=input_dir,
-            s3_client=s3_client,
-            dry_run=dry_run,
-            generated_dir=args.generated_dir,
-            endpoint_url=args.endpoint_url,
-            region=args.region,
-            profile=args.profile,
-            rollback_path=None,
-            journal=args.journal,
-            preflight_client=preflight_client,
-        )
-        if args.format == 'json':
-            print(
-                json.dumps(
-                    sanitize(
-                        {**_run_payload(push_report, args.journal), 'preflight': args.preflight}
-                    ),
-                    indent=2,
-                )
-            )
-        else:
-            _print_preflight(args)
-            _print_push_report(push_report)
-        return 1 if push_report.has_errors else 0
-
+        return _run_push(args, parser)
     if args.command == 'generate':
-        check_report = _checked(args)
-        if check_report.validation_errors:
-            _print_check(check_report, args.format, args.journal)
-            return 3
-        config = load_config(args.config)
-        input_dir = _resolve_input_dir(args.config, config)
-        output_dir = args.output_dir or (input_dir / 'generated')
-        local = output_readiness(check_report.upload_plan, input_dir, output_dir, generating=True)
-        args.preflight = {'local': local}
-        args.journal.append('context', stage='generate', preflight=args.preflight)
-        if local['errors']:
-            _print_preflight(args)
-            return 3
-        output_dir.mkdir(parents=True, exist_ok=True)
-        args.journal.attach(output_dir)
-        args.journal.write_audit(check_report.upload_plan, output_dir)
-        generate_report = generate_service_jpgs(
-            upload_plan=check_report.upload_plan,
-            input_dir=input_dir,
-            output_dir=output_dir,
-            max_long_side=args.max_long_side,
-            quality=args.quality,
-            journal=args.journal,
-        )
-
-        if args.manifests:
-            manifest_base_url = config.get('manifest_base_url')
-            if manifest_base_url is None:
-                manifest_base_url = args.manifest_base_url
-
-            manifest_report = generate_manifests(
-                objects=check_report.objects,
-                upload_plan=check_report.upload_plan,
-                output_dir=output_dir,
-                cantaloupe_base_url=str(
-                    config.get('cantaloupe_base_url', args.cantaloupe_base_url or '/iiif/2')
-                ),
-                manifest_base_url=manifest_base_url,
-                journal=args.journal,
-                page_dimensions=generate_report.page_dimensions,
-            )
-            generate_report = _combine_generate_reports(generate_report, manifest_report)
-
-        if args.thumbnails:
-            thumbnail_report = generate_thumbnails(
-                upload_plan=check_report.upload_plan,
-                input_dir=input_dir,
-                output_dir=output_dir,
-                max_long_side=300,
-                quality=max(min(args.quality, 100), 1),
-                journal=args.journal,
-            )
-            generate_report = _combine_generate_reports(generate_report, thumbnail_report)
-
-        if args.format == 'json':
-            print(
-                json.dumps(
-                    sanitize(
-                        {**_run_payload(generate_report, args.journal), 'preflight': args.preflight}
-                    ),
-                    indent=2,
-                )
-            )
-        else:
-            _print_generate_report(generate_report)
-        return 4 if generate_report.failed_count or generate_report.missing_source_count else 0
-
+        return _run_generate(args)
     if args.command == 'verify-cantaloupe':
-        manifest_paths: list[Path] = []
-        manifest_paths.extend(args.manifest)
-
-        if args.manifest_dir is not None:
-            if not args.manifest_dir.exists():
-                raise ConfigError(f'Manifest directory not found: {args.manifest_dir}')
-            manifest_paths.extend(
-                sorted(
-                    path
-                    for path in args.manifest_dir.rglob('*.json')
-                    if path.name not in {'.workbench-run.json', 'upload-plan.json'}
-                )
-            )
-
-        if not manifest_paths:
-            if args.manifest_dir is not None:
-                raise ConfigError('Manifest directory contains no JSON manifests.')
-            parser.error('verify-cantaloupe requires --manifest or --manifest-dir')
-        if args.timeout <= 0:
-            parser.error('--timeout must be greater than zero')
-
-        report = verify_manifest_service_urls(
-            manifest_paths=[str(path) for path in manifest_paths],
-            base_url_override=args.cantaloupe_base_url,
-            timeout_seconds=args.timeout,
-            journal=args.journal,
-        )
-
-        payload = _run_payload(report, args.journal)
-        if args.format == 'json':
-            print(json.dumps(sanitize(payload), indent=2))
-        else:
-            _print_safe('Workbench-lite Cantaloupe verification report')
-            _print_safe(f'Checked: {report.tested_count}')
-            _print_safe(f'Passed: {report.passed_count}')
-            _print_safe(f'Failed: {report.failed_count}')
-            if report.failed_count:
-                _print_safe('Failures:')
-                for result in report.results:
-                    if result.ok:
-                        continue
-                    _print_safe(
-                        f'  - {result.canvas_id} ({result.manifest_path}) -> {result.info_url}'
-                    )
-                    if result.status_code is not None:
-                        _print_safe(f'    status: {result.status_code}')
-                    if result.content_type:
-                        _print_safe(f'    content-type: {result.content_type}')
-                    if result.message:
-                        _print_safe(f'    {result.message}')
-            else:
-                _print_safe('All tested service URLs returned 200')
-                for result in report.results:
-                    dims = (
-                        f'{result.width}x{result.height}'
-                        if result.width is not None and result.height is not None
-                        else 'unknown dimensions'
-                    )
-                    _print_safe(f'  - {result.canvas_id}: {result.info_url} ({dims})')
-
-        return 4 if report.failed_count else 0
-
+        return _run_verify_cantaloupe(args, parser)
     return 1
+
+
+def _run_check(args):
+    report = _checked(args)
+    _print_check(report, args.format, args.journal)
+    return 3 if report.validation_errors else 0
+
+
+def _run_push(args, parser):
+    check_report = _checked(args)
+    if check_report.validation_errors:
+        _print_check(check_report, args.format, args.journal)
+        return 3
+    _validate_generated_push(args, parser, check_report.upload_plan)
+    config = load_config(args.config)
+    input_dir = _resolve_input_dir(args.config, config)
+    dry_run = not args.execute
+    local = _push_local_readiness(args, check_report.upload_plan, input_dir)
+    if local['errors']:
+        _print_preflight(args)
+        return 1
+    _prepare_generated_push(args, check_report.upload_plan)
+    preflight_client = _push_preflight_client(args)
+    sdk_meta = getattr(getattr(preflight_client, 'client', None), 'meta', None)
+    _lock_push_destination(args, check_report.upload_plan, sdk_meta, dry_run)
+    _record_push_storage_context(args, sdk_meta)
+    if not _reconcile_push_resume(args, preflight_client):
+        return 1
+    remote = _push_storage_readiness(args, check_report.upload_plan, preflight_client, sdk_meta)
+    if remote['errors']:
+        _print_preflight(args)
+        return 1
+    s3_client = _push_client(args, dry_run)
+    push_report = push_upload_plan(
+        check_report.upload_plan,
+        input_dir=input_dir,
+        s3_client=s3_client,
+        dry_run=dry_run,
+        generated_dir=args.generated_dir,
+        endpoint_url=args.endpoint_url,
+        region=args.region,
+        profile=args.profile,
+        rollback_path=None,
+        journal=args.journal,
+        preflight_client=preflight_client,
+    )
+    _print_push_result(args, push_report)
+    return 1 if push_report.has_errors else 0
+
+
+def _validate_generated_push(args, parser, upload_plan):
+    if (
+        args.execute
+        and args.generated_dir is None
+        and any(entry.generated for entry in upload_plan)
+    ):
+        parser.error('push --execute requires --generated-dir for planned generated artifacts')
+
+
+def _push_local_readiness(args, upload_plan, input_dir):
+    new_audit = (
+        args.generated_dir is not None and not (args.generated_dir / '.workbench-run.json').exists()
+    )
+    local = output_readiness(upload_plan, input_dir, args.generated_dir, new_audit=new_audit)
+    args.preflight = {'local': local}
+    args.journal.append('context', stage=args.journal.stage, preflight=args.preflight)
+    return local
+
+
+def _prepare_generated_push(args, upload_plan):
+    if args.generated_dir is None:
+        return
+    reference = args.generated_dir / '.workbench-run.json'
+    if not reference.exists():
+        args.generated_dir.mkdir(parents=True, exist_ok=True)
+        args.journal.write_audit(upload_plan, args.generated_dir)
+        args.journal.attach(args.generated_dir)
+        return
+    audit = next(entry for entry in upload_plan if entry.role == 'audit')
+    audit_path = args.generated_dir / audit.key
+    if audit_path.exists() and digest(audit_path) != digest(args.journal.path / 'upload-plan.json'):
+        raise JournalError('Audit snapshot changed since generation; upload blocked.')
+
+
+def _push_preflight_client(args):
+    if args.offline:
+        return None
+    return create_s3_client(args.endpoint_url, args.region, args.profile, preflight=True)
+
+
+def _lock_push_destination(args, upload_plan, sdk_meta, dry_run):
+    if dry_run:
+        return
+    endpoint = _configured_endpoint(args, sdk_meta, 'aws-s3')
+    lock_destination(args.locks, endpoint.rstrip('/').lower(), upload_plan)
+    if args.resume:
+        _validate_push_resume_destination(args, endpoint, sdk_meta)
+
+
+def _configured_endpoint(args, sdk_meta, fallback):
+    return (
+        getattr(sdk_meta, 'endpoint_url', None)
+        or args.endpoint_url
+        or os.environ.get('AWS_ENDPOINT_URL_S3')
+        or os.environ.get('AWS_ENDPOINT_URL')
+        or fallback
+    )
+
+
+def _validate_push_resume_destination(args, endpoint, sdk_meta):
+    recorded = _recorded_storage(args.journal.path)
+    prior_endpoint = recorded.get('effective_endpoint_url') or recorded.get(
+        'configured_endpoint_url'
+    )
+    prior_region = recorded.get('effective_region') or recorded.get('configured_region')
+    if not prior_endpoint or prior_endpoint.rstrip('/').lower() != endpoint.rstrip('/').lower():
+        raise JournalError('Resume refused: S3 endpoint differs from the recorded run.')
+    current_region = (
+        getattr(sdk_meta, 'region_name', None)
+        or args.region
+        or os.environ.get('AWS_DEFAULT_REGION')
+        or os.environ.get('AWS_REGION')
+    )
+    if prior_region and current_region and prior_region != current_region:
+        raise JournalError('Resume refused: S3 region differs from the recorded run.')
+
+
+def _record_push_storage_context(args, sdk_meta):
+    args.journal.append(
+        'context',
+        stage='push',
+        storage={
+            'effective_endpoint_url': getattr(sdk_meta, 'endpoint_url', None),
+            'effective_region': getattr(sdk_meta, 'region_name', None),
+            'configured_endpoint_url': args.endpoint_url
+            or os.environ.get('AWS_ENDPOINT_URL_S3')
+            or os.environ.get('AWS_ENDPOINT_URL'),
+            'configured_region': args.region
+            or os.environ.get('AWS_DEFAULT_REGION')
+            or os.environ.get('AWS_REGION'),
+            'configured_profile': args.profile or os.environ.get('AWS_PROFILE') or 'default',
+        },
+    )
+
+
+def _reconcile_push_resume(args, preflight_client):
+    if not args.resume:
+        return True
+    unknown, conflicts = _reconcile_pending(args.journal, preflight_client)
+    if not unknown and not conflicts:
+        return True
+    _print_error(
+        args, 'Resume stopped because reconciliation found an unknown outcome or conflict.'
+    )
+    return False
+
+
+def _push_storage_readiness(args, upload_plan, preflight_client, sdk_meta):
+    endpoint = _configured_endpoint(args, sdk_meta, 'aws-s3 (SDK default)')
+    remote = storage_readiness(
+        preflight_client,
+        upload_plan,
+        endpoint,
+        offline=args.offline,
+        journal=args.journal,
+    )
+    args.preflight['storage'] = remote
+    args.journal.append('context', stage=args.journal.stage, preflight=args.preflight)
+    return remote
+
+
+def _push_client(args, dry_run):
+    if dry_run:
+        return None
+    return create_s3_client(
+        args.endpoint_url,
+        args.region,
+        args.profile,
+        full_readback=args.verify_readback,
+        upload=True,
+    )
+
+
+def _print_push_result(args, report):
+    if args.format == 'json':
+        payload = {**_run_payload(report, args.journal), 'preflight': args.preflight}
+        print(json.dumps(sanitize(payload), indent=2))
+        return
+    _print_preflight(args)
+    _print_push_report(report)
+
+
+def _run_generate(args):
+    check_report = _checked(args)
+    if check_report.validation_errors:
+        _print_check(check_report, args.format, args.journal)
+        return 3
+    config = load_config(args.config)
+    input_dir = _resolve_input_dir(args.config, config)
+    output_dir = args.output_dir or (input_dir / 'generated')
+    local = output_readiness(check_report.upload_plan, input_dir, output_dir, generating=True)
+    args.preflight = {'local': local}
+    args.journal.append('context', stage='generate', preflight=args.preflight)
+    if local['errors']:
+        _print_preflight(args)
+        return 3
+    output_dir.mkdir(parents=True, exist_ok=True)
+    args.journal.attach(output_dir)
+    args.journal.write_audit(check_report.upload_plan, output_dir)
+    report = generate_service_jpgs(
+        upload_plan=check_report.upload_plan,
+        input_dir=input_dir,
+        output_dir=output_dir,
+        max_long_side=args.max_long_side,
+        quality=args.quality,
+        journal=args.journal,
+    )
+    report = _add_requested_manifests(args, config, check_report, output_dir, report)
+    report = _add_requested_thumbnails(
+        args, check_report.upload_plan, input_dir, output_dir, report
+    )
+    _print_generate_result(args, report)
+    return 4 if report.failed_count or report.missing_source_count else 0
+
+
+def _add_requested_manifests(args, config, check_report, output_dir, report):
+    if not args.manifests:
+        return report
+    manifest_base_url = config.get('manifest_base_url')
+    if manifest_base_url is None:
+        manifest_base_url = args.manifest_base_url
+    manifest_report = generate_manifests(
+        objects=check_report.objects,
+        upload_plan=check_report.upload_plan,
+        output_dir=output_dir,
+        cantaloupe_base_url=str(
+            config.get('cantaloupe_base_url', args.cantaloupe_base_url or '/iiif/2')
+        ),
+        manifest_base_url=manifest_base_url,
+        journal=args.journal,
+        page_dimensions=report.page_dimensions,
+    )
+    return _combine_generate_reports(report, manifest_report)
+
+
+def _add_requested_thumbnails(args, upload_plan, input_dir, output_dir, report):
+    if not args.thumbnails:
+        return report
+    thumbnail_report = generate_thumbnails(
+        upload_plan=upload_plan,
+        input_dir=input_dir,
+        output_dir=output_dir,
+        max_long_side=300,
+        quality=max(min(args.quality, 100), 1),
+        journal=args.journal,
+    )
+    return _combine_generate_reports(report, thumbnail_report)
+
+
+def _print_generate_result(args, report):
+    if args.format == 'json':
+        payload = {**_run_payload(report, args.journal), 'preflight': args.preflight}
+        print(json.dumps(sanitize(payload), indent=2))
+    else:
+        _print_generate_report(report)
+
+
+def _run_verify_cantaloupe(args, parser):
+    manifest_paths = _verify_manifest_paths(args, parser)
+    if args.timeout <= 0:
+        parser.error('--timeout must be greater than zero')
+    report = verify_manifest_service_urls(
+        manifest_paths=[str(path) for path in manifest_paths],
+        base_url_override=args.cantaloupe_base_url,
+        timeout_seconds=args.timeout,
+        journal=args.journal,
+    )
+    _print_verify_result(args, report)
+    return 4 if report.failed_count else 0
+
+
+def _verify_manifest_paths(args, parser):
+    manifest_paths: list[Path] = list(args.manifest)
+    if args.manifest_dir is not None:
+        if not args.manifest_dir.exists():
+            raise ConfigError(f'Manifest directory not found: {args.manifest_dir}')
+        manifest_paths.extend(
+            sorted(
+                path
+                for path in args.manifest_dir.rglob('*.json')
+                if path.name not in {'.workbench-run.json', 'upload-plan.json'}
+            )
+        )
+    if manifest_paths:
+        return manifest_paths
+    if args.manifest_dir is not None:
+        raise ConfigError('Manifest directory contains no JSON manifests.')
+    parser.error('verify-cantaloupe requires --manifest or --manifest-dir')
+
+
+def _print_verify_result(args, report):
+    if args.format == 'json':
+        print(json.dumps(sanitize(_run_payload(report, args.journal)), indent=2))
+        return
+    _print_safe('Workbench-lite Cantaloupe verification report')
+    _print_safe(f'Checked: {report.tested_count}')
+    _print_safe(f'Passed: {report.passed_count}')
+    _print_safe(f'Failed: {report.failed_count}')
+    if report.failed_count:
+        _print_verify_failures(report)
+    else:
+        _print_verify_successes(report)
+
+
+def _print_verify_failures(report):
+    _print_safe('Failures:')
+    for result in report.results:
+        if result.ok:
+            continue
+        _print_safe(f'  - {result.canvas_id} ({result.manifest_path}) -> {result.info_url}')
+        if result.status_code is not None:
+            _print_safe(f'    status: {result.status_code}')
+        if result.content_type:
+            _print_safe(f'    content-type: {result.content_type}')
+        if result.message:
+            _print_safe(f'    {result.message}')
+
+
+def _print_verify_successes(report):
+    _print_safe('All tested service URLs returned 200')
+    for result in report.results:
+        dims = (
+            f'{result.width}x{result.height}'
+            if result.width is not None and result.height is not None
+            else 'unknown dimensions'
+        )
+        _print_safe(f'  - {result.canvas_id}: {result.info_url} ({dims})')
 
 
 def _resolve_input_dir(config_path: Path, config) -> Path:
