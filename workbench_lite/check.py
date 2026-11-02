@@ -1,5 +1,6 @@
 import csv
 from collections import Counter, defaultdict
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional
 from urllib.parse import urlparse
@@ -13,54 +14,131 @@ from .preflight import safe_source, validate_content
 REQUIRED_COLUMNS = ['title', 'id', 'field_model', 'parent_id', 'field_weight', 'file']
 
 
+@dataclass
+class _CheckInputs:
+    config_path: Path
+    config: Dict[str, object]
+    input_dir: Path
+    rows: List[Dict[str, str]]
+    fieldnames: List[str]
+    allow_dummy_files: bool
+    run_id: Optional[str]
+    errors: List[str]
+    warnings: List[str]
+
+
+@dataclass
+class _RowValidation:
+    parent_rows: List[Dict[str, str]]
+    page_rows: List[Dict[str, str]]
+    child_parent_ids: set[str]
+    bad_child_weight_count: int
+    additional_files: Dict[str, object]
+
+
+@dataclass
+class _CheckPlan:
+    objects: List[WorkbenchObject]
+    file_counts: Dict[str, int]
+    upload_plan: List[UploadPlanEntry]
+
+
+@dataclass
+class _SourceValidation:
+    rows: List[Dict[str, str]]
+    parent_rows: List[Dict[str, str]]
+    page_rows: List[Dict[str, str]]
+    input_dir: Path
+    additional_files: Dict[str, object]
+    allow_dummy_files: bool
+    config: Dict[str, object]
+    errors: List[str]
+    warnings: List[str]
+
+
 def run_check(
     config_path: Path,
     input_csv_override: Optional[Path] = None,
     allow_dummy_files: bool = False,
     run_id: Optional[str] = None,
 ) -> CheckReport:
+    inputs = _read_check_inputs(config_path, input_csv_override, allow_dummy_files, run_id)
+    row_validation = _validate_check_inputs(inputs)
+    plan = _build_check_plan(inputs, row_validation)
+    return _build_check_report(inputs, row_validation, plan)
+
+
+def _read_check_inputs(config_path, input_csv_override, allow_dummy_files, run_id):
     config_path = Path(config_path)
     config = load_config(config_path)
     csv_path = _resolve_csv_path(config_path, config, input_csv_override)
     rows, fieldnames, csv_errors = _read_csv(csv_path)
-
-    validation_errors: List[str] = []
-    validation_warnings: List[str] = []
-    validation_errors.extend(csv_errors)
-    input_dir = _resolve_input_dir(config_path, config)
-    parent_rows, page_rows, child_parent_ids, bad_child_weight_count = _validate_csv_rows(
-        rows, fieldnames, validation_errors
+    return _CheckInputs(
+        config_path=config_path,
+        config=config,
+        input_dir=_resolve_input_dir(config_path, config),
+        rows=rows,
+        fieldnames=fieldnames,
+        allow_dummy_files=allow_dummy_files,
+        run_id=run_id,
+        errors=csv_errors,
+        warnings=[],
     )
-    additional_files = _additional_file_columns(config, fieldnames)
+
+
+def _validate_check_inputs(inputs):
+    parent_rows, page_rows, child_parent_ids, bad_child_weight_count = _validate_csv_rows(
+        inputs.rows, inputs.fieldnames, inputs.errors
+    )
+    additional_files = _additional_file_columns(inputs.config, inputs.fieldnames)
     _validate_source_rows(
-        rows,
+        _SourceValidation(
+            rows=inputs.rows,
+            parent_rows=parent_rows,
+            page_rows=page_rows,
+            input_dir=inputs.input_dir,
+            additional_files=additional_files,
+            allow_dummy_files=inputs.allow_dummy_files,
+            config=inputs.config,
+            errors=inputs.errors,
+            warnings=inputs.warnings,
+        )
+    )
+    return _RowValidation(
         parent_rows,
         page_rows,
-        input_dir,
+        child_parent_ids,
+        bad_child_weight_count,
         additional_files,
-        allow_dummy_files,
-        config,
-        validation_errors,
-        validation_warnings,
     )
-    objects = _build_objects(parent_rows, page_rows)
-    file_counts = _count_file_roles(rows, additional_files.keys())
-    upload_plan = build_upload_plan(objects, config, config_path, input_dir, run_id=run_id)
-    _validate_upload_plan_collisions(upload_plan, validation_errors)
-    _validate_planned_content(upload_plan, input_dir, allow_dummy_files, validation_errors)
 
+
+def _build_check_plan(inputs, row_validation):
+    objects = _build_objects(row_validation.parent_rows, row_validation.page_rows)
+    file_counts = _count_file_roles(inputs.rows, row_validation.additional_files.keys())
+    upload_plan = build_upload_plan(
+        objects, inputs.config, inputs.config_path, inputs.input_dir, run_id=inputs.run_id
+    )
+    _validate_upload_plan_collisions(upload_plan, inputs.errors)
+    _validate_planned_content(
+        upload_plan, inputs.input_dir, inputs.allow_dummy_files, inputs.errors
+    )
+    return _CheckPlan(objects, file_counts, upload_plan)
+
+
+def _build_check_report(inputs, row_validation, plan):
     return CheckReport(
-        row_count=len(rows),
-        column_count=len(fieldnames),
-        parent_count=len(parent_rows),
-        page_count=len(page_rows),
-        unique_child_parent_count=len(child_parent_ids),
-        bad_child_weight_count=bad_child_weight_count,
-        file_counts=file_counts,
-        validation_errors=validation_errors,
-        validation_warnings=validation_warnings,
-        objects=objects,
-        upload_plan=upload_plan,
+        row_count=len(inputs.rows),
+        column_count=len(inputs.fieldnames),
+        parent_count=len(row_validation.parent_rows),
+        page_count=len(row_validation.page_rows),
+        unique_child_parent_count=len(row_validation.child_parent_ids),
+        bad_child_weight_count=row_validation.bad_child_weight_count,
+        file_counts=plan.file_counts,
+        validation_errors=inputs.errors,
+        validation_warnings=inputs.warnings,
+        objects=plan.objects,
+        upload_plan=plan.upload_plan,
     )
 
 
@@ -97,27 +175,21 @@ def _additional_file_columns(config, fieldnames):
     return additional_files
 
 
-def _validate_source_rows(
-    rows,
-    parent_rows,
-    page_rows,
-    input_dir,
-    additional_files,
-    allow_dummy_files,
-    config,
-    errors,
-    warnings,
-):
-    _validate_file_extensions(parent_rows, page_rows, additional_files.keys(), errors)
-    _validate_row_source_paths(rows, additional_files, input_dir, errors)
-    if not allow_dummy_files:
+def _validate_source_rows(source):
+    _validate_file_extensions(
+        source.parent_rows, source.page_rows, source.additional_files.keys(), source.errors
+    )
+    _validate_row_source_paths(
+        source.rows, source.additional_files, source.input_dir, source.errors
+    )
+    if not source.allow_dummy_files:
         _validate_file_paths(
-            rows=rows,
-            input_dir=input_dir,
-            additional_file_columns=additional_files.keys(),
-            errors=errors,
-            warnings=warnings,
-            allow_missing_files=bool(config.get('allow_missing_files', False)),
+            rows=source.rows,
+            input_dir=source.input_dir,
+            additional_file_columns=source.additional_files.keys(),
+            errors=source.errors,
+            warnings=source.warnings,
+            allow_missing_files=bool(source.config.get('allow_missing_files', False)),
         )
 
 
