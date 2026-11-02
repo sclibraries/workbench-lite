@@ -2,12 +2,24 @@
 
 import json
 import os
+from dataclasses import dataclass
 from pathlib import Path
 import shutil
 
 from .image_policy import Image, pixel_limit_error
 
 from .diagnostics import operation_error
+
+
+@dataclass
+class _OutputReadiness:
+    input_dir: Path
+    root: Path | None
+    generating: bool
+    new_audit: bool
+    errors: list
+    planned: list
+    missing: list
 
 
 def safe_source(value, input_dir):
@@ -87,18 +99,23 @@ def _validate_readable_content(path):
 
 
 def output_readiness(entries, input_dir, output_dir, *, generating=False, new_audit=False):
-    errors, planned, missing = [], [], []
+    readiness = _OutputReadiness(
+        input_dir=input_dir,
+        root=Path(output_dir).resolve() if output_dir is not None else None,
+        generating=generating,
+        new_audit=new_audit,
+        errors=[],
+        planned=[],
+        missing=[],
+    )
     required_bytes = 0
-    root = Path(output_dir).resolve() if output_dir is not None else None
     for entry in entries:
-        required_bytes += _check_generated_entry(
-            entry, input_dir, root, generating, new_audit, errors, planned, missing
-        )
-    free = _check_output_capacity(root, required_bytes, errors)
+        required_bytes += _check_generated_entry(entry, readiness)
+    free = _check_output_capacity(readiness.root, required_bytes, readiness.errors)
     return {
-        'errors': errors,
-        'missing_generated': missing,
-        'planned_generation': planned,
+        'errors': readiness.errors,
+        'missing_generated': readiness.missing,
+        'planned_generation': readiness.planned,
         'estimated_additional_bytes': required_bytes,
         'available_bytes': free,
         'estimate_basis': 'source RGB upper estimate plus 64 KiB per generated entry; '
@@ -106,19 +123,27 @@ def output_readiness(entries, input_dir, output_dir, *, generating=False, new_au
     }
 
 
-def _check_generated_entry(entry, input_dir, root, generating, new_audit, errors, planned, missing):
+def _check_generated_entry(entry, readiness):
     if not entry.generated:
         return 0
-    target, safe = _generated_target(entry, root, errors)
+    target, safe = _generated_target(entry, readiness.root, readiness.errors)
     if not safe:
         return 0
-    if not _check_generated_location(entry, target, generating, new_audit, errors):
+    if not _check_generated_location(
+        entry, target, readiness.generating, readiness.new_audit, readiness.errors
+    ):
         return 0
-    if generating or (new_audit and entry.role == 'audit') or root is None:
-        planned.append(entry.key)
+    if (
+        readiness.generating
+        or (readiness.new_audit and entry.role == 'audit')
+        or readiness.root is None
+    ):
+        readiness.planned.append(entry.key)
         estimated = 65536  # Per-file encoding, manifest and journal allowance.
-        return estimated + _source_image_estimate(entry, input_dir, generating, errors)
-    _check_existing_generated_entry(entry, target, errors, missing)
+        return estimated + _source_image_estimate(
+            entry, readiness.input_dir, readiness.generating, readiness.errors
+        )
+    _check_existing_generated_entry(entry, target, readiness.errors, readiness.missing)
     return 0
 
 
