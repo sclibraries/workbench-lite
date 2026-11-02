@@ -1,6 +1,7 @@
 """Guarded rollback from confirmed new-key inventory entries."""
 
 from datetime import datetime
+from dataclasses import dataclass
 import hashlib
 import json
 from pathlib import Path
@@ -466,21 +467,38 @@ def _record_result(journal, operation_id, item, status, remote_outcome, message=
     journal.result(operation_id, 'rollback-delete', payload)
 
 
+@dataclass
+class _RollbackDeleteContext:
+    client: object
+    journal: object
+    report: dict
+    used_by: dict
+    pending: dict
+    blocked_objects: set
+
+
+@dataclass
+class _DeleteTarget:
+    item: dict
+    result: dict
+    operation_id: str | None = None
+    etag: str | None = None
+
+    @property
+    def identity(self):
+        return self.item['bucket'], self.item['key']
+
+
 def _run_deletes(inventory, client, journal, report, used_by, pending):
     stopped = False
-    blocked_objects = set()
+    context = _RollbackDeleteContext(client, journal, report, used_by, pending, set())
     for item in sorted(inventory.get('new_keys') or [], key=_sort_key):
-        identity_key = (item['bucket'], item['key'])
-        result = _delete_result(item)
-        if _append_delete_skip(report, result, item, stopped, blocked_objects):
+        target = _DeleteTarget(item, _delete_result(item))
+        if _append_delete_skip(target, context, stopped):
             continue
-        if _record_later_reuse_conflict(
-            item, identity_key, result, journal, report, used_by, blocked_objects
-        ):
+        if _record_later_reuse_conflict(target, context):
             continue
-        stopped = _delete_item(
-            item, identity_key, result, client, journal, report, pending, blocked_objects
-        )
+        stopped = _delete_item(target, context)
 
 
 def _delete_result(item):
@@ -488,137 +506,154 @@ def _delete_result(item):
     return {key: item.get(key) for key in fields}
 
 
-def _append_delete_skip(report, result, item, stopped, blocked_objects):
+def _append_delete_skip(target, context, stopped):
     if stopped:
         message = 'Earlier S3 deletion failed or had an uncertain outcome.'
-    elif item.get('object_id') in blocked_objects:
+    elif target.item.get('object_id') in context.blocked_objects:
         message = 'Manifest conflict for this object prevents deletion.'
     else:
         return False
-    report['results'].append({**result, 'status': 'not_attempted', 'reason': message})
+    context.report['results'].append(
+        {**target.result, 'status': 'not_attempted', 'reason': message}
+    )
     return True
 
 
-def _record_later_reuse_conflict(
-    item, identity_key, result, journal, report, used_by, blocked_objects
-):
-    if identity_key not in used_by:
+def _record_later_reuse_conflict(target, context):
+    if target.identity not in context.used_by:
         return False
-    names = ', '.join(used_by[identity_key])
+    names = ', '.join(context.used_by[target.identity])
     message = f'conflict: used by run {names}'
-    if item.get('role') == 'manifest':
+    if target.item.get('role') == 'manifest':
         message = f'conflict: manifest used by run {names}'
-        blocked_objects.add(item.get('object_id'))
-    operation_id = journal.intent(
+        context.blocked_objects.add(target.item.get('object_id'))
+    target.operation_id = context.journal.intent(
         'rollback-delete',
         {
-            **result,
-            'expected_checksum': item['checksum'],
-            'expected_size_bytes': item['size_bytes'],
+            **target.result,
+            'expected_checksum': target.item['checksum'],
+            'expected_size_bytes': target.item['size_bytes'],
         },
     )
-    _record_result(journal, operation_id, item, 'conflict', 'not_deleted', message)
-    report['results'].append({**result, 'status': 'conflict', 'reason': message})
+    _record_result(
+        context.journal, target.operation_id, target.item, 'conflict', 'not_deleted', message
+    )
+    context.report['results'].append({**target.result, 'status': 'conflict', 'reason': message})
     return True
 
 
-def _delete_item(item, identity_key, result, client, journal, report, pending, blocked_objects):
-    operation_id = _rollback_delete_operation(item, identity_key, result, journal, pending)
-    etag, handled, stopped, current = _inspect_delete_target(
-        item, result, client, journal, report, operation_id, blocked_objects
-    )
+def _delete_item(target, context):
+    target.operation_id = _rollback_delete_operation(target, context)
+    etag, handled, stopped, current = _inspect_delete_target(target, context)
     if handled:
         return stopped
-    journal.append(
+    context.journal.append(
         'context',
         stage='rollback',
-        operation_id=operation_id,
-        bucket=item['bucket'],
-        key=item['key'],
+        operation_id=target.operation_id,
+        bucket=target.item['bucket'],
+        key=target.item['key'],
         observed_checksum=_field(current, 'checksum'),
         observed_size_bytes=_field(current, 'size_bytes'),
         checksum_type=_field(current, 'checksum_type'),
         if_match=etag,
     )
-    delete_result = _send_conditional_delete(
-        item, result, client, journal, report, operation_id, etag, blocked_objects
-    )
+    delete_result = _send_conditional_delete(target, context)
     if delete_result is not False:
         return delete_result is True
-    return _confirm_delete_absent(item, result, client, journal, report, operation_id, etag)
+    return _confirm_delete_absent(target, context)
 
 
-def _rollback_delete_operation(item, identity_key, result, journal, pending):
-    operation_id = pending.pop(identity_key, None)
+def _rollback_delete_operation(target, context):
+    operation_id = context.pending.pop(target.identity, None)
     if operation_id is not None:
         return operation_id
-    return journal.intent(
+    return context.journal.intent(
         'rollback-delete',
         {
-            **result,
-            'expected_checksum': item['checksum'],
-            'expected_size_bytes': item['size_bytes'],
+            **target.result,
+            'expected_checksum': target.item['checksum'],
+            'expected_size_bytes': target.item['size_bytes'],
         },
     )
 
 
-def _inspect_delete_target(item, result, client, journal, report, operation_id, blocked_objects):
+def _inspect_delete_target(target, context):
     try:
-        current = _current_identity(client, item['bucket'], item['key'])
+        current = _current_identity(context.client, target.item['bucket'], target.item['key'])
     except (ClientError, BotoCoreError, OSError) as exc:
         message = operation_error(exc)
-        _record_delete_failure(journal, report, operation_id, item, result, message)
+        _record_delete_failure(context, target, message)
         return None, True, True, None
     if current is None:
-        _record_result(journal, operation_id, item, 'already_deleted', 'not_needed')
-        report['results'].append({**result, 'status': 'already_deleted'})
-        return None, True, False, None
-    if not _matches(item, current):
-        message = 'conflict: modified after upload; current FULL_OBJECT SHA-256 or size differs.'
         _record_result(
-            journal,
-            operation_id,
-            item,
-            'conflict',
-            'not_deleted',
-            message,
-            observed_checksum=_field(current, 'checksum'),
-            observed_size_bytes=_field(current, 'size_bytes'),
-            checksum_type=_field(current, 'checksum_type'),
+            context.journal, target.operation_id, target.item, 'already_deleted', 'not_needed'
         )
-        report['results'].append(
-            {
-                **result,
-                'status': 'conflict',
-                'reason': message,
-                'observed_checksum': _field(current, 'checksum'),
-                'observed_size_bytes': _field(current, 'size_bytes'),
-            }
-        )
-        _block_manifest_object(item, blocked_objects)
+        context.report['results'].append({**target.result, 'status': 'already_deleted'})
+        return None, True, False, None
+    if not _matches(target.item, current):
+        _record_modified_delete_conflict(target, context, current)
         return None, True, False, None
     etag = _field(current, 'etag')
     if not isinstance(etag, str) or not etag:
-        message = 'conflict: current ETag unavailable; conditional delete cannot be sent.'
-        _record_result(
-            journal,
-            operation_id,
-            item,
-            'conflict',
-            'not_deleted',
-            message,
-            observed_checksum=_field(current, 'checksum'),
-            observed_size_bytes=_field(current, 'size_bytes'),
-        )
-        report['results'].append({**result, 'status': 'conflict', 'reason': message})
-        _block_manifest_object(item, blocked_objects)
+        _record_missing_etag_conflict(target, context, current)
         return None, True, False, None
+    target.etag = etag
     return etag, False, False, current
 
 
-def _record_delete_failure(journal, report, operation_id, item, result, message, **fields):
-    _record_result(journal, operation_id, item, 'failed', 'unknown', message, **fields)
-    report['results'].append({**result, 'status': 'failed', 'reason': message})
+def _record_modified_delete_conflict(target, context, current):
+    message = 'conflict: modified after upload; current FULL_OBJECT SHA-256 or size differs.'
+    _record_result(
+        context.journal,
+        target.operation_id,
+        target.item,
+        'conflict',
+        'not_deleted',
+        message,
+        observed_checksum=_field(current, 'checksum'),
+        observed_size_bytes=_field(current, 'size_bytes'),
+        checksum_type=_field(current, 'checksum_type'),
+    )
+    context.report['results'].append(
+        {
+            **target.result,
+            'status': 'conflict',
+            'reason': message,
+            'observed_checksum': _field(current, 'checksum'),
+            'observed_size_bytes': _field(current, 'size_bytes'),
+        }
+    )
+    _block_manifest_object(target.item, context.blocked_objects)
+
+
+def _record_missing_etag_conflict(target, context, current):
+    message = 'conflict: current ETag unavailable; conditional delete cannot be sent.'
+    _record_result(
+        context.journal,
+        target.operation_id,
+        target.item,
+        'conflict',
+        'not_deleted',
+        message,
+        observed_checksum=_field(current, 'checksum'),
+        observed_size_bytes=_field(current, 'size_bytes'),
+    )
+    context.report['results'].append({**target.result, 'status': 'conflict', 'reason': message})
+    _block_manifest_object(target.item, context.blocked_objects)
+
+
+def _record_delete_failure(context, target, message, **fields):
+    _record_result(
+        context.journal,
+        target.operation_id,
+        target.item,
+        'failed',
+        'unknown',
+        message,
+        **fields,
+    )
+    context.report['results'].append({**target.result, 'status': 'failed', 'reason': message})
 
 
 def _block_manifest_object(item, blocked_objects):
@@ -626,93 +661,103 @@ def _block_manifest_object(item, blocked_objects):
         blocked_objects.add(item.get('object_id'))
 
 
-def _send_conditional_delete(
-    item, result, client, journal, report, operation_id, etag, blocked_objects
-):
+def _send_conditional_delete(target, context):
     try:
-        client.delete_object(item['bucket'], item['key'], if_match=etag)
-    except ClientError as exc:
-        return _record_delete_client_error(
-            exc, item, result, journal, report, operation_id, etag, blocked_objects
+        context.client.delete_object(
+            target.item['bucket'], target.item['key'], if_match=target.etag
         )
+    except ClientError as exc:
+        return _record_delete_client_error(exc, target, context)
     except (BotoCoreError, OSError) as exc:
         message = operation_error(exc)
-        _record_delete_failure(journal, report, operation_id, item, result, message, if_match=etag)
+        _record_delete_failure(context, target, message, if_match=target.etag)
         return True
     return False
 
 
-def _record_delete_client_error(
-    exc, item, result, journal, report, operation_id, etag, blocked_objects
-):
+def _record_delete_client_error(exc, target, context):
     status = exc.response.get('ResponseMetadata', {}).get('HTTPStatusCode')
     code = exc.response.get('Error', {}).get('Code')
     if status == 412 or code in {'PreconditionFailed', '412'}:
-        message = 'conflict: S3 rejected the conditional delete (HTTP 412); '
-        _record_result(
-            journal,
-            operation_id,
-            item,
-            'conflict',
-            'not_deleted',
-            message,
-            if_match=etag,
-            error_code=code,
-            http_status=status,
-        )
-        report['results'].append(
-            {
-                **result,
-                'status': 'conflict',
-                'reason': message,
-                'if_match': etag,
-                'http_status': status,
-            }
-        )
-        _block_manifest_object(item, blocked_objects)
+        _record_delete_precondition_conflict(target, context, status, code)
         return None
+    _record_failed_delete_client_error(target, context, exc, status, code)
+    return True
+
+
+def _record_delete_precondition_conflict(target, context, status, code):
+    message = 'conflict: S3 rejected the conditional delete (HTTP 412); '
+    _record_result(
+        context.journal,
+        target.operation_id,
+        target.item,
+        'conflict',
+        'not_deleted',
+        message,
+        if_match=target.etag,
+        error_code=code,
+        http_status=status,
+    )
+    context.report['results'].append(
+        {
+            **target.result,
+            'status': 'conflict',
+            'reason': message,
+            'if_match': target.etag,
+            'http_status': status,
+        }
+    )
+    _block_manifest_object(target.item, context.blocked_objects)
+
+
+def _record_failed_delete_client_error(target, context, exc, status, code):
     message = operation_error(exc)
     valid_status = isinstance(status, int) and not isinstance(status, bool)
     uncertain = not valid_status or status >= 500 or status in {408, 409, 429}
     remote_outcome = 'unknown' if uncertain else 'not_deleted'
     _record_result(
-        journal,
-        operation_id,
-        item,
+        context.journal,
+        target.operation_id,
+        target.item,
         'failed',
         remote_outcome,
         message,
-        if_match=etag,
+        if_match=target.etag,
         error_code=code,
         http_status=status,
     )
-    report['results'].append({**result, 'status': 'failed', 'reason': message})
-    return True
+    context.report['results'].append({**target.result, 'status': 'failed', 'reason': message})
 
 
-def _confirm_delete_absent(item, result, client, journal, report, operation_id, etag):
+def _confirm_delete_absent(target, context):
     try:
-        after = _current_identity(client, item['bucket'], item['key'])
+        after = _current_identity(context.client, target.item['bucket'], target.item['key'])
     except (ClientError, BotoCoreError, OSError) as exc:
         message = operation_error(exc)
-        _record_delete_failure(journal, report, operation_id, item, result, message, if_match=etag)
+        _record_delete_failure(context, target, message, if_match=target.etag)
         return True
     if after is not None:
         message = 'Delete request returned, but the object remains visible.'
         _record_delete_failure(
-            journal,
-            report,
-            operation_id,
-            item,
-            result,
+            context,
+            target,
             message,
-            if_match=etag,
+            if_match=target.etag,
             observed_checksum=_field(after, 'checksum'),
             observed_size_bytes=_field(after, 'size_bytes'),
         )
         return True
-    _record_result(journal, operation_id, item, 'deleted', 'deleted', if_match=etag)
-    report['results'].append({**result, 'status': 'deleted', 'if_match': etag})
+    _record_result(
+        context.journal,
+        target.operation_id,
+        target.item,
+        'deleted',
+        'deleted',
+        if_match=target.etag,
+    )
+    context.report['results'].append(
+        {**target.result, 'status': 'deleted', 'if_match': target.etag}
+    )
     return False
 
 
