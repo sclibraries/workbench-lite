@@ -201,52 +201,51 @@ def _validate_cli_args(args, parser):
 
 def _run_early_command(args, lock_factory):
     if args.command == 'inspect-run':
-        summary = inspect_run(args.path)
-        print(
-            json.dumps(sanitize(summary), indent=2)
-            if args.format == 'json'
-            else f'Run: {args.path.resolve()}\nState: {summary["state"]}\n'
-            f'Unknown operations: {len(summary["unknown_operations"])}\n'
-            f'Publication: {summary["publication"]["state"]}\n'
-            f'Journal error: {summary["journal_error"] or "none"}'
-        )
-        return (
-            1
-            if summary['journal_error']
-            or summary['incomplete_stage']
-            or summary['unknown_operations']
-            else (summary['exit_code'] or 0)
-        )
+        return _run_inspect_command(args)
     if args.command == 'reconcile':
         return _run_reconcile_command(args, lock_factory)
     if args.command == 'rollback-inventory':
-        try:
-            inventory = (
-                write_inventory(args.path, args.output)
-                if args.output
-                else build_inventory(args.path)
-            )
-        except JournalError as exc:
-            _print_error(args, str(exc))
-            return 1
-        print(
-            json.dumps(sanitize(inventory), indent=2)
-            if args.format == 'json'
-            else f'Run: {inventory["run_id"]}\nInventory: {inventory["state"]}\n'
-            f'Confirmed new keys: {len(inventory["new_keys"])}\n'
-            f'Unknown outcomes: {len(inventory["unknown_keys"])}\n'
-            'Deletion authorized: no'
-        )
-        return (
-            1
-            if inventory['state']
-            in {'needs_reconciliation', 'invalid_evidence', 'incomplete_stage'}
-            else 0
-        )
+        return _run_inventory_command(args)
     if args.command == 'rollback':
         return _run_rollback_command(args, lock_factory)
 
     return None
+
+
+def _run_inspect_command(args):
+    summary = inspect_run(args.path)
+    print(
+        json.dumps(sanitize(summary), indent=2)
+        if args.format == 'json'
+        else f'Run: {args.path.resolve()}\nState: {summary["state"]}\n'
+        f'Unknown operations: {len(summary["unknown_operations"])}\n'
+        f'Publication: {summary["publication"]["state"]}\n'
+        f'Journal error: {summary["journal_error"] or "none"}'
+    )
+    if summary['journal_error'] or summary['incomplete_stage'] or summary['unknown_operations']:
+        return 1
+    return summary['exit_code'] or 0
+
+
+def _run_inventory_command(args):
+    try:
+        inventory = (
+            write_inventory(args.path, args.output) if args.output else build_inventory(args.path)
+        )
+    except JournalError as exc:
+        _print_error(args, str(exc))
+        return 1
+    print(
+        json.dumps(sanitize(inventory), indent=2)
+        if args.format == 'json'
+        else f'Run: {inventory["run_id"]}\nInventory: {inventory["state"]}\n'
+        f'Confirmed new keys: {len(inventory["new_keys"])}\n'
+        f'Unknown outcomes: {len(inventory["unknown_keys"])}\n'
+        'Deletion authorized: no'
+    )
+    return int(
+        inventory['state'] in {'needs_reconciliation', 'invalid_evidence', 'incomplete_stage'}
+    )
 
 
 def _run_locked_command(args, parser, lock_factory):
