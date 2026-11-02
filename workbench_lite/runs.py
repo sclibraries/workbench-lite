@@ -5,6 +5,7 @@ import io
 import hashlib
 import json
 import os
+from dataclasses import dataclass
 from pathlib import Path
 import socket
 import tempfile
@@ -28,6 +29,18 @@ CONFIG_FIELDS = {
     'additional_files',
     'allow_missing_files',
 }
+
+
+@dataclass(frozen=True)
+class _ReceiptEvidence:
+    plan: list
+    expected: set
+    destinations: dict
+    uploads: dict
+    reused: dict
+    verified_events: list
+    verified_identities: dict
+    receipt: dict
 
 
 class JournalError(RuntimeError):
@@ -224,14 +237,16 @@ def _valid_publication_receipt(path, events, receipt):
             return False
         verified_events, verified_identities = verified
         return _receipt_matches_plan(
-            plan,
-            expected,
-            destinations,
-            uploads,
-            reused,
-            verified_events,
-            verified_identities,
-            receipt,
+            _ReceiptEvidence(
+                plan,
+                expected,
+                destinations,
+                uploads,
+                reused,
+                verified_events,
+                verified_identities,
+                receipt,
+            )
         )
     except (OSError, ValueError, KeyError, TypeError):
         return False
@@ -305,25 +320,23 @@ def _verified_upload_identities(results):
     return verified_events, verified
 
 
-def _receipt_matches_plan(
-    plan, expected, destinations, uploads, reused, verified_events, verified, receipt
-):
-    absent = {identity for identity, status in destinations.items() if status == 'absent'}
+def _receipt_matches_plan(evidence):
+    absent = {identity for identity, status in evidence.destinations.items() if status == 'absent'}
     previously_published = {
-        identity for identity, status in destinations.items() if status == 'unchanged'
+        identity for identity, status in evidence.destinations.items() if status == 'unchanged'
     }
-    manifest_count = sum(entry['role'] == 'manifest' for entry in plan)
+    manifest_count = sum(entry['role'] == 'manifest' for entry in evidence.plan)
     return not (
-        not expected
-        or set(uploads) != absent
-        or set(reused) != previously_published
-        or set(uploads).intersection(reused)
-        or set(uploads) | set(reused) != expected
-        or verified != uploads
-        or len(verified_events) != len(uploads)
-        or receipt['verified_count'] != len(plan)
+        not evidence.expected
+        or set(evidence.uploads) != absent
+        or set(evidence.reused) != previously_published
+        or set(evidence.uploads).intersection(evidence.reused)
+        or set(evidence.uploads) | set(evidence.reused) != evidence.expected
+        or evidence.verified_identities != evidence.uploads
+        or len(evidence.verified_events) != len(evidence.uploads)
+        or evidence.receipt['verified_count'] != len(evidence.plan)
         or manifest_count < 1
-        or receipt['manifest_count'] != manifest_count
+        or evidence.receipt['manifest_count'] != manifest_count
     )
 
 
