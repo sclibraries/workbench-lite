@@ -43,47 +43,83 @@ class _OperationEvidence:
     unresolved_ids: set
 
 
+@dataclass
+class _InventoryInputs:
+    metadata: dict
+    events: list
+    plan: list
+    stage: _PushStage
+    config_snapshot: dict
+    errors: '_InventoryErrors'
+
+
+@dataclass
+class _InventoryErrors:
+    journal: str | None
+    plan: str | None
+    metadata: str | None
+
+
+@dataclass
+class _InventoryStateInput:
+    inputs: _InventoryInputs
+    key_groups: dict
+    unresolved: list
+    ownership_uncertain: bool
+
+
+@dataclass
+class _InventoryDocument:
+    inputs: _InventoryInputs
+    operations: list
+    unresolved: list
+    key_groups: dict
+    manifest_urls: list
+    derivatives: list
+    state: str
+
+
 def build_inventory(run_path):
     """Report confirmed writes and uncertainty; never grant deletion authority."""
     path = Path(run_path)
+    inputs = _read_inventory_inputs(path)
+    operation_evidence = _collect_operation_evidence(inputs.stage.events)
+    key_groups, ownership_uncertain = _classify_planned_objects(
+        inputs.plan, inputs.stage.mode, operation_evidence
+    )
+    _load_inventory_config(inputs, path)
+    manifest_urls = _manifest_urls(key_groups['new_keys'], inputs.config_snapshot, inputs.events)
+    derivatives = _local_derivatives(inputs.events)
+    unresolved = _unresolved_operations(operation_evidence)
+    state = _inventory_state(
+        _InventoryStateInput(inputs, key_groups, unresolved, ownership_uncertain)
+    )
+    return _inventory_document(
+        _InventoryDocument(
+            inputs,
+            operation_evidence.operations,
+            unresolved,
+            key_groups,
+            manifest_urls,
+            derivatives,
+            state,
+        )
+    )
+
+
+def _read_inventory_inputs(path):
     metadata, metadata_error = _read_metadata(path)
     events, journal_error = read_events(path)
     plan, plan_error = _read_upload_plan(path, metadata)
     stage = _latest_push_stage(events)
     metadata_error = stage.error or metadata_error
-    operation_evidence = _collect_operation_evidence(stage.events)
-    key_groups, ownership_uncertain = _classify_planned_objects(
-        plan, stage.mode, operation_evidence
-    )
-    config_snapshot, config_error = _read_config_snapshot(path)
-    metadata_error = config_error or metadata_error
-    manifest_urls = _manifest_urls(key_groups['new_keys'], config_snapshot, events)
-    derivatives = _local_derivatives(events)
-    unresolved = _unresolved_operations(operation_evidence)
-    state = _inventory_state(
-        journal_error,
-        plan_error,
-        metadata_error,
-        stage,
-        key_groups,
-        unresolved,
-        ownership_uncertain,
-    )
-    return _inventory_document(
-        metadata,
-        config_snapshot,
-        plan,
-        stage,
-        operation_evidence.operations,
-        unresolved,
-        key_groups,
-        manifest_urls,
-        derivatives,
-        state,
-        journal_error,
-        plan_error,
-        metadata_error,
-    )
+    errors = _InventoryErrors(journal_error, plan_error, metadata_error)
+    return _InventoryInputs(metadata, events, plan, stage, {}, errors)
+
+
+def _load_inventory_config(inputs, path):
+    inputs.config_snapshot, config_error = _read_config_snapshot(path)
+    inputs.errors.metadata = config_error or inputs.errors.metadata
 
 
 def _read_metadata(path):
@@ -375,70 +411,71 @@ def _unresolved_operations(evidence):
     ]
 
 
-def _inventory_state(
-    journal_error, plan_error, metadata_error, stage, key_groups, unresolved, ownership_uncertain
-):
-    if journal_error or plan_error or metadata_error or stage.mode == 'no_push':
+def _inventory_state(state):
+    if (
+        state.inputs.errors.journal
+        or state.inputs.errors.plan
+        or state.inputs.errors.metadata
+        or state.inputs.stage.mode == 'no_push'
+    ):
         return 'invalid_evidence'
-    if key_groups['unknown_keys'] or unresolved or ownership_uncertain:
+    if state.key_groups['unknown_keys'] or state.unresolved or state.ownership_uncertain:
         return 'needs_reconciliation'
-    if not stage.complete:
+    if not state.inputs.stage.complete:
         return 'incomplete_stage'
-    if stage.mode == 'preview':
+    if state.inputs.stage.mode == 'preview':
         return 'preview'
     return 'reviewable'
 
 
-def _inventory_document(
-    metadata,
-    config_snapshot,
-    plan,
-    stage,
-    operations,
-    unresolved,
-    key_groups,
-    manifest_urls,
-    derivatives,
-    state,
-    journal_error,
-    plan_error,
-    metadata_error,
-):
+def _inventory_document(document):
+    inputs = document.inputs
     return {
         'schema_version': INVENTORY_VERSION,
         'kind': 'rollback-inventory',
-        'run_id': metadata.get('run_id'),
-        'batch_id': metadata.get('batch_id'),
-        'mode': stage.mode,
-        'state': state,
+        'run_id': inputs.metadata.get('run_id'),
+        'batch_id': inputs.metadata.get('batch_id'),
+        'mode': inputs.stage.mode,
+        'state': document.state,
         'deletion_authorized': False,
-        'source': sanitize(
-            {
-                'config_path': stage.options.get('config'),
-                'csv_path': stage.options.get('input_csv') or config_snapshot.get('input_csv'),
-                'config_sha256': metadata.get('inputs', {}).get('config_sha256'),
-                'csv_sha256': metadata.get('inputs', {}).get('csv_sha256'),
-            }
-        ),
-        'plan_sha256': metadata.get('plan_sha256'),
-        'planned': plan,
-        'operations': operations,
-        'pending_operations': [
-            {
-                key: operation.get(key)
-                for key in ('sequence', 'stage', 'operation_id', 'bucket', 'key', 'role')
-                if key in operation
-            }
-            for operation in unresolved
-        ],
-        **key_groups,
-        'local_derivatives': derivatives,
-        'manifest_urls': manifest_urls,
+        'source': _inventory_source(inputs),
+        'plan_sha256': inputs.metadata.get('plan_sha256'),
+        'planned': inputs.plan,
+        'operations': document.operations,
+        'pending_operations': _pending_operation_summaries(document.unresolved),
+        **document.key_groups,
+        'local_derivatives': document.derivatives,
+        'manifest_urls': document.manifest_urls,
         'aspace': {'changes': [], 'previous_values': [], 'status': 'deferred-to-reviewed-csv'},
-        'evidence_errors': [
-            error for error in (journal_error, plan_error, metadata_error) if error
-        ],
+        'evidence_errors': _inventory_errors(inputs.errors),
     }
+
+
+def _inventory_source(inputs):
+    return sanitize(
+        {
+            'config_path': inputs.stage.options.get('config'),
+            'csv_path': inputs.stage.options.get('input_csv')
+            or inputs.config_snapshot.get('input_csv'),
+            'config_sha256': inputs.metadata.get('inputs', {}).get('config_sha256'),
+            'csv_sha256': inputs.metadata.get('inputs', {}).get('csv_sha256'),
+        }
+    )
+
+
+def _pending_operation_summaries(unresolved):
+    return [
+        {
+            key: operation.get(key)
+            for key in ('sequence', 'stage', 'operation_id', 'bucket', 'key', 'role')
+            if key in operation
+        }
+        for operation in unresolved
+    ]
+
+
+def _inventory_errors(errors):
+    return [error for error in (errors.journal, errors.plan, errors.metadata) if error]
 
 
 def write_inventory(run_path, output_path=None):
