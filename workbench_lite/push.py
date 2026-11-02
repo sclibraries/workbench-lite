@@ -163,6 +163,89 @@ class _PushEntryOutcome:
     verified_identity: Optional[dict] = None
 
 
+@dataclass
+class _PushSettings:
+    input_dir: Path
+    generated_dir: Optional[Path]
+    s3_client: Optional[S3UploadClient]
+    dry_run: bool
+    destination_client: Optional[S3UploadClient]
+    rollback_path: Optional[Path]
+    journal: object
+    endpoint: str
+    region: str
+    profile: str
+
+
+@dataclass
+class _PushRun:
+    settings: _PushSettings
+    entries: list
+    role_counts: dict
+    attempt_history: dict
+    prior_writes: set
+    readiness_failures: dict
+    destinations: dict
+    errors: List[str] = field(default_factory=list)
+    results: list = field(default_factory=list)
+    verified: list = field(default_factory=list)
+    stopped: bool = False
+    retry_wait_seconds: float = 0.0
+
+
+@dataclass
+class _PushEntryContext:
+    entry: UploadPlanEntry
+    index: int
+    source_path: Path
+    source_label: str
+    destination: dict
+    prior_attempts: int = 0
+    prior_operation_id: Optional[str] = None
+    status: Optional[str] = None
+    message: str = ''
+    checksum: Optional[str] = None
+    size_bytes: Optional[int] = None
+    operation_id: Optional[str] = None
+    remote_unknown: bool = False
+    attempt_events_written: bool = False
+    classification: str = 'new'
+    retry_wait_seconds: float = 0.0
+
+
+@dataclass
+class _PushResultDetails:
+    status: str
+    message: str
+    classification: str
+    checksum: Optional[str] = None
+    size_bytes: Optional[int] = None
+    previous_checksum: Optional[str] = None
+    previous_checksum_type: Optional[str] = None
+    observed_size_bytes: Optional[int] = None
+    verification_method: Optional[str] = None
+
+
+@dataclass
+class _UploadAttempt:
+    run: _PushRun
+    target: _PushEntryContext
+    identity: dict
+    retry_wait_seconds: float
+    operation_id: Optional[str]
+    prior_attempts: int = 0
+
+
+@dataclass
+class _AttemptResult:
+    status: str
+    remote_outcome: str
+    disposition: str
+    message: str
+    error: Optional[dict] = None
+    evidence: dict = field(default_factory=dict)
+
+
 def push_upload_plan(
     upload_plan: Iterable[UploadPlanEntry],
     input_dir: Path,
@@ -178,53 +261,67 @@ def push_upload_plan(
 ) -> PushReport:
     if not dry_run and s3_client is None:
         raise ValueError('Execute requires an upload client.')
-    entries = _ordered_entries(upload_plan)
     endpoint, region_name, profile_name = _resolved_target(endpoint_url, region, profile)
-    role_counts = dict(sorted(Counter(entry.role for entry in entries).items()))
-    attempt_history, prior_writes = _upload_history(journal)
-    readiness_failures, destinations = _local_readiness(entries, input_dir, generated_dir, dry_run)
     destination_client = preflight_client or s3_client
-    preflight_errors, verified = _destination_readiness(
-        entries,
-        destinations,
-        destination_client,
+    settings = _PushSettings(
+        input_dir,
+        generated_dir,
+        s3_client,
         dry_run,
-        readiness_failures,
-        prior_writes,
+        destination_client,
+        rollback_path,
         journal,
+        endpoint,
+        region_name,
+        profile_name,
     )
-    errors = list(preflight_errors)
-    results = []
-    stopped = bool(readiness_failures or preflight_errors)
-    retry_wait_seconds = 0.0
-    for index, entry in enumerate(entries):
-        outcome = _push_entry(
-            entry,
-            index,
-            input_dir,
-            generated_dir,
-            s3_client,
-            dry_run,
-            destination_client,
-            destinations.get(index, {}),
-            readiness_failures,
-            stopped,
-            retry_wait_seconds,
-            attempt_history,
-            journal,
-            errors,
-        )
-        results.append(outcome.result)
-        errors.extend(outcome.errors)
-        stopped = outcome.stopped
-        retry_wait_seconds = outcome.retry_wait_seconds
-        if outcome.verified_identity:
-            verified.append(outcome.verified_identity)
+    run = _prepare_push_run(upload_plan, settings)
+    _process_push_entries(run)
+    _finish_push_run(run)
+    return _build_push_report(run)
 
-    _write_legacy_rollback(rollback_path, dry_run, results, journal, errors)
-    _record_verified_batch(journal, dry_run, entries, verified, errors)
-    return _build_push_report(
-        dry_run, endpoint, region_name, profile_name, entries, role_counts, results, errors
+
+def _prepare_push_run(upload_plan, settings):
+    entries = _ordered_entries(upload_plan)
+    role_counts = dict(sorted(Counter(entry.role for entry in entries).items()))
+    attempt_history, prior_writes = _upload_history(settings.journal)
+    readiness_failures, destinations = _local_readiness(
+        entries, settings.input_dir, settings.generated_dir, settings.dry_run
+    )
+    run = _PushRun(
+        settings,
+        entries,
+        role_counts,
+        attempt_history,
+        prior_writes,
+        readiness_failures,
+        destinations,
+    )
+    preflight_errors, verified = _destination_readiness(run)
+    run.errors.extend(preflight_errors)
+    run.verified.extend(verified)
+    run.stopped = bool(readiness_failures or preflight_errors)
+    return run
+
+
+def _process_push_entries(run):
+    for index, entry in enumerate(run.entries):
+        outcome = _push_entry(run, entry, index)
+        run.results.append(outcome.result)
+        run.errors.extend(outcome.errors)
+        run.stopped = outcome.stopped
+        run.retry_wait_seconds = outcome.retry_wait_seconds
+        if outcome.verified_identity:
+            run.verified.append(outcome.verified_identity)
+
+
+def _finish_push_run(run):
+    settings = run.settings
+    _write_legacy_rollback(
+        settings.rollback_path, settings.dry_run, run.results, settings.journal, run.errors
+    )
+    _record_verified_batch(
+        settings.journal, settings.dry_run, run.entries, run.verified, run.errors
     )
 
 
@@ -287,23 +384,28 @@ def _ready_destination(source_path):
     }
 
 
-def _destination_readiness(
-    entries, destinations, client, dry_run, readiness_failures, prior_writes, journal
-):
+def _destination_readiness(run):
     errors = []
     verified = []
-    if not readiness_failures and client is not None:
-        for index, entry in enumerate(entries):
-            local = destinations[index]
+    settings = run.settings
+    if not run.readiness_failures and settings.destination_client is not None:
+        for index, entry in enumerate(run.entries):
+            local = run.destinations[index]
             if local['checksum'] is None or local['size_bytes'] is None:
                 continue
             found_errors, verified_item = _check_destination(
-                entry, local, client, prior_writes, journal
+                entry,
+                local,
+                settings.destination_client,
+                run.prior_writes,
+                settings.journal,
             )
             errors.extend(found_errors)
             if verified_item:
                 verified.append(verified_item)
-    elif not dry_run and client is None and not readiness_failures:
+    elif (
+        not settings.dry_run and settings.destination_client is None and not run.readiness_failures
+    ):
         errors.append('Destination readiness failed: no read-only S3 client is available.')
     return errors, verified
 
@@ -421,73 +523,51 @@ def _failed_destination(evidence, local, exc):
     return result, [message], None
 
 
-def _push_entry(
-    entry,
-    index,
-    input_dir,
-    generated_dir,
-    s3_client,
-    dry_run,
-    destination_client,
-    destination,
-    readiness_failures,
-    stopped,
-    retry_wait_seconds,
-    attempt_history,
-    journal,
-    existing_errors,
-):
-    source_path = _resolve_upload_path(entry, input_dir, generated_dir)
+def _push_entry(run, entry, index):
+    target = _push_entry_context(run, entry, index)
+    result = _entry_result(run, target)
+    return _finish_push_entry(run, target, result)
+
+
+def _push_entry_context(run, entry, index):
+    settings = run.settings
+    source_path = _resolve_upload_path(entry, settings.input_dir, settings.generated_dir)
     source_label = (
-        str(source_path) if entry.generated and generated_dir is not None else entry.source_path
+        str(source_path)
+        if entry.generated and settings.generated_dir is not None
+        else entry.source_path
     )
-    entry_result = _entry_result(
-        entry,
-        index,
-        source_path,
-        source_label,
-        generated_dir,
-        s3_client,
-        dry_run,
-        destination_client,
-        destination,
-        readiness_failures,
-        stopped,
-        retry_wait_seconds,
-        attempt_history,
-        journal,
+    prior_attempts, prior_operation_id = run.attempt_history.get(
+        (entry.bucket, entry.key), (0, None)
     )
+    return _PushEntryContext(
+        entry=entry,
+        index=index,
+        source_path=source_path,
+        source_label=source_label,
+        destination=run.destinations.get(index, {}),
+        prior_attempts=prior_attempts,
+        prior_operation_id=prior_operation_id,
+        retry_wait_seconds=run.retry_wait_seconds,
+    )
+
+
+def _finish_push_entry(run, target, entry_result):
     if entry_result.retry_wait_seconds == 0:
-        entry_result.retry_wait_seconds = retry_wait_seconds
-    errors = []
-    if destination.get('status') == 'held':
-        errors.append(entry_result.result.message)
-    elif (
-        entry_result.result.status == 'failed'
-        and entry_result.result.message not in existing_errors
-    ):
-        errors.append(entry_result.result.message)
-    if journal and not entry_result.attempt_events_written:
-        journal.result(
-            entry_result.operation_id,
-            'push',
-            {
-                **entry.to_dict(),
-                **entry_result.result.to_dict(),
-                'remote_outcome': (
-                    'unknown' if entry_result.remote_unknown else entry_result.result.status
-                ),
-            },
-        )
+        entry_result.retry_wait_seconds = run.retry_wait_seconds
+    errors = _push_entry_errors(run, target, entry_result.result)
+    _record_push_entry_result(run, target, entry_result)
     verified_identity = None
-    if not dry_run and entry_result.result.status == 'uploaded':
+    stopped = run.stopped
+    settings = run.settings
+    if not settings.dry_run and entry_result.result.status == 'uploaded':
         verified_identity, verification_error = _verify_uploaded_entry(
-            entry, entry_result.result, s3_client, journal
+            target.entry, entry_result.result, settings.s3_client, settings.journal
         )
         if verification_error:
             errors.append('Upload verification failed: ' + verification_error)
             stopped = True
-    if not dry_run and entry_result.result.status in {
+    if not settings.dry_run and entry_result.result.status in {
         'missing_source',
         'missing_generated',
         'failed',
@@ -502,63 +582,61 @@ def _push_entry(
     )
 
 
-def _entry_result(
-    entry,
-    index,
-    source_path,
-    source_label,
-    generated_dir,
-    s3_client,
-    dry_run,
-    destination_client,
-    destination,
-    readiness_failures,
-    stopped,
-    retry_wait_seconds,
-    attempt_history,
-    journal,
-):
-    blocked = _blocked_entry_result(
-        entry, index, source_label, destination, readiness_failures, stopped
-    )
+def _push_entry_errors(run, target, result):
+    errors = []
+    if target.destination.get('status') == 'held':
+        errors.append(result.message)
+    elif result.status == 'failed' and result.message not in run.errors:
+        errors.append(result.message)
+    return errors
+
+
+def _record_push_entry_result(run, target, entry_result):
+    journal = run.settings.journal
+    if journal and not entry_result.attempt_events_written:
+        journal.result(
+            entry_result.operation_id,
+            'push',
+            {
+                **target.entry.to_dict(),
+                **entry_result.result.to_dict(),
+                'remote_outcome': (
+                    'unknown' if entry_result.remote_unknown else entry_result.result.status
+                ),
+            },
+        )
+
+
+def _entry_result(run, target):
+    blocked = _blocked_entry_result(run, target)
     if blocked is not None:
         return blocked
-    return _ready_entry_result(
-        entry,
-        source_path,
-        source_label,
-        generated_dir,
-        s3_client,
-        dry_run,
-        destination_client,
-        destination,
-        retry_wait_seconds,
-        attempt_history,
-        journal,
-    )
+    return _ready_entry_result(run, target)
 
 
-def _blocked_entry_result(entry, index, source_label, destination, readiness_failures, stopped):
-    if readiness_failures:
-        status, message = readiness_failures.get(
-            index, ('unattempted', 'Not attempted because batch upload readiness failed.')
+def _blocked_entry_result(run, target):
+    if run.readiness_failures:
+        status, message = run.readiness_failures.get(
+            target.index, ('unattempted', 'Not attempted because batch upload readiness failed.')
         )
-        return _make_entry_result(entry, source_label, status, message, 'held')
-    destination_status = destination.get('status')
+        return _make_entry_result(target, _PushResultDetails(status, message, 'held'))
+    destination_status = target.destination.get('status')
     if destination_status in {'unchanged', 'held', 'conflict', 'failed'}:
-        return _known_destination_result(entry, source_label, destination)
-    if stopped:
+        return _known_destination_result(target)
+    if run.stopped:
         return _make_entry_result(
-            entry,
-            source_label,
-            'unattempted',
-            'Not attempted because batch upload readiness failed.',
-            destination.get('classification', 'held'),
+            target,
+            _PushResultDetails(
+                'unattempted',
+                'Not attempted because batch upload readiness failed.',
+                target.destination.get('classification', 'held'),
+            ),
         )
     return None
 
 
-def _known_destination_result(entry, source_label, destination):
+def _known_destination_result(target):
+    destination = target.destination
     status = destination['status']
     message = destination.get('message', '')
     classification = 'held'
@@ -573,57 +651,39 @@ def _known_destination_result(entry, source_label, destination):
     elif status == 'failed':
         message = message or 'Destination readiness failed.'
     return _make_entry_result(
-        entry,
-        source_label,
-        status,
-        message,
-        classification,
-        checksum=destination.get('checksum'),
-        size_bytes=destination.get('size_bytes'),
-        previous_checksum=destination.get('previous_checksum'),
-        previous_checksum_type=destination.get('previous_checksum_type'),
-        observed_size_bytes=destination.get('observed_size_bytes'),
-        verification_method=destination.get('verification_method'),
+        target,
+        _PushResultDetails(
+            status=status,
+            message=message,
+            classification=classification,
+            checksum=destination.get('checksum'),
+            size_bytes=destination.get('size_bytes'),
+            previous_checksum=destination.get('previous_checksum'),
+            previous_checksum_type=destination.get('previous_checksum_type'),
+            observed_size_bytes=destination.get('observed_size_bytes'),
+            verification_method=destination.get('verification_method'),
+        ),
     )
 
 
-def _ready_entry_result(
-    entry,
-    source_path,
-    source_label,
-    generated_dir,
-    s3_client,
-    dry_run,
-    destination_client,
-    destination,
-    retry_wait_seconds,
-    attempt_history,
-    journal,
-):
+def _ready_entry_result(run, target):
+    settings = run.settings
     try:
-        status = _entry_status(entry, source_path, dry_run, generated_dir)
-        if status == 'would_upload':
-            checksum, size_bytes = _destination_identity(destination, source_path)
-        else:
-            checksum, size_bytes = None, None
-        upload = _upload_entry(
-            entry,
-            source_path,
-            source_label,
-            status,
-            checksum,
-            size_bytes,
-            s3_client,
-            dry_run,
-            destination_client,
-            destination,
-            retry_wait_seconds,
-            attempt_history,
-            journal,
+        target.status = _entry_status(
+            target.entry, target.source_path, settings.dry_run, settings.generated_dir
         )
-        return upload
+        if target.status == 'would_upload':
+            target.checksum, target.size_bytes = _destination_identity(
+                target.destination, target.source_path
+            )
+        else:
+            target.checksum, target.size_bytes = None, None
+        return _upload_entry(run, target)
     except STORAGE_ERRORS as exc:
-        return _make_entry_result(entry, source_label, 'failed', operation_error(exc), 'held')
+        return _make_entry_result(
+            target,
+            _PushResultDetails('failed', operation_error(exc), 'held'),
+        )
 
 
 def _destination_identity(destination, source_path):
@@ -636,105 +696,94 @@ def _destination_identity(destination, source_path):
     return checksum, size_bytes
 
 
-def _upload_entry(
-    entry,
-    source_path,
-    source_label,
-    status,
-    checksum,
-    size_bytes,
-    s3_client,
-    dry_run,
-    destination_client,
-    destination,
-    retry_wait_seconds,
-    attempt_history,
-    journal,
-):
-    operation_id = None
-    remote_unknown = False
-    attempt_events_written = False
-    classification = 'new'
-    if status == 'would_upload':
-        if not dry_run and size_bytes > MAX_SINGLE_PUT_BYTES:
+def _upload_entry(run, target):
+    settings = run.settings
+    target.classification = 'new'
+    if target.status == 'would_upload':
+        if not settings.dry_run and target.size_bytes > MAX_SINGLE_PUT_BYTES:
             raise OSError('Artifact exceeds conditional single-PUT limit.')
-        if not dry_run:
-            prior_attempts, prior_operation_id = attempt_history.get(
-                (entry.bucket, entry.key), (0, None)
-            )
-            status, message, operation_id, remote_unknown, retry_wait_seconds = (
-                _upload_with_retries(
-                    s3_client,
-                    source_path,
-                    entry,
-                    checksum,
-                    size_bytes,
-                    journal,
-                    retry_wait_seconds,
-                    prior_attempts,
-                    prior_operation_id,
-                )
-            )
-            attempt_events_written = journal is not None
-            classification = 'new' if status == 'uploaded' else 'held'
+        if not settings.dry_run:
+            _upload_entry_content(run, target)
         else:
-            message = _status_message(status)
+            target.message = _status_message(target.status)
     else:
-        message = _status_message(status)
-    if dry_run and destination_client is None and destination.get('status') == 'unchecked':
-        classification = 'held'
-        message = (
-            'Remote destinations were not checked; dry-run does not establish prior publication.'
-        )
-    if destination.get('status') == 'unchecked':
-        classification = destination.get('classification', 'held')
+        target.message = _status_message(target.status)
+    _classify_push_entry(run, target)
     return _PushEntryResult(
         result=_make_entry_result(
-            entry,
-            source_label,
-            status,
-            message,
-            classification,
-            checksum=checksum,
-            size_bytes=size_bytes,
+            target,
+            _PushResultDetails(
+                target.status,
+                target.message,
+                target.classification,
+                checksum=target.checksum,
+                size_bytes=target.size_bytes,
+            ),
         ).result,
-        operation_id=operation_id,
-        remote_unknown=remote_unknown,
-        attempt_events_written=attempt_events_written,
-        retry_wait_seconds=retry_wait_seconds,
+        operation_id=target.operation_id,
+        remote_unknown=target.remote_unknown,
+        attempt_events_written=target.attempt_events_written,
+        retry_wait_seconds=target.retry_wait_seconds,
     )
 
 
-def _make_entry_result(
-    entry,
-    source_label,
-    status,
-    message,
-    classification,
-    *,
-    checksum=None,
-    size_bytes=None,
-    previous_checksum=None,
-    previous_checksum_type=None,
-    observed_size_bytes=None,
-    verification_method=None,
-):
+def _upload_entry_content(run, target):
+    settings = run.settings
+    attempt = _UploadAttempt(
+        run,
+        target,
+        {
+            **target.entry.to_dict(),
+            'checksum': target.checksum,
+            'size_bytes': target.size_bytes,
+        },
+        run.retry_wait_seconds,
+        target.prior_operation_id,
+        target.prior_attempts,
+    )
+    (
+        target.status,
+        target.message,
+        target.operation_id,
+        target.remote_unknown,
+        target.retry_wait_seconds,
+    ) = _upload_with_retries(attempt)
+    target.attempt_events_written = settings.journal is not None
+    target.classification = 'new' if target.status == 'uploaded' else 'held'
+
+
+def _classify_push_entry(run, target):
+    settings = run.settings
+    if (
+        settings.dry_run
+        and settings.destination_client is None
+        and target.destination.get('status') == 'unchecked'
+    ):
+        target.classification = 'held'
+        target.message = (
+            'Remote destinations were not checked; dry-run does not establish prior publication.'
+        )
+    if target.destination.get('status') == 'unchecked':
+        target.classification = target.destination.get('classification', 'held')
+
+
+def _make_entry_result(target, details):
     return _PushEntryResult(
         result=PushResult(
-            role=entry.role,
-            source_path=source_label,
-            bucket=entry.bucket,
-            key=entry.key,
-            status=status,
-            checksum=checksum,
-            size_bytes=size_bytes,
-            message=message,
+            role=target.entry.role,
+            source_path=target.source_label,
+            bucket=target.entry.bucket,
+            key=target.entry.key,
+            status=details.status,
+            checksum=details.checksum,
+            size_bytes=details.size_bytes,
+            message=details.message,
             required=True,
-            classification=classification,
-            previous_checksum=previous_checksum,
-            previous_checksum_type=previous_checksum_type,
-            observed_size_bytes=observed_size_bytes,
-            verification_method=verification_method,
+            classification=details.classification,
+            previous_checksum=details.previous_checksum,
+            previous_checksum_type=details.previous_checksum_type,
+            observed_size_bytes=details.observed_size_bytes,
+            verification_method=details.verification_method,
         )
     )
 
@@ -800,17 +849,19 @@ def _record_verified_batch(journal, dry_run, entries, verified, errors):
     )
 
 
-def _build_push_report(dry_run, endpoint, region, profile, entries, role_counts, results, errors):
+def _build_push_report(run):
+    settings = run.settings
+    results = run.results
     return PushReport(
-        dry_run=dry_run,
-        endpoint_url=endpoint,
-        region=region,
-        profile=profile,
-        planned_count=len(entries),
+        dry_run=settings.dry_run,
+        endpoint_url=settings.endpoint,
+        region=settings.region,
+        profile=settings.profile,
+        planned_count=len(run.entries),
         source_backed_count=sum(
-            1 for entry in entries if entry.source_path and not entry.generated
+            1 for entry in run.entries if entry.source_path and not entry.generated
         ),
-        generated_count=sum(1 for entry in entries if entry.generated),
+        generated_count=sum(1 for entry in run.entries if entry.generated),
         missing_source_count=sum(1 for result in results if result.status == 'missing_source'),
         missing_generated_count=sum(
             1 for result in results if result.status == 'missing_generated'
@@ -819,9 +870,9 @@ def _build_push_report(dry_run, endpoint, region, profile, entries, role_counts,
         skipped_generated_count=sum(
             1 for result in results if result.status == 'skipped_generated'
         ),
-        role_counts=role_counts,
+        role_counts=run.role_counts,
         results=results,
-        errors=errors,
+        errors=run.errors,
     )
 
 
@@ -864,78 +915,55 @@ def _upload_history(journal):
     return history, prior_writes
 
 
-def _upload_with_retries(
-    client,
-    source_path,
-    entry,
-    checksum,
-    size_bytes,
-    journal,
-    retry_wait_seconds,
-    prior_attempts=0,
-    prior_operation_id=None,
-):
+def _upload_with_retries(context):
     """Perform bounded conditional uploads, reconciling every failed attempt."""
-    identity = {**entry.to_dict(), 'checksum': checksum, 'size_bytes': size_bytes}
-    operation_id = prior_operation_id
-    if retry_wait_seconds >= RUN_RETRY_WAIT_BUDGET_SECONDS:
-        return _retry_budget_exhausted(operation_id, retry_wait_seconds)
+    run = context.run
+    target = context.target
+    journal = run.settings.journal
+    if context.retry_wait_seconds >= RUN_RETRY_WAIT_BUDGET_SECONDS:
+        return _retry_budget_exhausted(context.operation_id, context.retry_wait_seconds)
     for attempt_in_invocation in range(1, UPLOAD_MAX_ATTEMPTS + 1):
-        attempt = prior_attempts + attempt_in_invocation
+        attempt = context.prior_attempts + attempt_in_invocation
         if journal:
-            operation_id = journal.intent(
-                'push', identity, operation_id=operation_id, attempt=attempt
+            context.operation_id = journal.intent(
+                'push', context.identity, operation_id=context.operation_id, attempt=attempt
             )
         try:
-            client.upload_file(source_path, entry.bucket, entry.key, checksum)
+            run.settings.s3_client.upload_file(
+                target.source_path,
+                target.entry.bucket,
+                target.entry.key,
+                target.checksum,
+            )
         except STORAGE_ERRORS as exc:
-            details = upload_error_details(exc)
-            reconciled = _reconcile_failed_upload(
-                client,
-                journal,
-                operation_id,
-                attempt,
-                entry,
-                identity,
-                checksum,
-                size_bytes,
-                exc,
-                details,
-            )
-            if reconciled is not None:
-                return reconciled + (retry_wait_seconds,)
-            terminal = _absent_upload_failure(
-                journal, operation_id, attempt, attempt_in_invocation, entry, identity, exc, details
-            )
+            terminal = _handle_failed_upload(context, attempt, attempt_in_invocation, exc)
             if terminal is not None:
-                return terminal + (retry_wait_seconds,)
-            retry_wait_seconds, terminal = _wait_before_upload_retry(
-                journal,
-                operation_id,
-                attempt,
-                entry,
-                identity,
-                details,
-                retry_wait_seconds,
-                UPLOAD_RETRY_BACKOFF_SECONDS[attempt_in_invocation - 1],
-            )
-            if terminal is not None:
-                return terminal + (retry_wait_seconds,)
+                return terminal + (context.retry_wait_seconds,)
         else:
-            return _record_upload_attempt(
-                journal,
-                operation_id,
-                attempt,
-                entry,
-                identity,
-                status='uploaded',
-                remote_outcome='written',
-                disposition='written',
-                message='Source file uploaded.',
-                reconciled=False,
-            ) + (retry_wait_seconds,)
+            result = _AttemptResult(
+                'uploaded',
+                'written',
+                'written',
+                'Source file uploaded.',
+                evidence={'reconciled': False},
+            )
+            return _record_upload_attempt(context, attempt, result) + (context.retry_wait_seconds,)
 
     raise AssertionError('bounded upload loop ended without a disposition')
+
+
+def _handle_failed_upload(context, attempt, attempt_in_invocation, exc):
+    details = upload_error_details(exc)
+    reconciled = _reconcile_failed_upload(context, attempt, exc, details)
+    if reconciled is not None:
+        return reconciled
+    terminal = _absent_upload_failure(context, attempt, attempt_in_invocation, exc, details)
+    if terminal is not None:
+        return terminal
+    context.retry_wait_seconds, terminal = _wait_before_upload_retry(
+        context, attempt, details, UPLOAD_RETRY_BACKOFF_SECONDS[attempt_in_invocation - 1]
+    )
+    return terminal
 
 
 def _retry_budget_exhausted(operation_id, retry_wait_seconds):
@@ -948,222 +976,195 @@ def _retry_budget_exhausted(operation_id, retry_wait_seconds):
     )
 
 
-def _reconcile_failed_upload(
-    client, journal, operation_id, attempt, entry, identity, checksum, size_bytes, exc, details
-):
+def _reconcile_failed_upload(context, attempt, exc, details):
+    settings = context.run.settings
+    target = context.target
+    client = settings.s3_client
     inspect = getattr(client, 'inspect_object', None)
     if not callable(inspect):
         return _record_upload_attempt(
-            journal,
-            operation_id,
+            context,
             attempt,
-            entry,
-            identity,
-            status='failed',
-            remote_outcome='unknown',
-            disposition='unknown',
-            message='Upload failed and the storage client cannot inspect the destination.',
-            error=details,
-            reconciled=False,
+            _AttemptResult(
+                'failed',
+                'unknown',
+                'unknown',
+                'Upload failed and the storage client cannot inspect the destination.',
+                error=details,
+                evidence={'reconciled': False},
+            ),
         )
     try:
-        observed = inspect(entry.bucket, entry.key)
+        observed = inspect(target.entry.bucket, target.entry.key)
     except STORAGE_ERRORS as head_error:
         return _record_upload_attempt(
-            journal,
-            operation_id,
+            context,
             attempt,
-            entry,
-            identity,
-            status='failed',
-            remote_outcome='unknown',
-            disposition='unknown',
-            message=operation_error(exc)
-            + ' Destination inspection failed; outcome remains unknown.',
-            error=details,
-            reconciliation_error_class=type(head_error).__name__,
-            reconciled=False,
+            _AttemptResult(
+                'failed',
+                'unknown',
+                'unknown',
+                operation_error(exc) + ' Destination inspection failed; outcome remains unknown.',
+                error=details,
+                evidence={
+                    'reconciliation_error_class': type(head_error).__name__,
+                    'reconciled': False,
+                },
+            ),
         )
     if observed is None:
         return None
-    return _record_observed_upload(
-        journal, operation_id, attempt, entry, identity, checksum, size_bytes, observed, details
-    )
+    return _record_observed_upload(context, attempt, observed, details)
 
 
-def _record_observed_upload(
-    journal, operation_id, attempt, entry, identity, checksum, size_bytes, observed, details
-):
+def _record_observed_upload(context, attempt, observed, details):
+    result = _observed_upload_result(context.target, observed, details)
+    return _record_upload_attempt(context, attempt, result)
+
+
+def _observed_upload_result(target, observed, details):
     observed_checksum = getattr(observed, 'checksum', None)
     observed_size = getattr(observed, 'size_bytes', None)
     observed_type = getattr(observed, 'checksum_type', None)
     matches = (
-        observed_checksum == checksum
-        and observed_size == size_bytes
+        observed_checksum == target.checksum
+        and observed_size == target.size_bytes
         and observed_type == 'FULL_OBJECT'
     )
     if matches:
-        return _record_upload_attempt(
-            journal,
-            operation_id,
-            attempt,
-            entry,
-            identity,
-            status='uploaded',
-            remote_outcome='written',
-            disposition='reconciled_written',
-            message='Upload was confirmed by destination checksum and size '
+        return _AttemptResult(
+            'uploaded',
+            'written',
+            'reconciled_written',
+            'Upload was confirmed by destination checksum and size '
             'after an unacknowledged response.',
             error=details,
-            observed_checksum=observed_checksum,
-            observed_size_bytes=observed_size,
-            checksum_type=observed_type,
-            reconciled=True,
+            evidence={
+                'observed_checksum': observed_checksum,
+                'observed_size_bytes': observed_size,
+                'checksum_type': observed_type,
+                'reconciled': True,
+            },
         )
-    return _record_upload_attempt(
-        journal,
-        operation_id,
-        attempt,
-        entry,
-        identity,
-        status='failed',
-        remote_outcome='conflict',
-        disposition='conflict',
-        message='Destination contains different or unverifiable content; batch stopped.',
+    return _AttemptResult(
+        'failed',
+        'conflict',
+        'conflict',
+        'Destination contains different or unverifiable content; batch stopped.',
         error=details,
-        observed_checksum=observed_checksum,
-        observed_size_bytes=observed_size,
-        checksum_type=observed_type,
-        reconciled=False,
+        evidence={
+            'observed_checksum': observed_checksum,
+            'observed_size_bytes': observed_size,
+            'checksum_type': observed_type,
+            'reconciled': False,
+        },
     )
 
 
-def _absent_upload_failure(
-    journal, operation_id, attempt, attempt_in_invocation, entry, identity, exc, details
-):
+def _absent_upload_failure(context, attempt, attempt_in_invocation, exc, details):
     if not details['retryable']:
         return _record_upload_attempt(
-            journal,
-            operation_id,
+            context,
             attempt,
-            entry,
-            identity,
-            status='failed',
-            remote_outcome='absent',
-            disposition='not_retryable',
-            message=operation_error(exc) + ' Destination is absent; this error is not retryable.',
-            error=details,
-            reconciled=False,
+            _AttemptResult(
+                'failed',
+                'absent',
+                'not_retryable',
+                operation_error(exc) + ' Destination is absent; this error is not retryable.',
+                error=details,
+                evidence={'reconciled': False},
+            ),
         )
     if attempt_in_invocation >= UPLOAD_MAX_ATTEMPTS:
         return _record_upload_attempt(
-            journal,
-            operation_id,
+            context,
             attempt,
-            entry,
-            identity,
-            status='failed',
-            remote_outcome='absent',
-            disposition='retries_exhausted',
-            message=f'Transient upload attempts exhausted after '
-            f'{_error_label(details)}; destination is confirmed absent.',
-            error=details,
-            reconciled=False,
+            _AttemptResult(
+                'failed',
+                'absent',
+                'retries_exhausted',
+                f'Transient upload attempts exhausted after '
+                f'{_error_label(details)}; destination is confirmed absent.',
+                error=details,
+                evidence={'reconciled': False},
+            ),
         )
     return None
 
 
-def _wait_before_upload_retry(
-    journal, operation_id, attempt, entry, identity, details, retry_wait_seconds, backoff
-):
-    remaining = RUN_RETRY_WAIT_BUDGET_SECONDS - retry_wait_seconds
+def _wait_before_upload_retry(context, attempt, details, backoff):
+    remaining = RUN_RETRY_WAIT_BUDGET_SECONDS - context.retry_wait_seconds
     if remaining <= 0:
-        return retry_wait_seconds, _retry_wait_exhausted(
-            journal, operation_id, attempt, entry, identity, details
-        )
+        return context.retry_wait_seconds, _retry_wait_exhausted(context, attempt, details)
     delay = min(random.uniform(0, backoff), remaining)
     started_wait = time.monotonic()
     time.sleep(delay)
     elapsed_wait = max(delay, time.monotonic() - started_wait)
-    retry_wait_seconds += elapsed_wait
-    if retry_wait_seconds >= RUN_RETRY_WAIT_BUDGET_SECONDS:
-        return retry_wait_seconds, _retry_wait_exhausted(
-            journal,
-            operation_id,
-            attempt,
-            entry,
-            identity,
-            details,
-            actual_retry_wait_seconds=elapsed_wait,
+    context.retry_wait_seconds += elapsed_wait
+    if context.retry_wait_seconds >= RUN_RETRY_WAIT_BUDGET_SECONDS:
+        return context.retry_wait_seconds, _retry_wait_exhausted(
+            context, attempt, details, actual_retry_wait_seconds=elapsed_wait
         )
     _record_upload_attempt(
-        journal,
-        operation_id,
+        context,
         attempt,
-        entry,
-        identity,
-        status='failed',
-        remote_outcome='absent',
-        disposition='retrying',
-        message='Transient upload failure; destination is confirmed absent before retry.',
-        error=details,
-        delay_before_next_attempt=elapsed_wait,
-        actual_retry_wait_seconds=elapsed_wait,
-        reconciled=False,
+        _AttemptResult(
+            'failed',
+            'absent',
+            'retrying',
+            'Transient upload failure; destination is confirmed absent before retry.',
+            error=details,
+            evidence={
+                'delay_before_next_attempt': elapsed_wait,
+                'actual_retry_wait_seconds': elapsed_wait,
+                'reconciled': False,
+            },
+        ),
     )
-    return retry_wait_seconds, None
+    return context.retry_wait_seconds, None
 
 
-def _retry_wait_exhausted(journal, operation_id, attempt, entry, identity, details, **evidence):
+def _retry_wait_exhausted(context, attempt, details, **evidence):
     return _record_upload_attempt(
-        journal,
-        operation_id,
+        context,
         attempt,
-        entry,
-        identity,
-        status='failed',
-        remote_outcome='absent',
-        disposition='retries_exhausted',
-        message=f'Invocation retry wait budget exhausted after '
-        f'{_error_label(details)}; destination is confirmed absent.',
-        error=details,
-        reconciled=False,
-        **evidence,
+        _AttemptResult(
+            'failed',
+            'absent',
+            'retries_exhausted',
+            f'Invocation retry wait budget exhausted after '
+            f'{_error_label(details)}; destination is confirmed absent.',
+            error=details,
+            evidence={'reconciled': False, **evidence},
+        ),
     )
 
 
-def _record_upload_attempt(
-    journal,
-    operation_id,
-    attempt,
-    entry,
-    identity,
-    *,
-    status,
-    remote_outcome,
-    disposition,
-    message,
-    error=None,
-    **evidence,
-):
-    details = error or {}
+def _record_upload_attempt(context, attempt, result):
+    details = result.error or {}
     event = {
-        **entry.to_dict(),
-        **identity,
-        'status': status,
-        'classification': 'new' if status == 'uploaded' else 'held',
-        'remote_outcome': remote_outcome,
-        'disposition': disposition,
-        'message': message,
+        **context.target.entry.to_dict(),
+        **context.identity,
+        'status': result.status,
+        'classification': 'new' if result.status == 'uploaded' else 'held',
+        'remote_outcome': result.remote_outcome,
+        'disposition': result.disposition,
+        'message': result.message,
         'error_class': details.get('error_class'),
         'error_code': details.get('error_code'),
         'http_status': details.get('http_status'),
         'delay_before_next_attempt': None,
-        **evidence,
+        **result.evidence,
     }
+    journal = context.run.settings.journal
     if journal:
-        journal.result(operation_id, 'push', event, attempt=attempt)
-    return status, message, operation_id, remote_outcome == 'unknown'
+        journal.result(context.operation_id, 'push', event, attempt=attempt)
+    return (
+        result.status,
+        result.message,
+        context.operation_id,
+        result.remote_outcome == 'unknown',
+    )
 
 
 def _error_label(details):
