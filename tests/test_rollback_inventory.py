@@ -8,8 +8,8 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
+from claim_aware_journal import ClaimAwareRunJournal as RunJournal
 from workbench_lite.models import UploadPlanEntry
-from workbench_lite.runs import RunJournal
 from workbench_lite.rollback_inventory import build_inventory
 from cli_test_runner import main
 

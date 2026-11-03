@@ -1010,6 +1010,73 @@ class InterleavedIdClaimTests(unittest.TestCase):
         self.assertEqual(inspected['claim_counts']['unsettled'], 1)
         self.assertFalse(_valid_publication_receipt(run_path, events, receipt))
 
+    def test_invalid_expected_claims_make_inventory_error_and_refuse_rollback(self):
+        for case in ('empty', 'altered_expected'):
+            with self.subTest(expected_claims=case):
+                prefix = f'invalid-claim-rollback-{case}'
+                config, run_path = self._published_claim_run(prefix)
+                self._mutate_claim_journal(run_path, case)
+                content_before = self.store.listing(TEST_PUBLIC_BUCKET, f'{prefix}/')
+
+                inventory = self.invoke('rollback-inventory', run_path, '--format', 'json')
+                self._assert_invalid_claim_inventory(inventory)
+                rollback = self.invoke(*self._rollback_execute_arguments(config, run_path))
+
+                self.assertEqual(rollback['exit'], 1, rollback['stdout'] + rollback['stderr'])
+                self.assertEqual(self.store.delete_calls, [])
+                self.assertEqual(
+                    self.store.listing(TEST_PUBLIC_BUCKET, f'{prefix}/'), content_before
+                )
+
+    def test_valid_settled_claim_conflict_remains_rollback_eligible(self):
+        prefix = 'settled-claim-conflict'
+        config, run_path = self._published_claim_run(prefix)
+        self._mutate_claim_journal(run_path, 'conflict')
+
+        inventory = self.invoke('rollback-inventory', run_path, '--format', 'json')
+        self.assertEqual(inventory['exit'], 0, inventory['stdout'] + inventory['stderr'])
+        self.assertEqual(inventory['payload']['state'], 'reviewable')
+        self.assertEqual(inventory['payload']['claim_counts']['conflict'], 1)
+        self.assertEqual(inventory['payload']['claim_counts']['unsettled'], 0)
+
+        rollback = self.invoke(*self._rollback_execute_arguments(config, run_path))
+
+        self.assertEqual(rollback['exit'], 0, rollback['stdout'] + rollback['stderr'])
+        self.assertTrue(self.store.delete_calls)
+        self.assertTrue(self.claim_keys(prefix=prefix))
+
+    def _published_claim_run(self, prefix):
+        config = self.package(prefix, parent_ids=('alpha', 'beta'), prefix=prefix)
+        output = self.generate(config, f'{prefix}-generated')
+        pushed = self.push(config, output, name=f'{prefix}-runs')
+        self.assertEqual(pushed['exit'], 0, pushed['stdout'] + pushed['stderr'])
+        return config, self.run_path(output)
+
+    @staticmethod
+    def _rollback_execute_arguments(config, run_path):
+        return (
+            'rollback',
+            run_path,
+            '--config',
+            config,
+            '--endpoint-url',
+            TEST_ENDPOINT,
+            '--region',
+            'us-east-1',
+            '--execute',
+            '--confirm',
+            run_path.name,
+            '--format',
+            'json',
+        )
+
+    def _assert_invalid_claim_inventory(self, inventory):
+        self.assertEqual(inventory['exit'], 1, inventory['stdout'] + inventory['stderr'])
+        self.assertEqual(inventory['payload']['state'], 'invalid_evidence')
+        self.assertTrue(
+            any('claim' in error.lower() for error in inventory['payload']['evidence_errors'])
+        )
+
     def _mutate_claim_journal(self, run_path, case):
         events, error = read_events(run_path)
         self.assertIsNone(error)
