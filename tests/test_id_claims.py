@@ -1175,8 +1175,9 @@ class InterleavedIdClaimTests(unittest.TestCase):
         claims_before = self.claim_keys(prefix=prefix)
         self.assertEqual(inventory['exit'], 0, inventory['stdout'] + inventory['stderr'])
         self.assertEqual(inventory['payload']['state'], 'reviewable')
+        delete_start = len(self.store.delete_calls)
         rollback = self.invoke(*self._rollback_execute_arguments(config, run_path))
-        deleted = {(bucket, key) for bucket, key, _ in self.store.delete_calls}
+        deleted = {(bucket, key) for bucket, key, _ in self.store.delete_calls[delete_start:]}
         self.assertEqual(rollback['exit'], 0, rollback['stdout'] + rollback['stderr'])
         self.assertEqual(deleted, keys)
         self.assertEqual(self.claim_keys(prefix=prefix), claims_before)
