@@ -119,6 +119,19 @@ class CanonicalIdCheckTests(unittest.TestCase):
         for value in ('é', 'e\u0301'):
             self.assertIn(value, errors)
 
+    def test_check_refuses_equivalent_parent_and_page_ids(self):
+        rows = (
+            ('Parent ABC', 'ABC', 'Paged Content', '', '', 'parent-a.pdf'),
+            ('Parent B', 'parent-b', 'Paged Content', '', '', 'parent-b.pdf'),
+            ('Page abc', 'abc', 'Page', 'parent-b', 1, 'page-b.tif'),
+        )
+        code, payload = self.check_rows(rows, 'parent-page-collision-runs')
+
+        self.assertEqual(code, 3, payload)
+        errors = '\n'.join(payload['validation_errors'])
+        self.assertIn('ABC', errors)
+        self.assertIn('abc', errors)
+
 
 if __name__ == '__main__':
     unittest.main()
