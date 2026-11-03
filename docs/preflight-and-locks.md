@@ -28,6 +28,14 @@ Push now performs bounded read-only preflight by default for both dry-run and ex
 
 Only the preflight client uses five-second connect/read timeouts and one total SDK attempt. Execute creates a separate upload client after successful preflight with 10-second connect and 60-second read timeouts and one total SDK attempt. Application retries are limited to three attempts per entry and a five-minute run-wide wait budget; see [publication holds](publication-holds.md) for retry classification and reconciliation behavior. Dry runs create no upload client. No PutObject probe, delete, ACL update or other remote mutation is used to test permissions. Bucket access checks do not prove PutObject permission or authorize replacement. Before execute, every planned key is checked: matching existing content is verified by SHA-256 and size then skipped; changed content is rejected; a differing manifest is held for review. New writes use conditional creation. See [publication holds](publication-holds.md).
 
+After local readiness and all existing destination blockers pass, push reads the claim key for
+each validated object and page ID in canonical order from the private bucket at
+`{s3_prefix}/_ids/`. A claim conflict prevents every write and returns 3. Execute conditionally
+creates only missing claims, verifies each acknowledged claim with one checksum-enabled HEAD,
+then begins content uploads. A read or write failure returns 1 and holds the batch. Online
+dry-run performs only the claim reads; offline dry-run reports the claim check as `not_run`.
+Claims share the destination locks with content and remain outside the content upload plan.
+
 For explicitly local checks without credentials or network access:
 
 ```sh

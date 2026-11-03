@@ -18,6 +18,7 @@ from .retry_policy import (
     upload_error_details,
 )
 from .runs import read_events
+from .id_claims import check_id_claims
 
 # The SDK remains optional for checks and local generation.
 try:
@@ -94,6 +95,8 @@ class PushReport:
     role_counts: Dict[str, int]
     results: List[PushResult] = field(default_factory=list)
     errors: List[str] = field(default_factory=list)
+    claim_check: Optional[dict] = None
+    refusal_code: int = 0
 
     @property
     def failed_count(self) -> int:
@@ -191,6 +194,8 @@ class _PushRun:
     verified: list = field(default_factory=list)
     stopped: bool = False
     retry_wait_seconds: float = 0.0
+    claim_check: Optional[dict] = None
+    refusal_code: int = 0
 
 
 @dataclass
@@ -258,6 +263,7 @@ def push_upload_plan(
     rollback_path: Optional[Path] = None,
     journal=None,
     preflight_client=None,
+    id_claims=None,
 ) -> PushReport:
     if not dry_run and s3_client is None:
         raise ValueError('Execute requires an upload client.')
@@ -276,9 +282,29 @@ def push_upload_plan(
         profile_name,
     )
     run = _prepare_push_run(upload_plan, settings)
+    _check_push_claims(run, id_claims)
     _process_push_entries(run)
     _finish_push_run(run)
     return _build_push_report(run)
+
+
+def _check_push_claims(run, claims):
+    if claims is None:
+        return
+    if run.stopped:
+        run.claim_check = {'status': 'skipped', 'expected_count': len(claims)}
+        return
+    result = check_id_claims(
+        claims,
+        run.settings.destination_client,
+        run.settings.s3_client,
+        run.settings.journal,
+        dry_run=run.settings.dry_run,
+    )
+    run.claim_check = result.to_dict()
+    run.errors.extend(result.errors)
+    run.refusal_code = result.refusal_code
+    run.stopped = bool(result.refusal_code)
 
 
 def _prepare_push_run(upload_plan, settings):
@@ -873,6 +899,8 @@ def _build_push_report(run):
         role_counts=run.role_counts,
         results=results,
         errors=run.errors,
+        claim_check=run.claim_check,
+        refusal_code=run.refusal_code,
     )
 
 

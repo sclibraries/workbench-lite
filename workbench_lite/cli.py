@@ -31,6 +31,7 @@ from .preflight import output_readiness, storage_readiness
 from .rollback_inventory import build_inventory, write_inventory
 from .rollback import run_rollback
 from .storage_plan import DEFAULT_PRIVATE_BUCKET, DEFAULT_PUBLIC_BUCKET
+from .id_claims import build_id_claims, reconcile_claim
 
 
 def main(argv=None, *, lock_factory=WriterLocks) -> int:
@@ -404,41 +405,9 @@ def _run_rollback_command(args, lock_factory) -> int:
 def _run_reconcile_command(args, lock_factory) -> int:
     path = args.path.resolve()
     locks = lock_factory()
-    journal = None
     code = 1
     try:
-        locks.acquire('run:' + str(path))
-        journal = RunJournal.open(path)
-        plan = json.loads((path / 'upload-plan.json').read_text())['entries']
-        storage = _recorded_storage(journal.path)
-        endpoint = storage.get('effective_endpoint_url') or storage.get('configured_endpoint_url')
-        region = storage.get('effective_region') or storage.get('configured_region')
-        if not endpoint:
-            raise JournalError('Run has no recorded S3 endpoint for safe reconciliation.')
-        lock_destination(
-            locks, endpoint.rstrip('/').lower(), [SimpleNamespace(**entry) for entry in plan]
-        )
-        profile = storage.get('configured_profile')
-        if profile == 'default':
-            profile = None
-        client = create_s3_client(endpoint, region, profile, preflight=True)
-        journal.start('reconcile')
-        unknown, conflicts = _reconcile_pending(journal, client)
-        code = 1 if unknown else 0
-        journal.finish(code)
-        inventory = write_inventory(path)
-        payload = {
-            'run_id': path.name,
-            'unknown_count': unknown,
-            'conflict_count': conflicts,
-            'inventory_state': inventory['state'],
-        }
-        print(
-            json.dumps(sanitize(payload), indent=2)
-            if args.format == 'json'
-            else f'Run: {path}\nUnknown outcomes: {unknown}\nConflicts: {conflicts}\n'
-            f'Rollback inventory: {inventory["state"]}'
-        )
+        code = _reconcile_run(path, args, locks)
     except STORAGE_ERRORS as exc:
         _print_error(args, operation_error(exc))
         code = 1
@@ -452,6 +421,44 @@ def _run_reconcile_command(args, lock_factory) -> int:
             _print_error(args, str(exc))
             code = 1
     return code
+
+
+def _reconcile_run(path, args, locks):
+    locks.acquire('run:' + str(path))
+    journal = RunJournal.open(path)
+    plan = json.loads((path / 'upload-plan.json').read_text())['entries']
+    storage = _recorded_storage(journal.path)
+    endpoint = storage.get('effective_endpoint_url') or storage.get('configured_endpoint_url')
+    region = storage.get('effective_region') or storage.get('configured_region')
+    if not endpoint:
+        raise JournalError('Run has no recorded S3 endpoint for safe reconciliation.')
+    lock_entries = [SimpleNamespace(**entry) for entry in plan]
+    lock_destination(locks, endpoint.rstrip('/').lower(), lock_entries)
+    profile = storage.get('configured_profile')
+    client = create_s3_client(
+        endpoint, region, None if profile == 'default' else profile, preflight=True
+    )
+    journal.start('reconcile')
+    unknown, conflicts, _ = _reconcile_pending(journal, client)
+    code = 1 if unknown else 0
+    journal.finish(code)
+    inventory = write_inventory(path)
+    _print_reconcile_result(path, args.format, unknown, conflicts, inventory['state'])
+    return code
+
+
+def _print_reconcile_result(path, output_format, unknown, conflicts, inventory_state):
+    payload = {
+        'run_id': path.name,
+        'unknown_count': unknown,
+        'conflict_count': conflicts,
+        'inventory_state': inventory_state,
+    }
+    text = (
+        f'Run: {path}\nUnknown outcomes: {unknown}\nConflicts: {conflicts}\n'
+        f'Rollback inventory: {inventory_state}'
+    )
+    print(json.dumps(sanitize(payload), indent=2) if output_format == 'json' else text)
 
 
 def _recorded_storage(run_path):
@@ -474,97 +481,89 @@ def _recorded_storage(run_path):
 
 
 def _reconcile_pending(journal, client):
-    summary = inspect_run(journal.path)
-    unknown_count = 0
-    conflict_count = 0
-    for pending in summary['unknown_operations']:
-        bucket, key = pending.get('bucket'), pending.get('key')
-        checksum, size = pending.get('checksum'), pending.get('size_bytes')
-        common = {
-            'bucket': bucket,
-            'key': key,
-            'role': pending.get('role'),
-            'object_id': pending.get('object_id'),
-            'page_id': pending.get('page_id'),
-            'checksum': checksum,
-            'size_bytes': size,
-            'reconciliation_stage': 'reconcile',
+    pending = inspect_run(journal.path)['unknown_operations']
+    outcomes = [_reconcile_operation(journal, client, item) for item in pending]
+    return tuple(sum(outcome[index] for outcome in outcomes) for index in range(3))
+
+
+def _reconcile_operation(journal, client, pending):
+    if pending.get('stage') == 'claim':
+        unknown, conflict = _reconcile_claim(journal, client, pending)
+        return unknown, conflict, conflict
+    unknown, conflict = _reconcile_content(journal, client, pending)
+    return unknown, conflict, 0
+
+
+def _reconcile_content(journal, client, pending):
+    common = _content_reconciliation_identity(pending)
+    try:
+        observed = client.inspect_object(common['bucket'], common['key'])
+    except STORAGE_ERRORS as exc:
+        _record_content_reconciliation(journal, pending, common, 'unknown', 'unknown', exc)
+        return 1, 0
+    if observed is None:
+        _record_content_reconciliation(journal, pending, common, 'absent', 'absent')
+        return 0, 0
+    return _record_observed_content(journal, pending, common, observed)
+
+
+def _content_reconciliation_identity(pending):
+    return {
+        key: pending.get(key)
+        for key in ('bucket', 'key', 'role', 'object_id', 'page_id', 'checksum', 'size_bytes')
+    } | {'reconciliation_stage': 'reconcile'}
+
+
+def _record_observed_content(journal, pending, common, observed):
+    observed_checksum = getattr(observed, 'checksum', None)
+    observed_size = getattr(observed, 'size_bytes', None)
+    observed_type = getattr(observed, 'checksum_type', None)
+    matches = (
+        isinstance(common['checksum'], str)
+        and isinstance(common['size_bytes'], int)
+        and observed_checksum == common['checksum']
+        and observed_size == common['size_bytes']
+        and observed_type == 'FULL_OBJECT'
+    )
+    status = 'confirmed' if matches else 'conflict'
+    outcome = 'written' if matches else 'conflict'
+    _record_content_reconciliation(journal, pending, common, status, outcome, observed)
+    return 0, int(not matches)
+
+
+def _record_content_reconciliation(journal, pending, common, status, outcome, details=None):
+    fields = {
+        **common,
+        'status': status,
+        'remote_outcome': outcome,
+        'disposition': 'reconciled_written' if outcome == 'written' else outcome,
+        'reconciled': not isinstance(details, Exception),
+    }
+    if isinstance(details, Exception):
+        fields.update(reconciliation_error_class=type(details).__name__)
+    elif details is not None:
+        fields.update(
+            observed_checksum=getattr(details, 'checksum', None),
+            observed_size_bytes=getattr(details, 'size_bytes', None),
+            checksum_type=getattr(details, 'checksum_type', None),
+        )
+    journal.result(pending['operation_id'], 'push', fields, attempt=pending.get('attempt', 1))
+
+
+def _reconcile_claim(journal, client, pending):
+    identity = {key: pending.get(key) for key in ('bucket', 'key', 'checksum', 'size_bytes')}
+    try:
+        result = reconcile_claim(client, identity)
+    except STORAGE_ERRORS as exc:
+        result = {
+            **identity,
+            'status': 'unknown',
+            'remote_outcome': 'unknown',
+            'reconciled': False,
+            'reconciliation_error_class': type(exc).__name__,
         }
-        try:
-            observed = client.inspect_object(bucket, key)
-        except STORAGE_ERRORS as exc:
-            journal.result(
-                pending['operation_id'],
-                'push',
-                {
-                    **common,
-                    'status': 'unknown',
-                    'remote_outcome': 'unknown',
-                    'disposition': 'unknown',
-                    'reconciled': False,
-                    'reconciliation_error_class': type(exc).__name__,
-                },
-                attempt=pending.get('attempt', 1),
-            )
-            unknown_count += 1
-            continue
-        if observed is None:
-            journal.result(
-                pending['operation_id'],
-                'push',
-                {
-                    **common,
-                    'status': 'absent',
-                    'remote_outcome': 'absent',
-                    'disposition': 'absent',
-                    'reconciled': True,
-                },
-                attempt=pending.get('attempt', 1),
-            )
-        else:
-            observed_checksum = getattr(observed, 'checksum', None)
-            observed_size = getattr(observed, 'size_bytes', None)
-            observed_type = getattr(observed, 'checksum_type', None)
-            if (
-                isinstance(checksum, str)
-                and isinstance(size, int)
-                and observed_checksum == checksum
-                and observed_size == size
-                and observed_type == 'FULL_OBJECT'
-            ):
-                journal.result(
-                    pending['operation_id'],
-                    'push',
-                    {
-                        **common,
-                        'status': 'confirmed',
-                        'remote_outcome': 'written',
-                        'disposition': 'reconciled_written',
-                        'reconciled': True,
-                        'observed_checksum': observed_checksum,
-                        'observed_size_bytes': observed_size,
-                        'checksum_type': observed_type,
-                    },
-                    attempt=pending.get('attempt', 1),
-                )
-            else:
-                journal.result(
-                    pending['operation_id'],
-                    'push',
-                    {
-                        **common,
-                        'status': 'conflict',
-                        'remote_outcome': 'conflict',
-                        'disposition': 'conflict',
-                        'reconciled': True,
-                        'observed_checksum': observed_checksum,
-                        'observed_size_bytes': observed_size,
-                        'checksum_type': observed_type,
-                    },
-                    attempt=pending.get('attempt', 1),
-                )
-                conflict_count += 1
-    return unknown_count, conflict_count
+    journal.result(pending['operation_id'], 'claim', result, attempt=pending.get('attempt', 1))
+    return int(result['status'] == 'unknown'), int(result['status'] == 'conflict')
 
 
 def _print_rollback_report(report, output_format):
@@ -844,7 +843,12 @@ def _run_push(args, parser):
         _print_check(check_report, args.format, args.journal)
         return 3
     _validate_generated_push(args, parser, check_report.upload_plan)
+    return _run_validated_push(args, check_report)
+
+
+def _run_validated_push(args, check_report):
     config = load_config(args.config)
+    id_claims = build_id_claims(check_report.objects, config, args.config)
     input_dir = _resolve_input_dir(args.config, config)
     dry_run = not args.execute
     local = _push_local_readiness(args, check_report.upload_plan, input_dir)
@@ -852,16 +856,25 @@ def _run_push(args, parser):
         _print_preflight(args)
         return 1
     _prepare_generated_push(args, check_report.upload_plan)
+    return _run_push_with_storage(args, check_report, input_dir, dry_run, id_claims)
+
+
+def _run_push_with_storage(args, check_report, input_dir, dry_run, id_claims):
     preflight_client = _push_preflight_client(args)
     sdk_meta = getattr(getattr(preflight_client, 'client', None), 'meta', None)
     _lock_push_destination(args, check_report.upload_plan, sdk_meta, dry_run)
     _record_push_storage_context(args, sdk_meta)
-    if not _reconcile_push_resume(args, preflight_client):
-        return 1
+    resume_code = _reconcile_push_resume(args, preflight_client)
+    if resume_code:
+        return resume_code
     remote = _push_storage_readiness(args, check_report.upload_plan, preflight_client, sdk_meta)
     if remote['errors']:
         _print_preflight(args)
         return 1
+    return _execute_push(args, check_report, input_dir, dry_run, id_claims, preflight_client)
+
+
+def _execute_push(args, check_report, input_dir, dry_run, id_claims, preflight_client):
     s3_client = _push_client(args, dry_run)
     push_report = push_upload_plan(
         check_report.upload_plan,
@@ -875,9 +888,11 @@ def _run_push(args, parser):
         rollback_path=None,
         journal=args.journal,
         preflight_client=preflight_client,
+        id_claims=id_claims,
     )
+    args.preflight['claim_check'] = push_report.claim_check
     _print_push_result(args, push_report)
-    return 1 if push_report.has_errors else 0
+    return push_report.refusal_code or (1 if push_report.has_errors else 0)
 
 
 def _validate_generated_push(args, parser, upload_plan):
@@ -977,14 +992,14 @@ def _record_push_storage_context(args, sdk_meta):
 
 def _reconcile_push_resume(args, preflight_client):
     if not args.resume:
-        return True
-    unknown, conflicts = _reconcile_pending(args.journal, preflight_client)
+        return 0
+    unknown, conflicts, claim_conflicts = _reconcile_pending(args.journal, preflight_client)
     if not unknown and not conflicts:
-        return True
+        return 0
     _print_error(
         args, 'Resume stopped because reconciliation found an unknown outcome or conflict.'
     )
-    return False
+    return 3 if claim_conflicts else 1
 
 
 def _push_storage_readiness(args, upload_plan, preflight_client, sdk_meta):

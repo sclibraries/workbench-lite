@@ -15,6 +15,8 @@ outcomes, previously published objects reused by checksum, manifest replacement
 holds, local derivatives, and manifest URLs when a base URL was configured in
 YAML or passed to `generate --manifest-base-url`. These URLs follow the generated
 manifest `@id` and are listed only for confirmed uploads.
+It also reports `claim_counts` and `retained_claims`; claims are durable registry
+records, not upload-plan entries or rollback candidates.
 Older generated folders may have no recorded generate stage. For those
 older test outputs, a command-line-only base URL cannot be reconstructed from
 the journal; the inventory lists no manifest URL unless YAML supplies one.
@@ -60,6 +62,15 @@ result for each unknown operation without changing prior journal records. It use
 HEAD only and does not write or delete S3 objects. After all outcomes are resolved,
 the inventory no longer reports `needs_reconciliation`; conflicts remain excluded
 from `new_keys` and are listed separately.
+
+ID claims are recorded separately from planned content. `retained_claims` lists claims
+confirmed as `created` or `matched` and unsettled claims as `unknown` or `unsettled`;
+`claim_counts` also reports absent and conflicting claims. A claim is never included in
+`new_keys` and rollback never deletes it. If an execute run created claims but a later
+claim conflict stopped content uploads, its reviewable inventory may have no `new_keys`:
+preview reports zero deletions, and confirmed execute completes with nothing deleted.
+This empty-scope exception applies only when the inventory shows a claim created by that
+run. Unknown claim operations still require reconciliation and block rollback.
 
 ```sh
 workbench-lite reconcile workbench-lite-runs/RUN_ID

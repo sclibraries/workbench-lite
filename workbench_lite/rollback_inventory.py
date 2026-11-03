@@ -430,6 +430,7 @@ def _inventory_state(state):
 
 def _inventory_document(document):
     inputs = document.inputs
+    retained_claims, claim_counts = _claim_inventory(inputs.stage.events)
     return {
         'schema_version': INVENTORY_VERSION,
         'kind': 'rollback-inventory',
@@ -443,12 +444,101 @@ def _inventory_document(document):
         'planned': inputs.plan,
         'operations': document.operations,
         'pending_operations': _pending_operation_summaries(document.unresolved),
+        'claim_counts': claim_counts,
+        'retained_claims': retained_claims,
         **document.key_groups,
         'local_derivatives': document.derivatives,
         'manifest_urls': document.manifest_urls,
         'aspace': {'changes': [], 'previous_values': [], 'status': 'deferred-to-reviewed-csv'},
         'evidence_errors': _inventory_errors(inputs.errors),
     }
+
+
+def _claim_identity(event):
+    return (
+        event.get('bucket'),
+        event.get('key'),
+        event.get('checksum'),
+        event.get('size_bytes'),
+    )
+
+
+def _claim_inventory(events):
+    expected = _expected_claims(events)
+    intents, results = _claim_operations(events)
+    retained = []
+    counts = _claim_counts(expected, intents, results)
+    for identity in expected:
+        status = _claim_operation_status(intents.get(identity, []), results)
+        if status in {'created', 'matched', 'unknown', 'unsettled'}:
+            retained.append(_retained_claim(identity, status))
+    return sorted(retained, key=lambda claim: claim['key']), counts
+
+
+def _expected_claims(events):
+    expected = set()
+    for event in events:
+        if event['kind'] == 'context' and event.get('stage') == 'claim':
+            claims = event.get('expected_claims')
+            if isinstance(claims, list):
+                expected.update(_claim_identity(item) for item in claims if isinstance(item, dict))
+    return expected
+
+
+def _claim_operations(events):
+    intents = {}
+    results = {}
+    for event in events:
+        if event.get('stage') != 'claim':
+            continue
+        if event['kind'] == 'intent':
+            intents.setdefault(_claim_identity(event), []).append(event)
+        elif event['kind'] == 'result':
+            results[event['operation_id']] = event
+    return intents, results
+
+
+def _claim_counts(expected, intents, results):
+    counts = {
+        status: 0
+        for status in (
+            'expected',
+            'created',
+            'matched',
+            'absent',
+            'conflict',
+            'unknown',
+            'unsettled',
+        )
+    }
+    counts['expected'] = len(expected)
+    for identity in expected:
+        status = _claim_operation_status(intents.get(identity, []), results)
+        counts[status] += 1
+    return counts
+
+
+def _retained_claim(identity, status):
+    return {
+        'bucket': identity[0],
+        'key': identity[1],
+        'checksum': identity[2],
+        'size_bytes': identity[3],
+        'status': status,
+    }
+
+
+def _claim_operation_status(intents, results):
+    if not intents:
+        return 'unsettled'
+    intent = max(intents, key=lambda event: event['sequence'])
+    result = results.get(intent['operation_id'])
+    if result is None or result['sequence'] < intent['sequence']:
+        return 'unsettled'
+    status = result.get('status')
+    if status in {'created', 'matched', 'absent', 'conflict', 'unknown'}:
+        return status
+    return 'unsettled'
 
 
 def _inventory_source(inputs):

@@ -108,6 +108,8 @@ never delete by prefix.
 | Generate | Continue independent derivatives/diagnostics | Exit 1 for processing failures; held |
 | Local push readiness | Inspect the whole local plan for missing files | Exit 1; zero uploads; held |
 | Remote access/destination checks | Stop on denial, uncertain checksum evidence, or changed existing content. A differing existing manifest is recorded as a replacement hold; only new content/audit keys and new-parent manifests may proceed, and that manifest is never written. | Exit 1 for a hold/failure; publication held |
+| ID claim read pass | Read every expected claim in canonical-ID order. A different owner stops before any claim or content write. | Exit 3 for a conflict; claim read failure exits 1; held |
+| ID claim create pass | Conditionally create missing claims and verify each acknowledged create. A matching 412 race is `matched`; a different owner stops the pass. Earlier claims remain. | Exit 3 for a conflict; write/verification failure exits 1; no content upload; held |
 | Data/audit upload | Stop subsequent uploads on any required failure | Exit 1; retain acknowledgments/unknown intents; no manifest; held |
 | Remote byte verification | Stop subsequent uploads on mismatch/read failure | Exit 1; acknowledged upload remains recorded; held |
 | Manifest upload/verification | Stop immediately; no automatic rollback | Exit 1; possibly directly accessible manifest; held |
@@ -122,6 +124,12 @@ never delete by prefix.
 Completed-with-errors never permits release. Missing source discovered by source
 preflight returns 3; generated files missing at push readiness return 1. Argument
 misuse still returns 2. Dry runs never create a publication receipt.
+
+Claims are reserved in the private bucket at `{s3_prefix}/_ids/{canonical_id}.json`.
+The read pass covers the validated package rows, whether or not generated files are present.
+Execute starts claim creation only after existing blocking checks have passed; every
+successful claim uses a conditional upload followed by one checksum-enabled verification
+HEAD. A claim remains reserved after later upload failure or rollback.
 
 ## Durable completion and inspection
 
@@ -153,6 +161,12 @@ method for every successful verification. Older completed receipts without this
 contract are retained but report held under this inspector; do not relabel or edit
 them to bypass reconciliation. Existing generated-only runs can still proceed to
 execute if their original input/plan checks pass.
+
+The receipt also requires an exact expected claim set with settled `created` or `matched`
+evidence for every claim, including its key, SHA-256, size and FULL_OBJECT checksum type.
+Missing, altered, conflicting or unknown claim evidence keeps publication held.
+`inspect-run` reports claim counts and lists any unsettled claim intent as an unknown
+operation. Claims are not content-plan entries or `push` results.
 
 `summary.json` and `summary.txt` are cached before final commit and can still show
 `running`/held after success. Push's immediate report also remains held pending
@@ -202,6 +216,9 @@ environment must either
 allow the required bucket-level check or approve a preflight change; do not claim
 that prefix-conditioned ListBucket alone satisfies the current implementation.
 GetObject and PutObject can stay scoped to approved object prefixes.
+Those permissions must include `{s3_prefix}/_ids/*` in the private bucket: HeadObject
+checksums and conflict-owner reads use GetObject access, and conditional claim creation
+uses PutObject. Bucket preflight alone does not prove either prefix grant.
 
 Absent ListBucket permission, a HEAD of a missing key can return 403 rather than
 404. The CLI correctly treats 403 as an error and never as absence. Existing

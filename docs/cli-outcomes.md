@@ -9,9 +9,9 @@ report. Publication and recovery limits are described in the linked guides.
 | Code | Meaning |
 | --- | --- |
 | 0 | Command completed without required failures |
-| 1 | Processing aborted, required upload artifact missing, upload failed, or evidence/rollback inventory could not be written |
+| 1 | Processing aborted, required upload artifact missing, upload or claim storage failed, or evidence/rollback inventory could not be written |
 | 2 | Invalid arguments, including execute with dummy files or without a required generated directory |
-| 3 | Input/configuration validation errors, including check-only errors and invalid manifests |
+| 3 | Input/configuration validation errors, invalid manifests, or a package ID claim conflict |
 | 4 | Generation or URL verification completed independent work with failures |
 | 130 / 143 | SIGINT / SIGTERM; an interruption event is recorded when storage permits |
 
@@ -21,6 +21,13 @@ A source missing at required preflight validation produces 3. A source disappear
 normalization, then case folding, then the storage-segment normalizer. Parent and page IDs
 share one namespace, and comparison does not rewrite their original spelling. Exact duplicate
 IDs and upload-plan collisions continue to be reported by their existing checks.
+
+`push --execute` checks validated package IDs against private-bucket claims after existing
+local and destination blockers pass and before any claim or content write. A claim conflict,
+including a conditional-create race with a different owner, returns 3; claim storage failures
+return 1 and hold the batch. Online `push --dry-run` performs the read-only claim check with or
+without generated files. `push --dry-run --offline` reports the check as `not_run` and makes
+no storage call.
 
 ## Run locations and workflow
 
@@ -46,7 +53,15 @@ workbench-lite reconcile /absolute/path/to/RUN_ID
 workbench-lite push --config package.yml --generated-dir generated --execute --resume
 ```
 
-Reconciliation performs only S3 HEAD requests. Resume validates the recorded input files, private snapshots, immutable plan, software source hash, endpoint and buckets; it rechecks prior writes by full-object SHA-256 and size. A receipt, pending finalization marker, rollback hold, unresolved outcome or conflict prevents resume. Without `--resume`, the existing execute guard still rejects reuse. The generated-output and run locks are acquired before the reference and run are examined; destination locks are held through reconciliation, upload verification, receipt commit and release.
+Reconciliation performs only S3 HEAD requests. An uncertain claim is recorded as `matched`,
+`absent` or `conflict`; reconciliation never labels one `created`. Resume validates the
+recorded input files, private snapshots, immutable plan, software source hash, endpoint and
+buckets; it rechecks prior writes by full-object SHA-256 and size, then repeats claim checks
+before content. A claim conflict on resume returns 3. A receipt, pending finalization marker,
+rollback hold, unresolved outcome or conflict prevents resume. Without `--resume`, the
+existing execute guard still rejects reuse. The generated-output and run locks are acquired
+before the reference and run are examined; destination locks are held through reconciliation,
+upload verification, receipt commit and release.
 
 Read-only inspection derives current state from the valid journal prefix. It neither modifies evidence nor calls S3. It returns 1 for journal damage, an incomplete stage or unknown operations; otherwise it returns the recorded terminal exit status. Local PID/hostname liveness helps distinguish running from inferred interrupted stages; this is advisory, not a lock or proof of process identity. A torn final line is reported without discarding earlier records. Do not append to a damaged journal. Stored summaries are checkpoints and may be stale after abrupt termination; use inspection for the current view.
 
@@ -59,6 +74,7 @@ The unanchored `workbench-lite-runs/` gitignore rule covers default directories 
 - `events.jsonl`: append-only UTF-8 JSON Lines, ordered sequence and UTC timestamps, stage, file/object/page identity, attempt number, safe error class/code/HTTP status, delay, checksums/sizes and disposition. Effective SDK endpoint/region and configured profile are recorded before uploads. Every PUT attempt has a durable intent and result; an unknown outcome remains pending only while its latest result is unknown.
 - `summary.json` and `summary.txt`: atomically replaced journal-derived summaries with running, completed, completed-with-errors, failed or interrupted states. A local completed generation does not mean remote publication. A failed or interrupted run can contain acknowledged uploads alongside unknown operations.
 - `upload-plan.json`: immutable pre-upload snapshot. The generated copy uploads to the private bucket at `{batch_prefix}/audit/{run_id}/upload-plan.json`. It is a plan, not an execution receipt, and excludes its own checksum. Old shared audit objects are untouched.
+- Claim context and claim-stage events: expected claim keys, SHA-256 and sizes, plus `intent`, `created`, `matched`, `absent`, `conflict` or `unknown` outcomes. Claims are not content-plan entries or `push` results.
 
 No transaction spans S3 and the local journal. A write can reach S3 before its receipt can be stored. Logging failures stop the command and produce a nonzero result. Journals preserve facts for reconciliation; they do not authorize deletion or retries themselves. See [publication holds](publication-holds.md) and [rollback inventory](rollback-inventory.md).
 

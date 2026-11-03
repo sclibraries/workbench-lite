@@ -65,6 +65,18 @@ The public bucket defaults to `islandora-derivatives`. AWS credentials
 come from the selected AWS profile or the standard AWS credential chain; do not put
 credentials in the YAML file.
 
+## S3 layout and ID reservations
+
+Content keeps its batch-specific layout under `{s3_prefix}/{batch_id}`. Workbench-lite also
+reserves each canonical object and page ID at
+`{s3_prefix}/_ids/{canonical_id}.json` in the private bucket. The claim registry is scoped to
+one S3 endpoint, private bucket and effective `s3_prefix`; changing the private bucket or
+prefix starts a separate registry. Claims remain after rollback, and parent and page IDs
+share the same claim namespace. Canonicalization is used only for the registry key; stored
+content keys and manifest canvas IDs retain the original spelling.
+An existing claim is reusable only when the original ID, normalized batch, kind and (for a
+page) parent ID all match. A mismatch stops push before content uploads.
+
 ## Install and run
 
 Python 3.12 is used by the Docker image. Install dependencies and view the CLI help:

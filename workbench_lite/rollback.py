@@ -780,8 +780,12 @@ def _validate_rollback_confirmation(inventory, execute, confirm):
         raise JournalError('--confirm is valid only with --execute.')
     if execute and confirm != inventory['run_id']:
         raise JournalError('--execute requires --confirm matching the source run ID.')
-    if execute and not inventory.get('new_keys'):
+    if execute and not inventory.get('new_keys') and not _has_created_claim(inventory):
         raise JournalError('Rollback refused: the source run has no confirmed new keys.')
+
+
+def _has_created_claim(inventory):
+    return any(claim.get('status') == 'created' for claim in inventory.get('retained_claims') or [])
 
 
 def _lock_rollback_targets(locks, source_path, client, inventory):
