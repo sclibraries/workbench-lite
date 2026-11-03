@@ -1011,8 +1011,8 @@ class InterleavedIdClaimTests(unittest.TestCase):
         self.assertFalse(_valid_publication_receipt(run_path, events, receipt))
 
     def test_invalid_expected_claims_make_inventory_error_and_refuse_rollback(self):
-        for case in ('empty', 'altered_expected'):
-            with self.subTest(expected_claims=case):
+        for case in ('empty', 'altered_expected', 'altered', 'altered_size', 'altered_type'):
+            with self.subTest(claim_mutation=case):
                 prefix = f'invalid-claim-rollback-{case}'
                 config, run_path = self._published_claim_run(prefix)
                 self._mutate_claim_journal(run_path, case)
@@ -1126,6 +1126,10 @@ class InterleavedIdClaimTests(unittest.TestCase):
     def _alter_claim_result(result, case):
         if case == 'altered':
             result['observed_checksum'] = '0' * 64
+        elif case == 'altered_size':
+            result['observed_size_bytes'] += 1
+        elif case == 'altered_type':
+            result['checksum_type'] = 'COMPOSITE'
         else:
             result['status'] = case
             result['remote_outcome'] = case
