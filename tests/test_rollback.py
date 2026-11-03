@@ -13,11 +13,11 @@ from unittest.mock import Mock, patch
 import botocore.session
 from botocore.exceptions import ClientError
 
-from claim_aware_journal import ClaimAwareRunJournal as RunJournal
 from workbench_lite.cli import main
 from workbench_lite.locks import WriterLocks
 from workbench_lite.models import UploadPlanEntry
 from workbench_lite.s3_client import Boto3S3Client
+from workbench_lite.runs import RunJournal
 
 
 ENDPOINT = 'http://localstack:4566'

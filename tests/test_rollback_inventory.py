@@ -8,10 +8,9 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from claim_aware_journal import ClaimAwareRunJournal as RunJournal
 from workbench_lite.models import UploadPlanEntry
 from workbench_lite.rollback_inventory import build_inventory
-from workbench_lite.runs import RunJournal as PlainRunJournal
+from workbench_lite.runs import RunJournal
 from cli_test_runner import main
 
 
@@ -119,14 +118,13 @@ class RollbackInventoryTests(unittest.TestCase):
         self.assertEqual(inventory['unchanged_keys'], [])
 
     def test_interrupted_before_claim_phase_preserves_journal_state(self):
-        run = PlainRunJournal.create(self.root / 'preclaim-runs')
-        run.inputs(self.config, {'batch_id': 'batch-one', 'input_csv': str(self.csv)}, self.csv)
-        run.plan(self.entries)
-        run.start('push')
-        self.assertEqual(build_inventory(run.path)['state'], 'incomplete_stage')
-        op = run.intent('destination-check', self.entries[0].to_dict())
-        inventory = build_inventory(run.path)
-        events = [json.loads(line) for line in (run.path / 'events.jsonl').read_text().splitlines()]
+        self.run.start('push')
+        self.assertEqual(build_inventory(self.run.path)['state'], 'incomplete_stage')
+        op = self.run.intent('destination-check', self.entries[0].to_dict())
+        inventory = build_inventory(self.run.path)
+        events = [
+            json.loads(line) for line in (self.run.path / 'events.jsonl').read_text().splitlines()
+        ]
         self.assertFalse(any(event.get('stage') == 'claim' for event in events))
         self.assertEqual(inventory['state'], 'needs_reconciliation')
         self.assertEqual(inventory['pending_operations'][0]['operation_id'], op)

@@ -30,6 +30,7 @@ from rehearsal_harness import (
 )
 from workbench_lite import cli
 from workbench_lite.locks import WriterLocks
+from workbench_lite.id_claims import claim_identities_from_plan
 from workbench_lite.runs import _valid_publication_receipt, inspect_run, read_events
 from workbench_lite.s3_client import ObjectIdentity
 
@@ -126,6 +127,50 @@ class ClaimVerificationMismatchClient(FileS3Client):
             else:
                 result[self.field] = 'COMPOSITE'
         return result
+
+
+class FinalClaimCheckClient(FileS3Client):
+    def __init__(self, root, prefix, fault):
+        super().__init__(root)
+        self.claim_root = claim_root(prefix)
+        self.fault = fault
+        self.claim_head_counts = {}
+        self.final_head_keys = []
+        self.interrupted = False
+
+    def head_object(self, **kwargs):
+        key = kwargs['Key']
+        if not key.startswith(self.claim_root):
+            return super().head_object(**kwargs)
+        count = self.claim_head_counts.get(key, 0) + 1
+        self.claim_head_counts[key] = count
+        final_check = count == 3
+        if final_check:
+            self.final_head_keys.append(key)
+            self._change_claim_before_head(kwargs['Bucket'], key)
+        result = super().head_object(**kwargs)
+        if final_check:
+            self._change_claim_metadata(result)
+        return result
+
+    def _change_claim_before_head(self, bucket, key):
+        path = self._path(bucket, key)
+        if self.fault == 'deleted':
+            path.unlink()
+        elif self.fault == 'checksum':
+            content = path.read_bytes()
+            path.write_bytes(content[:-1] + bytes([content[-1] ^ 1]))
+        elif self.fault == 'head_failure':
+            raise OSError('synthetic final claim HEAD failure')
+        elif self.fault == 'interrupt' and not self.interrupted:
+            self.interrupted = True
+            raise KeyboardInterrupt
+
+    def _change_claim_metadata(self, result):
+        if self.fault == 'size':
+            result['ContentLength'] += 1
+        elif self.fault == 'checksum_type':
+            result['ChecksumType'] = 'COMPOSITE'
 
 
 class SecondClaimConflictClient(FileS3Client):
@@ -964,69 +1009,94 @@ class InterleavedIdClaimTests(unittest.TestCase):
         self.assertEqual(resumed['exit'], 3, resumed['stdout'] + resumed['stderr'])
         self.assertEqual(self.content_puts(), [])
 
-    def test_receipt_requires_claim_evidence_to_be_present_settled_and_unaltered(self):
-        cases = ('remove', 'conflict', 'unknown', 'altered', 'empty')
-        for label in cases:
-            with self.subTest(evidence=label):
-                config = self.package(f'receipt-{label}', prefix=f'receipt-{label}')
-                output = self.generate(config, f'receipt-{label}-generated')
-                pushed = self.push(config, output, name=f'receipt-{label}-runs')
-                self.assertEqual(pushed['exit'], 0, pushed['stdout'] + pushed['stderr'])
-                run_path = self.run_path(output)
-                self._mutate_claim_journal(run_path, label)
+    def test_receipt_requires_claims_to_remain_present_and_unaltered_in_s3(self):
+        for fault in ('deleted', 'checksum', 'size', 'checksum_type'):
+            with self.subTest(fault=fault):
+                self._assert_final_claim_failure(fault)
 
-                self.assertEqual(inspect_run(run_path)['publication']['state'], 'held')
-
-    def test_receipt_derives_empty_and_reduced_expected_sets_from_the_plan(self):
-        for case in ('empty', 'reduced', 'altered_expected'):
-            with self.subTest(expected_claims=case):
-                config = self.package(
-                    f'receipt-plan-{case}',
-                    parent_ids=('alpha', 'beta'),
-                    prefix=f'receipt-plan-{case}',
-                )
-                output = self.generate(config, f'receipt-plan-{case}-generated')
-                pushed = self.push(config, output, name=f'receipt-plan-{case}-runs')
-                self.assertEqual(pushed['exit'], 0, pushed['stdout'] + pushed['stderr'])
-                run_path = self.run_path(output)
-                self._mutate_claim_journal(run_path, case)
-                self.assertEqual(inspect_run(run_path)['publication']['state'], 'held')
-
-    def test_claim_evidence_reducer_agrees_across_inspection_receipt_and_inventory(self):
-        config = self.package('claim-reducer')
-        output = self.generate(config, 'claim-reducer-generated')
-        self.assertEqual(self.push(config, output)['exit'], 0)
-        run_path = self.run_path(output)
-        self._append_pending_claim_intent(run_path)
-
-        inspected = inspect_run(run_path)
-        inventory = self.invoke('rollback-inventory', run_path, '--format', 'json')
+    def test_receipt_verified_claims_cover_the_plan_exactly(self):
+        _, run_path = self._published_claim_run('receipt-plan-verified')
         events, error = read_events(run_path)
         receipt = self._publication_receipt(events)
+        expected = self._expected_verified_claims(run_path)
 
         self.assertIsNone(error)
+        self.assertCountEqual(receipt.get('verified_claims') or [], expected)
+
+    def test_verified_count_remains_content_only(self):
+        _, run_path = self._published_claim_run('receipt-content-count')
+        events, error = read_events(run_path)
+        receipt = self._publication_receipt(events)
+        plan = json.loads((run_path / 'upload-plan.json').read_text())['entries']
+
+        self.assertIsNone(error)
+        self.assertEqual(receipt['verified_count'], len(plan))
+        self.assertGreater(len(self._expected_verified_claims(run_path)), 0)
+
+    def test_receipt_validation_rejects_incomplete_or_altered_verified_claims(self):
+        for mutation in ('missing_list', 'missing_entry', 'duplicate', 'altered', 'missing_field'):
+            with self.subTest(mutation=mutation):
+                self._assert_invalid_verified_claim_receipt(mutation)
+
+    def test_pending_claim_operation_still_blocks_rollback(self):
+        config, run_path = self._published_claim_run('pending-claim-recovery')
+        self._append_pending_claim_intent(run_path)
+        inspected = inspect_run(run_path)
+        inventory = self.invoke('rollback-inventory', run_path, '--format', 'json')
+
         self.assertEqual(inspected['publication']['state'], 'held')
         self.assertEqual(inspected['claim_counts'], inventory['payload']['claim_counts'])
-        self.assertEqual(inspected['claim_counts']['unsettled'], 1)
-        self.assertFalse(_valid_publication_receipt(run_path, events, receipt))
+        self.assertTrue(
+            any(item.get('stage') == 'claim' for item in inspected['unknown_operations'])
+        )
+        self.assertEqual(inventory['payload']['state'], 'needs_reconciliation')
+        self.assertEqual(inventory['payload']['claim_counts']['unsettled'], 1)
+        rollback = self.invoke(*self._rollback_execute_arguments(config, run_path))
+        self.assertEqual(rollback['exit'], 1, rollback['stdout'] + rollback['stderr'])
+        self.assertEqual(self.store.delete_calls, [])
 
-    def test_invalid_expected_claims_make_inventory_error_and_refuse_rollback(self):
-        for case in ('empty', 'altered_expected', 'altered', 'altered_size', 'altered_type'):
-            with self.subTest(claim_mutation=case):
-                prefix = f'invalid-claim-rollback-{case}'
-                config, run_path = self._published_claim_run(prefix)
-                self._mutate_claim_journal(run_path, case)
-                content_before = self.store.listing(TEST_PUBLIC_BUCKET, f'{prefix}/')
+    def test_claim_result_journal_does_not_change_content_rollback_scope(self):
+        for mutation in ('altered', 'altered_size', 'altered_type'):
+            with self.subTest(mutation=mutation):
+                self._assert_content_rollback_ignores_claim_result(mutation)
 
-                inventory = self.invoke('rollback-inventory', run_path, '--format', 'json')
-                self._assert_invalid_claim_inventory(inventory)
-                rollback = self.invoke(*self._rollback_execute_arguments(config, run_path))
+    def test_failed_final_claim_head_prevents_receipt_and_holds_the_batch(self):
+        self._assert_final_claim_failure('head_failure')
 
-                self.assertEqual(rollback['exit'], 1, rollback['stdout'] + rollback['stderr'])
-                self.assertEqual(self.store.delete_calls, [])
-                self.assertEqual(
-                    self.store.listing(TEST_PUBLIC_BUCKET, f'{prefix}/'), content_before
-                )
+    def test_interrupted_final_claim_checks_resume_with_fresh_checks(self):
+        prefix = 'final-claim-interruption'
+        self.store = FinalClaimCheckClient(self.storage_root, prefix, 'interrupt')
+        config = self.package(prefix, parent_ids=('alpha', 'beta'), prefix=prefix)
+        output = self.generate(config, f'{prefix}-generated')
+        with self.assertRaises(KeyboardInterrupt):
+            self.push(config, output, name=f'{prefix}-runs')
+        run_path = self.run_path(output)
+        before = dict(self.store.claim_head_counts)
+        events, error = read_events(run_path)
+        self.assertIsNone(error)
+        self.assertFalse(any(event.get('publication_receipt') for event in events))
+        resumed = self.push(config, output, name=f'{prefix}-runs', resume=True)
+        self.assertEqual(resumed['exit'], 0, resumed['stdout'] + resumed['stderr'])
+        self._assert_fresh_resume_claim_checks(before)
+
+    def test_execute_claim_request_counts_follow_decision_seven(self):
+        self._assert_execute_claim_request_counts()
+
+    def test_online_dry_run_claim_requests_remain_read_only(self):
+        self._assert_online_dry_run_claim_request_counts()
+
+    def test_malformed_claim_events_are_journal_errors(self):
+        cases = (
+            ('context', 'expected_claims'),
+            ('context', 'identity'),
+            ('intent', 'key'),
+            ('result', 'status'),
+            ('result', 'remote_outcome'),
+            ('result', 'unknown_status'),
+        )
+        for index, (kind, defect) in enumerate(cases):
+            with self.subTest(kind=kind, defect=defect):
+                self._assert_malformed_claim_event(kind, defect, index)
 
     def test_valid_settled_claim_conflict_remains_rollback_eligible(self):
         prefix = 'settled-claim-conflict'
@@ -1052,6 +1122,135 @@ class InterleavedIdClaimTests(unittest.TestCase):
         self.assertEqual(pushed['exit'], 0, pushed['stdout'] + pushed['stderr'])
         return config, self.run_path(output)
 
+    def _expected_verified_claims(self, run_path):
+        metadata = json.loads((run_path / 'run.json').read_text())
+        plan = json.loads((run_path / 'upload-plan.json').read_text())
+        config = json.loads((run_path / 'config.json').read_text())
+        config['batch_id'] = metadata['batch_id']
+        identities = claim_identities_from_plan(plan['entries'], config, metadata['batch_id'])
+        return [
+            {
+                'key': key,
+                'checksum': checksum,
+                'size_bytes': size,
+                'checksum_type': 'FULL_OBJECT',
+            }
+            for _, key, checksum, size in sorted(identities, key=lambda item: item[1])
+        ]
+
+    def _assert_invalid_verified_claim_receipt(self, mutation):
+        _, run_path = self._published_claim_run(f'receipt-verified-{mutation}')
+        events, error = read_events(run_path)
+        self.assertIsNone(error)
+        receipt = self._publication_receipt(events)
+        receipt['verified_claims'] = self._expected_verified_claims(run_path)
+        self._mutate_verified_claims(receipt, mutation)
+        self._write_events(run_path, events)
+        events, error = read_events(run_path)
+        self.assertIsNone(error)
+        receipt = self._publication_receipt(events)
+        self.assertFalse(_valid_publication_receipt(run_path, events, receipt))
+        self.assertEqual(inspect_run(run_path)['publication']['state'], 'held')
+
+    @staticmethod
+    def _mutate_verified_claims(receipt, mutation):
+        claims = receipt['verified_claims']
+        if mutation == 'missing_list':
+            receipt.pop('verified_claims')
+        elif mutation == 'missing_entry':
+            claims.pop()
+        elif mutation == 'duplicate':
+            claims.append(dict(claims[0]))
+        elif mutation == 'altered':
+            claims[0]['checksum'] = '0' * 64
+        else:
+            claims[0].pop('checksum_type')
+
+    def _assert_content_rollback_ignores_claim_result(self, mutation):
+        prefix = f'claim-rollback-{mutation}'
+        config, run_path = self._published_claim_run(prefix)
+        self._mutate_claim_journal(run_path, mutation)
+        inventory = self.invoke('rollback-inventory', run_path, '--format', 'json')
+        keys = {(item['bucket'], item['key']) for item in inventory['payload']['new_keys']}
+        claims_before = self.claim_keys(prefix=prefix)
+        self.assertEqual(inventory['exit'], 0, inventory['stdout'] + inventory['stderr'])
+        self.assertEqual(inventory['payload']['state'], 'reviewable')
+        rollback = self.invoke(*self._rollback_execute_arguments(config, run_path))
+        deleted = {(bucket, key) for bucket, key, _ in self.store.delete_calls}
+        self.assertEqual(rollback['exit'], 0, rollback['stdout'] + rollback['stderr'])
+        self.assertEqual(deleted, keys)
+        self.assertEqual(self.claim_keys(prefix=prefix), claims_before)
+
+    def _assert_final_claim_failure(self, fault):
+        prefix = f'final-claim-{fault}'
+        self.store = FinalClaimCheckClient(self.storage_root, prefix, fault)
+        config = self.package(prefix, prefix=prefix)
+        output = self.generate(config, f'{prefix}-generated')
+        result = self.push(config, output, name=f'{prefix}-runs')
+        self.assertTrue(self.store.final_head_keys)
+        self.assertNotEqual(result['exit'], 0, result['stdout'] + result['stderr'])
+        run_path = self.run_path(output)
+        events, error = read_events(run_path)
+        self.assertIsNone(error)
+        self.assertFalse(any(event.get('publication_receipt') for event in events))
+        self.assertEqual(inspect_run(run_path)['publication']['state'], 'held')
+
+    def _assert_fresh_resume_claim_checks(self, before):
+        counts = self.store.claim_head_counts
+        actual = {key: counts[key] - before.get(key, 0) for key in counts}
+        self.assertEqual(actual, {key: 2 for key in counts})
+
+    def _assert_execute_claim_request_counts(self):
+        prefix = 'claim-request-counts'
+        self.store = FileS3Client(self.storage_root)
+        config = self.package(
+            prefix, parent_ids=('alpha', 'beta'), pages=(('page-1', 'alpha'),), prefix=prefix
+        )
+        self.seed_claim('beta', claim_body('beta', 'beta', 'object', 'package'), prefix=prefix)
+        output = self.generate(config, f'{prefix}-generated')
+        result = self.push(config, output, name=f'{prefix}-runs')
+        heads = self._claim_head_requests(prefix)
+        puts = [key for _, key in self.store.put_calls if key.startswith(claim_root(prefix))]
+        self.assertEqual(result['exit'], 0, result['stdout'] + result['stderr'])
+        self.assertEqual(len(heads), 2 * 3 + 2)
+        self.assertTrue(all(call.get('ChecksumMode') == 'ENABLED' for call in heads))
+        self.assertEqual(len(puts), 2)
+
+    def _assert_online_dry_run_claim_request_counts(self):
+        prefix = 'claim-dry-request-counts'
+        self.store = FileS3Client(self.storage_root)
+        config = self.package(
+            prefix, parent_ids=('alpha', 'beta'), pages=(('page-1', 'alpha'),), prefix=prefix
+        )
+        result = self.push(config, dry_run=True, name=f'{prefix}-runs')
+        heads = self._claim_head_requests(prefix)
+        self.assertEqual(result['exit'], 0, result['stdout'] + result['stderr'])
+        self.assertEqual(len(heads), 3)
+        self.assertEqual(self.store.put_calls, [])
+
+    def _claim_head_requests(self, prefix):
+        root = claim_root(prefix)
+        return [call for call in self.store.head_calls if call['Key'].startswith(root)]
+
+    def _assert_malformed_claim_event(self, kind, defect, index):
+        _, run_path = self._published_claim_run(f'malformed-claim-{index}')
+        events, error = read_events(run_path)
+        event = next(
+            event for event in events if event.get('stage') == 'claim' and event['kind'] == kind
+        )
+        if defect == 'identity':
+            event['expected_claims'][0].pop('key')
+        elif defect == 'unknown_status':
+            event['status'] = 'unrecognized'
+            event['remote_outcome'] = 'unrecognized'
+        else:
+            event.pop(defect)
+        self._write_events(run_path, events)
+        events, error = read_events(run_path)
+        inspected = self.invoke('inspect-run', run_path, '--format', 'json')
+        self.assertIsNotNone(error)
+        self.assertNotEqual(inspected['exit'], 0, inspected['stdout'] + inspected['stderr'])
+
     @staticmethod
     def _rollback_execute_arguments(config, run_path):
         return (
@@ -1070,13 +1269,6 @@ class InterleavedIdClaimTests(unittest.TestCase):
             'json',
         )
 
-    def _assert_invalid_claim_inventory(self, inventory):
-        self.assertEqual(inventory['exit'], 1, inventory['stdout'] + inventory['stderr'])
-        self.assertEqual(inventory['payload']['state'], 'invalid_evidence')
-        self.assertTrue(
-            any('claim' in error.lower() for error in inventory['payload']['evidence_errors'])
-        )
-
     def _mutate_claim_journal(self, run_path, case):
         events, error = read_events(run_path)
         self.assertIsNone(error)
@@ -1086,25 +1278,13 @@ class InterleavedIdClaimTests(unittest.TestCase):
             if event['kind'] == 'context' and event.get('stage') == 'claim'
         )
         expected = context['expected_claims']
-        if case in {'empty', 'reduced', 'altered_expected'}:
-            if case == 'empty':
-                context['expected_claims'] = []
-            elif case == 'reduced':
-                context['expected_claims'] = expected[:-1]
-            else:
-                expected[-1]['checksum'] = '0' * 64
-            self._write_events(run_path, events)
-            return
         operation = self._created_claim_operation(events, expected[-1])
-        if case == 'remove':
-            events = [event for event in events if event.get('operation_id') != operation]
-        else:
-            result = next(
-                event
-                for event in events
-                if event.get('operation_id') == operation and event['kind'] == 'result'
-            )
-            self._alter_claim_result(result, case)
+        result = next(
+            event
+            for event in events
+            if event.get('operation_id') == operation and event['kind'] == 'result'
+        )
+        self._alter_claim_result(result, case)
         self._write_events(run_path, events)
 
     @staticmethod
