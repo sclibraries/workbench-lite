@@ -90,11 +90,20 @@ class RehearsalScenarioTests(unittest.TestCase):
         reference = json.loads((output / '.workbench-run.json').read_text())
         return output, Path(reference['run_path'])
 
-    def push(self, output, *, resume=False, mode=None, extra_patches=(), run_dir_name='runs'):
+    def push(
+        self,
+        output,
+        *,
+        config=None,
+        resume=False,
+        mode=None,
+        extra_patches=(),
+        run_dir_name='runs',
+    ):
         arguments = [
             'push',
             '--config',
-            self.config,
+            config or self.config,
             '--execute',
             '--generated-dir',
             output,
@@ -513,6 +522,11 @@ class RehearsalScenarioTests(unittest.TestCase):
         self.assertEqual(repeated['exit'], 0)
         self.assertGreater(repeated['payload']['already_deleted_count'], 0)
         self.assertTrue((source_run / 'rollback-hold.json').exists())
+        private_remaining = self.store.listing(TEST_PRIVATE_BUCKET, 'run/')
+        public_remaining = self.store.listing(TEST_PUBLIC_BUCKET, 'run/')
+        self.assertTrue(private_remaining)
+        self.assertTrue(all(key.startswith('run/_ids/') for key in private_remaining))
+        self.assertEqual(public_remaining, {})
 
     def _rollback_arguments(self, run_path, *, execute=False):
         arguments = [
@@ -585,6 +599,46 @@ class RehearsalScenarioTests(unittest.TestCase):
         self.assertTrue((source_run / 'rollback-hold.json').exists())
         self.assertEqual(inspect_run(source_run)['publication']['state'], 'held')
         self.assert_sentinels()
+
+    def test_scenario_15_cross_batch_duplicate_is_refused_without_storage_changes(self):
+        self.assert_contract_case(15)
+        first_output, first_run = self.generate()
+        first = self.push(first_output)
+        self.assertEqual(first['exit'], 0, first['stdout'] + first['stderr'])
+        second_config = self.root / 'second-batch.yml'
+        second_config.write_text(
+            self.config.read_text(encoding='utf-8').replace(
+                'batch_id: package', 'batch_id: package-second'
+            ),
+            encoding='utf-8',
+        )
+        second_output, second_run = self.generate(
+            config=second_config,
+            output_name='second-batch-generated',
+            run_name='second-batch-generation-runs',
+        )
+        before = {
+            TEST_PRIVATE_BUCKET: self.store.listing(TEST_PRIVATE_BUCKET, 'run/'),
+            TEST_PUBLIC_BUCKET: self.store.listing(TEST_PUBLIC_BUCKET, 'run/'),
+        }
+
+        duplicate = self.push(
+            second_output,
+            config=second_config,
+            run_dir_name='second-batch-push-runs',
+        )
+
+        self.assertEqual(
+            {
+                TEST_PRIVATE_BUCKET: self.store.listing(TEST_PRIVATE_BUCKET, 'run/'),
+                TEST_PUBLIC_BUCKET: self.store.listing(TEST_PUBLIC_BUCKET, 'run/'),
+            },
+            before,
+        )
+        self.assertEqual(duplicate['exit'], 3, duplicate['stdout'] + duplicate['stderr'])
+        self.assertTrue(self.store.listing(TEST_PRIVATE_BUCKET, 'run/_ids/'))
+        self.assertEqual(inspect_run(first_run)['publication']['state'], 'ready_for_review')
+        self.assertEqual(inspect_run(second_run)['publication']['state'], 'held')
 
 
 if __name__ == '__main__':

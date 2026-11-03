@@ -5,7 +5,7 @@ from pathlib import Path
 import sys
 import time
 
-from rehearsal_harness import FaultClient, FileS3Client
+from rehearsal_harness import FaultClient, FileS3Client, _upload_file_through_put
 from workbench_lite import cli
 from workbench_lite.s3_client import create_s3_client as make_boto_client
 
@@ -14,8 +14,10 @@ class WorkerClient(FaultClient):
     def __init__(self, client, mode):
         super().__init__(client, mode)
         self.mode = mode
+        self.claim_root = os.environ['REHEARSAL_CLAIM_ROOT']
         self.upload_count = 0
         self.delete_count = 0
+        self.claim_put_count = 0
 
     def _barrier(self):
         marker = os.environ.get('REHEARSAL_READY_FILE')
@@ -34,6 +36,8 @@ class WorkerClient(FaultClient):
                 time.sleep(0.02)
 
     def upload_file(self, source_path, bucket, key, checksum):
+        if key.startswith(self.claim_root):
+            return _upload_file_through_put(self, source_path, bucket, key, checksum)
         self.upload_count += 1
         if self.mode == f'upload_before_{self.upload_count}':
             self._barrier()
@@ -42,6 +46,19 @@ class WorkerClient(FaultClient):
             self._barrier()
             return result
         return super().upload_file(source_path, bucket, key, checksum)
+
+    def put_object(self, **kwargs):
+        if not kwargs.get('Key', '').startswith(self.claim_root):
+            return super().put_object(**kwargs)
+        self.claim_put_count += 1
+        if self.mode == f'claim_before_{self.claim_put_count}':
+            self._barrier()
+            return self._raw_client().put_object(**kwargs)
+        if self.mode == f'claim_after_{self.claim_put_count}':
+            result = self._raw_client().put_object(**kwargs)
+            self._barrier()
+            return result
+        return super().put_object(**kwargs)
 
     def delete_object(self, bucket, key, *, if_match):
         self.delete_count += 1

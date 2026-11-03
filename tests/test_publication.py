@@ -14,7 +14,7 @@ from botocore.exceptions import ClientError, EndpointConnectionError
 from types import SimpleNamespace
 
 from cli_test_runner import main
-from test_outcomes import Storage, package
+from test_outcomes import Storage, is_claim_key, package
 from workbench_lite.check import run_check
 from workbench_lite.cli import main as cli_main
 from workbench_lite.push import push_upload_plan
@@ -27,11 +27,14 @@ class TransientStorage(Storage):
         self.failures = list(failures)
         self.head_error_key = head_error_key
         self.head_calls = []
+        self.claim_head_calls = []
         self.client = SimpleNamespace(
             meta=SimpleNamespace(endpoint_url='http://s3.test', region_name='us-east-1')
         )
 
     def upload_file(self, source, bucket, key, checksum):
+        if is_claim_key(key, 'workbench-lite'):
+            return super().upload_file(source, bucket, key, checksum)
         self.calls.append(key)
         if self.failures:
             failure = self.failures.pop(0)
@@ -71,7 +74,8 @@ class TransientStorage(Storage):
         self.written[key] = Path(source).read_bytes()
 
     def inspect_object(self, bucket, key):
-        self.head_calls.append((bucket, key))
+        calls = self.claim_head_calls if is_claim_key(key, 'workbench-lite') else self.head_calls
+        calls.append((bucket, key))
         if key == self.head_error_key:
             raise EndpointConnectionError(endpoint_url='http://s3.test')
         return super().inspect_object(bucket, key)

@@ -1,12 +1,12 @@
 """Scenario contract and test-only helpers for the command-line rehearsal."""
 
+import base64
 import contextlib
 import hashlib
 import io
 import json
 import os
 from pathlib import Path
-import shutil
 import subprocess
 import sys
 import time
@@ -323,8 +323,9 @@ SCENARIO_EXPECTATIONS = [
                 'pending delete evidence; resume resolves it and completes.'
             ),
             'storage': (
-                'Only matching confirmed new keys are removed; all keys are absent '
-                'after resumed rollback; sentinels are unchanged.'
+                'Matching confirmed content keys are removed; ID claims remain as '
+                'retained evidence, with no deletable content left after resumed '
+                'rollback; sentinels are unchanged.'
             ),
             'recovery': (
                 'Rerun rollback against the same source run; its rollback hold remains permanent.'
@@ -353,6 +354,28 @@ SCENARIO_EXPECTATIONS = [
             'recovery': 'The source run remains held; republishing requires a new run.',
         },
     },
+    {
+        'number': 15,
+        'name': 'cross-batch duplicate ID is refused',
+        'contracts': (
+            'docs/publication-holds.md#publication-boundary',
+            'docs/rollback-inventory.md',
+        ),
+        'expected': {
+            'steps': {'initial_execute': 0, 'duplicate_execute': 3},
+            'run_state': 'first run completed; duplicate run failed',
+            'publication': 'first run ready_for_review; duplicate run held',
+            'journal': (
+                'The duplicate run records the existing claim owner and refuses '
+                'before any claim or content write.'
+            ),
+            'storage': (
+                'The first batch content and its private-bucket claim remain; the '
+                'second batch creates no content keys; sentinels are unchanged.'
+            ),
+            'recovery': 'The claimed ID remains reserved to its first batch.',
+        },
+    },
 ]
 
 
@@ -376,6 +399,7 @@ SCENARIO_INJECTIONS = {
         'pauses before acknowledgment'
     ),
     14: 'replace a confirmed object with different bytes before rollback execute',
+    15: 'publish one package, then execute the same ID in a different batch',
 }
 
 for _scenario in SCENARIO_EXPECTATIONS:
@@ -385,6 +409,14 @@ for _scenario in SCENARIO_EXPECTATIONS:
 TEST_ENDPOINT = 'http://synthetic.invalid'
 TEST_PRIVATE_BUCKET = 'wbl-local-test-sources'
 TEST_PUBLIC_BUCKET = 'wbl-local-test-derivatives'
+
+
+def claim_root(prefix):
+    return f'{prefix.strip("/")}/_ids/'
+
+
+def is_claim_key(key, prefix):
+    return key.startswith(claim_root(prefix))
 
 
 def stream_identity(stream, chunk_size=1024 * 1024):
@@ -405,10 +437,20 @@ class FileS3Client:
         self.root.mkdir(parents=True, exist_ok=True)
         self.endpoint_url = endpoint
         self.region_name = 'us-east-1'
-        self.meta = SimpleNamespace(endpoint_url=endpoint, region_name=self.region_name)
-        self.client = SimpleNamespace(meta=self.meta)
+        self.meta = SimpleNamespace(
+            endpoint_url=endpoint,
+            region_name=self.region_name,
+            service_model=SimpleNamespace(
+                operation_model=lambda _: SimpleNamespace(
+                    input_shape=SimpleNamespace(members={'IfNoneMatch': None, 'IfMatch': None})
+                )
+            ),
+        )
+        self.client = self
         self.put_calls = []
         self.delete_calls = []
+        self.head_calls = []
+        self.get_calls = []
 
     def _path(self, bucket, key):
         if not bucket or not key or key.startswith('/') or '\\' in key:
@@ -436,15 +478,85 @@ class FileS3Client:
         )
         return {'KeyCount': min(count, kwargs.get('MaxKeys', count))}
 
+    def head_object(self, **kwargs):
+        from botocore.exceptions import ClientError
+
+        self.head_calls.append(dict(kwargs))
+        bucket, key = kwargs['Bucket'], kwargs['Key']
+        path = self._path(bucket, key)
+        if not path.is_file():
+            raise ClientError(
+                {
+                    'Error': {'Code': '404'},
+                    'ResponseMetadata': {'HTTPStatusCode': 404},
+                },
+                'HeadObject',
+            )
+        checksum, size = _file_identity(path)
+        return {
+            'ContentLength': size,
+            'ChecksumSHA256': base64.b64encode(bytes.fromhex(checksum)).decode('ascii'),
+            'ChecksumType': 'FULL_OBJECT',
+            'ETag': f'"{checksum[:32]}"',
+        }
+
+    def put_object(self, **kwargs):
+        from botocore.exceptions import ClientError
+
+        bucket, key = kwargs['Bucket'], kwargs['Key']
+        path = self._path(bucket, key)
+        body = kwargs['Body']
+        value = body.read() if hasattr(body, 'read') else bytes(body)
+        checksum = hashlib.sha256(value).hexdigest()
+        expected = kwargs.get('ChecksumSHA256')
+        if expected and expected != base64.b64encode(bytes.fromhex(checksum)).decode('ascii'):
+            raise OSError('Synthetic PUT checksum mismatch.')
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if kwargs.get('IfNoneMatch') == '*':
+            try:
+                with path.open('xb') as target:
+                    target.write(value)
+            except FileExistsError as exc:
+                raise ClientError(
+                    {
+                        'Error': {'Code': 'PreconditionFailed'},
+                        'ResponseMetadata': {'HTTPStatusCode': 412},
+                    },
+                    'PutObject',
+                ) from exc
+        else:
+            self.seed(bucket, key, value)
+        self.put_calls.append((bucket, key))
+        return {'ETag': f'"{checksum[:32]}"'}
+
+    def get_object(self, **kwargs):
+        bucket, key = kwargs['Bucket'], kwargs['Key']
+        self.get_calls.append((bucket, key))
+        return {'Body': io.BytesIO(self._path(bucket, key).read_bytes())}
+
     def object_exists(self, bucket, key):
         return self._path(bucket, key).is_file()
 
     def inspect_object(self, bucket, key):
-        path = self._path(bucket, key)
-        if not path.is_file():
-            return None
-        checksum, size = _file_identity(path)
-        return ObjectIdentity(checksum, size, 'FULL_OBJECT', f'"{checksum[:32]}"')
+        from botocore.exceptions import ClientError
+
+        try:
+            metadata = self.head_object(Bucket=bucket, Key=key, ChecksumMode='ENABLED')
+        except ClientError as exc:
+            if exc.response.get('Error', {}).get('Code') == '404':
+                return None
+            raise
+        encoded = metadata.get('ChecksumSHA256') or ''
+        try:
+            checksum = base64.b64decode(encoded, validate=True).hex()
+        except ValueError:
+            checksum = None
+        return ObjectIdentity(
+            checksum,
+            metadata.get('ContentLength'),
+            metadata.get('ChecksumType', 'FULL_OBJECT'),
+            metadata.get('ETag'),
+        )
 
     def verify_file(self, bucket, key, checksum, size_bytes):
         identity = self.inspect_object(bucket, key)
@@ -455,32 +567,11 @@ class FileS3Client:
             identity.checksum,
             identity.size_bytes,
             's3-sha256',
+            identity.checksum_type,
         )
 
     def upload_file(self, source_path, bucket, key, checksum):
-        destination = self._path(bucket, key)
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        self.put_calls.append((bucket, key))
-        try:
-            with (
-                Path(source_path).open('rb') as source,
-                destination.open('xb') as target,
-            ):
-                shutil.copyfileobj(source, target, 1024 * 1024)
-        except FileExistsError as exc:
-            from botocore.exceptions import ClientError
-
-            raise ClientError(
-                {
-                    'Error': {'Code': 'PreconditionFailed'},
-                    'ResponseMetadata': {'HTTPStatusCode': 412},
-                },
-                'PutObject',
-            ) from exc
-        observed, _ = _file_identity(destination)
-        if observed != checksum:
-            destination.unlink(missing_ok=True)
-            raise OSError('Synthetic upload checksum mismatch.')
+        _upload_file_through_put(self, source_path, bucket, key, checksum)
 
     def delete_object(self, bucket, key, *, if_match):
         path = self._path(bucket, key)
@@ -523,10 +614,11 @@ class FileS3Client:
 class FaultClient:
     """Inject one documented storage failure around an S3-shaped client."""
 
-    def __init__(self, client, mode=None):
+    def __init__(self, client, mode=None, *, claim_prefix='run'):
         self._wrapped = client
-        self.client = getattr(client, 'client', client)
+        self.client = self
         self.mode = mode
+        self._claim_root = claim_root(claim_prefix)
         wrapped_meta = getattr(self.client, 'meta', None)
         self.endpoint_url = getattr(client, 'endpoint_url', None) or getattr(
             wrapped_meta, 'endpoint_url', TEST_ENDPOINT
@@ -550,6 +642,9 @@ class FaultClient:
     def __getattr__(self, name):
         return getattr(self._wrapped, name)
 
+    def _raw_client(self):
+        return getattr(self._wrapped, 'client', self._wrapped)
+
     def head_bucket(self, **kwargs):
         if self.mode == 'denied':
             from botocore.exceptions import ClientError
@@ -568,8 +663,10 @@ class FaultClient:
         return self._wrapped.head_bucket(**kwargs)
 
     def upload_file(self, source_path, bucket, key, checksum):
+        if key.startswith(self._claim_root):
+            return _upload_file_through_put(self, source_path, bucket, key, checksum)
         if self.mode == 'lost_ack':
-            self._wrapped.upload_file(source_path, bucket, key, checksum)
+            _upload_file_through_put(self, source_path, bucket, key, checksum)
             from botocore.exceptions import EndpointConnectionError
 
             raise EndpointConnectionError(endpoint_url='http://synthetic.invalid')
@@ -584,12 +681,33 @@ class FaultClient:
                 },
                 'PutObject',
             )
-        return self._wrapped.upload_file(source_path, bucket, key, checksum)
+        _upload_file_through_put(self, source_path, bucket, key, checksum)
+
+    def head_object(self, **kwargs):
+        return self._raw_client().head_object(**kwargs)
+
+    def put_object(self, **kwargs):
+        return self._raw_client().put_object(**kwargs)
+
+    def get_object(self, **kwargs):
+        return self._raw_client().get_object(**kwargs)
 
 
 def _file_identity(path):
     with Path(path).open('rb') as handle:
         return stream_identity(handle)
+
+
+def _upload_file_through_put(client, source_path, bucket, key, checksum):
+    with Path(source_path).open('rb') as source:
+        client.put_object(
+            Bucket=bucket,
+            Key=key,
+            Body=source,
+            IfNoneMatch='*',
+            ChecksumAlgorithm='SHA256',
+            ChecksumSHA256=base64.b64encode(bytes.fromhex(checksum)).decode('ascii'),
+        )
 
 
 def make_synthetic_package(root, *, pages=2, batch_id='package', prefix='run'):
@@ -642,8 +760,8 @@ def invoke_cli(argv, client_factory, lock_root, *, extra_patches=()):
     }
 
 
-def cli_client_factory(store, mode=None):
-    return lambda *args, **kwargs: FaultClient(store, mode)
+def cli_client_factory(store, mode=None, *, claim_prefix='run'):
+    return lambda *args, **kwargs: FaultClient(store, mode, claim_prefix=claim_prefix)
 
 
 def spawn_worker(
@@ -657,6 +775,7 @@ def spawn_worker(
     backend='file',
     timeout=20,
     kill_signal=None,
+    claim_prefix='run',
 ):
     """Run a CLI command in a child with the file-backed synthetic adapter."""
     process, _ = start_worker(
@@ -668,6 +787,7 @@ def spawn_worker(
         release_file=release_file,
         backend=backend,
         hold_barrier=kill_signal is not None,
+        claim_prefix=claim_prefix,
     )
     return _finish_worker(process, ready_file, timeout, kill_signal)
 
@@ -701,11 +821,14 @@ def start_worker(
     release_file=None,
     backend='file',
     hold_barrier=False,
+    claim_prefix='run',
 ):
     """Start a test worker, leaving barriers under the caller's control."""
     root = Path(__file__).resolve().parents[1]
     tests = Path(__file__).resolve().parent
-    env = _worker_environment(root, tests, storage_root, lock_root, fault, backend, hold_barrier)
+    env = _worker_environment(
+        root, tests, storage_root, lock_root, fault, backend, hold_barrier, claim_prefix
+    )
     if ready_file is not None:
         env['REHEARSAL_READY_FILE'] = str(ready_file)
     if release_file is not None:
@@ -714,7 +837,9 @@ def start_worker(
     return process, env
 
 
-def _worker_environment(root, tests, storage_root, lock_root, fault, backend, hold_barrier):
+def _worker_environment(
+    root, tests, storage_root, lock_root, fault, backend, hold_barrier, claim_prefix
+):
     env = {key: value for key, value in os.environ.items() if not key.startswith('AWS_')}
     env.update(
         {
@@ -727,6 +852,7 @@ def _worker_environment(root, tests, storage_root, lock_root, fault, backend, ho
             'REHEARSAL_LOCK_ROOT': str(lock_root),
             'REHEARSAL_FAULT': fault or '',
             'REHEARSAL_BACKEND': backend,
+            'REHEARSAL_CLAIM_ROOT': claim_root(claim_prefix),
             'REHEARSAL_HOLD_BARRIER': 'true' if hold_barrier else 'false',
         }
     )

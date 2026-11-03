@@ -13,6 +13,7 @@ from unittest.mock import patch
 
 from PIL import Image
 
+from rehearsal_harness import is_claim_key
 from workbench_lite.check import run_check
 from cli_test_runner import main
 from workbench_lite.generate import generate_service_jpgs, generate_thumbnails
@@ -27,6 +28,10 @@ class Storage:
     def __init__(self, fail_key=None):
         self.written = {}
         self.calls = []
+        self.claim_calls = []
+        self.content_head_calls = []
+        self.claim_head_calls = []
+        self.get_calls = []
         self.fail_key = fail_key
 
     def head_bucket(self, **kwargs):
@@ -36,9 +41,11 @@ class Storage:
         return {'KeyCount': 0}
 
     def object_exists(self, bucket, key):
+        self._record_head(key)
         return key in self.written
 
     def inspect_object(self, bucket, key):
+        self._record_head(key)
         import hashlib
 
         if key not in self.written:
@@ -50,7 +57,20 @@ class Storage:
             hashlib.sha256(value).hexdigest(), len(value), 'FULL_OBJECT', '"test-etag"'
         )
 
+    def _record_head(self, key):
+        calls = (
+            self.claim_head_calls
+            if is_claim_key(key, 'workbench-lite')
+            else self.content_head_calls
+        )
+        calls.append(key)
+
+    def get_object(self, Bucket, Key):
+        self.get_calls.append(Key)
+        return {'Body': io.BytesIO(self.written[Key])}
+
     def verify_file(self, bucket, key, checksum, size_bytes):
+        self._record_head(key)
         import hashlib
 
         value = self.written[key]
@@ -62,10 +82,12 @@ class Storage:
             observed,
             len(value),
             's3-sha256+readback',
+            'FULL_OBJECT',
         )
 
     def upload_file(self, source, bucket, key, checksum):
-        self.calls.append(key)
+        calls = self.claim_calls if is_claim_key(key, 'workbench-lite') else self.calls
+        calls.append(key)
         if key == self.fail_key:
             raise OSError(
                 'permission denied token=TOPSECRET https://user:PASS@host/x?X-Amz-Signature=SIGNED'

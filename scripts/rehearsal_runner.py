@@ -35,7 +35,7 @@ from rehearsal_storage import (
 from workbench_lite.s3_client import create_s3_client
 
 
-def cli_factory(mode=None):
+def cli_factory(mode=None, *, claim_prefix='run'):
     def factory(endpoint_url=None, region=None, profile=None, **kwargs):
         if profile:
             raise RuntimeError('Rehearsal refuses named AWS profiles.')
@@ -45,7 +45,7 @@ def cli_factory(mode=None):
         if endpoint_url != ENDPOINT and not closed_loopback:
             raise RuntimeError(f'Rehearsal refused unexpected endpoint: {endpoint_url!r}')
         adapter = create_s3_client(endpoint_url, region or 'us-east-1', None, **kwargs)
-        return FaultClient(adapter, mode)
+        return FaultClient(adapter, mode, claim_prefix=claim_prefix)
 
     return factory
 
@@ -86,8 +86,13 @@ class ScenarioRunner:
     def scenario_prefix(self, alias, number):
         return f'{self.base_prefix}/{alias}/case-{number:02d}'
 
-    def command(self, directory, display, argv, *, mode=None, extra_patches=()):
-        result = invoke_cli(argv, cli_factory(mode), self.lock_root, extra_patches=extra_patches)
+    def command(self, directory, display, argv, *, mode=None, extra_patches=(), claim_prefix='run'):
+        result = invoke_cli(
+            argv,
+            cli_factory(mode, claim_prefix=claim_prefix),
+            self.lock_root,
+            extra_patches=extra_patches,
+        )
         self.evidence.record_command(directory, display, argv, result)
         return result
 
@@ -134,6 +139,7 @@ class ScenarioRunner:
         run_name='push-runs',
         endpoint=ENDPOINT,
         extra_patches=(),
+        claim_prefix='run',
     ):
         argv = [
             'push',
@@ -154,11 +160,18 @@ class ScenarioRunner:
         if resume:
             argv.append('--resume')
         label = 'push --execute' + (' --resume' if resume else '')
-        return self.command(directory, label, argv, mode=mode, extra_patches=extra_patches)
+        return self.command(
+            directory,
+            label,
+            argv,
+            mode=mode,
+            extra_patches=extra_patches,
+            claim_prefix=claim_prefix,
+        )
 
     def run_all(self):
         for alias in ('single', 'triple'):
-            for number in range(1, 15):
+            for number in range(1, 16):
                 self.run_case(alias, number)
                 if self.stop:
                     return
@@ -273,7 +286,7 @@ class ScenarioRunner:
 
         return event_records(directory)
 
-    def worker(self, argv, *, fault, ready, stop_signal):
+    def worker(self, argv, *, fault, ready, stop_signal, claim_prefix='run'):
         process, _ = start_worker(
             argv,
             storage_root=self.artifact_root / 'worker-storage',
@@ -282,6 +295,7 @@ class ScenarioRunner:
             fault=fault,
             ready_file=ready,
             hold_barrier=True,
+            claim_prefix=claim_prefix,
         )
         deadline = time.monotonic() + 60
         while time.monotonic() < deadline and process.poll() is None and not ready.exists():

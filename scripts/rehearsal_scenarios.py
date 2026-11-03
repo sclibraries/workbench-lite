@@ -14,7 +14,7 @@ from unittest.mock import patch
 import yaml
 from PIL import Image
 
-from rehearsal_harness import clear_dead_test_locks, start_worker
+from rehearsal_harness import claim_root, clear_dead_test_locks, start_worker
 from rehearsal_storage import (
     ENDPOINT,
     full_identity,
@@ -218,6 +218,7 @@ def _run_signal_fault(ctx, directory, source, prefix, label, stop_signal, expect
         fault='upload_before_2',
         ready=directory / f'{label.lower()}-ready',
         stop_signal=stop_signal,
+        claim_prefix=f'{prefix}/{label.lower()}',
     )
     _verify_interrupted_signal(ctx, label, run_path, child, expected)
     return child.returncode
@@ -261,6 +262,7 @@ def case_07(ctx, alias, directory, source, config, prefix):
         fault='upload_after_1',
         ready=directory / 'kill-ready',
         stop_signal=9,
+        claim_prefix=prefix,
     )
     removed_locks = _verify_killed_push(ctx, child)
     reconcile = ctx.command(
@@ -502,7 +504,7 @@ def _run_paths(outputs):
 def case_11(ctx, alias, directory, source, config, prefix):
     output = directory / 'generated'
     run_path = ctx.generate(directory, config, output)
-    result = ctx.push(directory, config, output, mode='lost_ack')
+    result = ctx.push(directory, config, output, mode='lost_ack', claim_prefix=prefix)
     ctx.require_exit(result, 0, 'push_execute')
     events, error = read_events(run_path)
     if error or not any(event.get('disposition') == 'reconciled_written' for event in events):
@@ -524,9 +526,9 @@ def case_12(ctx, alias, directory, source, config, prefix):
         patch('workbench_lite.push.time.sleep', return_value=None),
         patch('workbench_lite.push.random.uniform', return_value=0),
     ):
-        first = ctx.push(directory, config, output, mode='retry_three')
+        first = ctx.push(directory, config, output, mode='retry_three', claim_prefix=prefix)
     ctx.require_exit(first, 1, 'initial_execute')
-    resumed = ctx.push(directory, config, output, resume=True)
+    resumed = ctx.push(directory, config, output, resume=True, claim_prefix=prefix)
     ctx.require_exit(resumed, 0, 'push_resume')
     events, _ = read_events(run_path)
     attempts = [
@@ -578,6 +580,7 @@ def _run_rollback_cycle(ctx, directory, config, source_run, prefix):
     ctx.require_exit(execute, 0, 'execute')
     repeat = _rollback_command(ctx, directory, config, source_run, execute=True, repeat=True)
     ctx.require_exit(repeat, 0, 'repeat')
+    _assert_only_claims_remain(ctx, prefix)
     return preview, execute, repeat
 
 
@@ -626,13 +629,30 @@ def _resume_interrupted_rollback(ctx, directory, source, prefix):
     ctx.require_exit(resume, 0, 'resume')
     if not (run_path / 'rollback-hold.json').exists():
         raise ScenarioMismatch('rollback source hold was not retained')
-    remaining = storage_listing(ctx.storage, ctx.args.private_bucket, f'{prefix}/interrupted')
-    remaining.update(storage_listing(ctx.storage, ctx.args.public_bucket, f'{prefix}/interrupted'))
-    if remaining:
+    remaining = storage_listing(ctx.storage, ctx.args.private_bucket, f'{prefix}/')
+    remaining.update(storage_listing(ctx.storage, ctx.args.public_bucket, f'{prefix}/'))
+    root = claim_root(prefix)
+    claims = {key for key in remaining if key.startswith(root)}
+    content = set(remaining) - claims
+    if content:
         raise ScenarioMismatch(
-            f'resumed rollback left rehearsal objects behind: {sorted(remaining)[:3]}'
+            f'resumed rollback left deletable content behind: {sorted(content)[:3]}'
         )
+    if not claims:
+        raise ScenarioMismatch('resumed rollback did not retain its ID claims')
     return resume, removed_locks
+
+
+def _assert_only_claims_remain(ctx, prefix):
+    remaining = storage_listing(ctx.storage, ctx.args.private_bucket, prefix)
+    remaining.update(storage_listing(ctx.storage, ctx.args.public_bucket, prefix))
+    root = claim_root(prefix)
+    claims = {key for key in remaining if key.startswith(root)}
+    content = set(remaining) - claims
+    if content:
+        raise ScenarioMismatch(f'rollback left deletable content behind: {sorted(content)[:3]}')
+    if not claims:
+        raise ScenarioMismatch('rollback did not retain ID claims')
 
 
 def _interrupt_rollback(ctx, directory, config, run_path):
@@ -676,6 +696,54 @@ def case_14(ctx, alias, directory, source, config, prefix):
         'publication': 'held permanently after rollback started',
         'modified_key': target['key'],
         'recovery': 'republish only in a new run',
+    }
+
+
+def case_15(ctx, alias, directory, source, config, prefix):
+    first_output = directory / 'first-generated'
+    first_run = ctx.generate(directory, config, first_output, 'first-generation-runs')
+    first = ctx.push(directory, config, first_output, run_name='first-push-runs')
+    ctx.require_exit(first, 0, 'initial_execute')
+
+    second_config = make_config(
+        source,
+        directory / 'second-config',
+        ctx.args.private_bucket,
+        ctx.args.public_bucket,
+        prefix,
+    )
+    second_values = yaml.safe_load(second_config.read_text(encoding='utf-8'))
+    second_values['batch_id'] = f'{second_values["batch_id"]}-second'
+    second_config.write_text(yaml.safe_dump(second_values, sort_keys=False), encoding='utf-8')
+    second_output = directory / 'second-generated'
+    second_run = ctx.generate(directory, second_config, second_output, 'second-generation-runs')
+    before = _scenario_storage(ctx, prefix)
+    duplicate = ctx.push(directory, second_config, second_output, run_name='second-push-runs')
+    after = _scenario_storage(ctx, prefix)
+    if after != before:
+        raise ScenarioMismatch('duplicate refusal changed S3 storage')
+    ctx.require_exit(duplicate, 3, 'duplicate_execute')
+    if inspect_run(first_run)['publication']['state'] != 'ready_for_review':
+        raise ScenarioMismatch('initial batch did not retain its completed publication receipt')
+    if inspect_run(second_run)['publication']['state'] != 'held':
+        raise ScenarioMismatch('duplicate batch was not held')
+    root = claim_root(prefix)
+    claims = sum(key.startswith(root) for listing in after.values() for key in listing)
+    if claims < 1:
+        raise ScenarioMismatch('initial batch claim was not retained')
+    return {
+        'steps': {'initial_execute': first['exit'], 'duplicate_execute': duplicate['exit']},
+        'run_state': 'first run completed; duplicate run failed',
+        'publication': 'first run ready_for_review; duplicate run held',
+        'retained_claim_count': claims,
+        'recovery': 'the claimed ID remains reserved to its first batch',
+    }
+
+
+def _scenario_storage(ctx, prefix):
+    return {
+        bucket: storage_listing(ctx.storage, bucket, prefix)
+        for bucket in (ctx.args.private_bucket, ctx.args.public_bucket)
     }
 
 
@@ -725,4 +793,5 @@ SCENARIO_RUNNERS = {
     12: case_12,
     13: case_13,
     14: case_14,
+    15: case_15,
 }

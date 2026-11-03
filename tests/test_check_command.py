@@ -38,6 +38,7 @@ class FakeS3Client:
             observed,
             len(value),
             's3-sha256+readback',
+            'FULL_OBJECT',
         )
 
     def upload_file(self, source_path, bucket, key, checksum):
@@ -641,6 +642,7 @@ class CheckCommandTest(unittest.TestCase):
             fake_module_dir = Path(temp_dir) / 'fake_boto3'
             fake_module_dir.mkdir()
             upload_log = Path(temp_dir) / 'uploads.jsonl'
+            head_log = Path(temp_dir) / 'heads.jsonl'
             (fake_module_dir / 'boto3.py').write_text(
                 r"""import io, json, os, hashlib, base64
 from types import SimpleNamespace
@@ -660,17 +662,27 @@ class FakeClient:
     def head_bucket(self, **kwargs): return {}
     def list_objects_v2(self, **kwargs): return {'KeyCount': 0}
     def head_object(self, Bucket, Key, **kwargs):
+        with open(os.environ['FAKE_BOTO3_HEAD_LOG'], 'a') as handle:
+            stage = 'claim' if Key.startswith('workbench-lite/_ids/') else 'content'
+            handle.write(json.dumps({'key': Key, 'stage': stage}) + '\n')
         if (Bucket, Key) not in self.written:
             raise ClientError({'Error': {'Code': '404'}}, 'HeadObject')
         value = self.written[Bucket, Key]
         checksum = base64.b64encode(hashlib.sha256(value).digest()).decode()
-        return {'ContentLength': len(value), 'ChecksumSHA256': checksum}
+        return {
+            'ContentLength': len(value),
+            'ChecksumSHA256': checksum,
+            'ChecksumType': 'FULL_OBJECT',
+        }
     def get_object(self, Bucket, Key): return {'Body': io.BytesIO(self.written[Bucket, Key])}
     def put_object(self, Bucket, Key, Body, IfNoneMatch, ChecksumAlgorithm, ChecksumSHA256):
         assert IfNoneMatch == '*'
         self.written[Bucket, Key] = Body.read()
         with open(os.environ['FAKE_BOTO3_UPLOAD_LOG'], 'a') as handle:
-            record = json.dumps({'source_path': Body.name, 'bucket': Bucket, 'key': Key})
+            stage = 'claim' if Key.startswith('workbench-lite/_ids/') else 'content'
+            record = json.dumps(
+                {'source_path': Body.name, 'bucket': Bucket, 'key': Key, 'stage': stage}
+            )
             handle.write(record + '\n')
 """,
                 encoding='utf-8',
@@ -681,6 +693,7 @@ class FakeClient:
                 f'{PACKAGE_ROOT}{os.pathsep}{PACKAGE_ROOT / "tests"}{os.pathsep}{fake_module_dir}'
             )
             env['FAKE_BOTO3_UPLOAD_LOG'] = str(upload_log)
+            env['FAKE_BOTO3_HEAD_LOG'] = str(head_log)
 
             result = subprocess.run(
                 [
@@ -714,15 +727,21 @@ class FakeClient:
             upload_rows = [
                 json.loads(line) for line in upload_log.read_text(encoding='utf-8').splitlines()
             ]
+            head_rows = [
+                json.loads(line) for line in head_log.read_text(encoding='utf-8').splitlines()
+            ]
 
+        content_upload_rows = [row for row in upload_rows if row['stage'] == 'content']
+        content_head_rows = [row for row in head_rows if row['stage'] == 'content']
         self.assertEqual(payload['planned_count'], 7)
         self.assertEqual(payload['uploaded_count'], 7)
         self.assertEqual(payload['missing_generated_count'], 0)
-        self.assertEqual(len(upload_rows), 7)
+        self.assertEqual(len(content_upload_rows), 7)
         self.assertIn(
             'workbench-lite/sample/manifests/parent.json',
-            [row['key'] for row in upload_rows],
+            [row['key'] for row in content_upload_rows],
         )
+        self.assertTrue(content_head_rows)
 
     def test_push_uploads_existing_source_entries_with_s3_client(self):
         from workbench_lite.check import run_check

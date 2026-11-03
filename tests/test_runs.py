@@ -82,7 +82,7 @@ class RunTests(unittest.TestCase):
     def test_generate_then_push_reuses_identity_and_uploads_required_audit(self):
         import contextlib
         import io
-        from test_outcomes import package, Storage
+        from test_outcomes import is_claim_key, package, Storage
         from cli_test_runner import main
 
         config = package(self.root)
@@ -144,7 +144,11 @@ class RunTests(unittest.TestCase):
         self.assertEqual(len(list((self.root / 'runs').iterdir())), 1)
         inventory = json.loads((run_path / 'rollback-inventory.json').read_text())
         self.assertEqual(inventory['run_id'], reference['run_id'])
-        self.assertEqual(len(inventory['new_keys']), len(client.written))
+        content_writes = {key for key in client.written if not is_claim_key(key, 'workbench-lite')}
+        self.assertEqual(len(inventory['new_keys']), len(content_writes))
+        self.assertTrue(
+            all(not is_claim_key(item['key'], 'workbench-lite') for item in inventory['new_keys'])
+        )
         self.assertFalse(inventory['deletion_authorized'])
         self.assertEqual(json.loads(rollback_copy.read_text()), inventory)
 
