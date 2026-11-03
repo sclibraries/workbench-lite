@@ -351,11 +351,7 @@ def claim_evidence_for_run(path, events):
     ):
         return reduce_claim_evidence(events)
     expected = _expected_claims_from_run(path)
-    if expected is None:
-        evidence = reduce_claim_evidence(events, require_context=True)
-        evidence.expectations_valid = False
-        return evidence
-    return reduce_claim_evidence(events, expected, require_context=True)
+    return reduce_claim_evidence(events, expected, plan_valid=expected is not None)
 
 
 def _expected_claims_from_run(path):

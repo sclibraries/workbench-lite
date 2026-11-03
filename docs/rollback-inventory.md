@@ -70,12 +70,16 @@ confirmed as `created` or `matched` and unsettled claims as `unknown` or `unsett
 claim conflict stopped content uploads, its reviewable inventory may have no `new_keys`:
 preview reports zero deletions, and confirmed execute completes with nothing deleted.
 This empty-scope exception applies only when the inventory shows a claim created by that
-run. Expected claim identities are checked against the immutable upload plan. Missing,
-reduced, altered, or malformed claim evidence makes the inventory `invalid_evidence`, and
-rollback refuses before deleting content. Unknown claim operations still require
-reconciliation and block rollback. A valid conflict result with no unresolved claim
-operation does not by itself invalidate the inventory; confirmed content remains eligible
-for normal rollback.
+run. Expected claim identities are checked against the immutable upload plan. Once claim
+context is recorded, missing, reduced, altered, or malformed claim evidence makes the
+inventory `invalid_evidence`, and rollback refuses before deleting content. A successful
+`created` or `matched` result must record the expected checksum and size with checksum type
+`FULL_OBJECT`; any mismatch is invalid evidence. A settled conflict is valid evidence but
+does not confirm a claim creation. Unknown claim operations still require reconciliation and
+block rollback. When no claim context was recorded, the claim phase was not reached; the
+inventory preserves the run's journal state as `incomplete_stage` or
+`needs_reconciliation`. A valid conflict result with no unresolved claim operation does not
+by itself invalidate the inventory; confirmed content remains eligible for normal rollback.
 
 ```sh
 workbench-lite reconcile workbench-lite-runs/RUN_ID

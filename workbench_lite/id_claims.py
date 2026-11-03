@@ -56,11 +56,11 @@ class ClaimEvidence:
     latest: dict[tuple, dict]
     counts: dict[str, int]
     created: set[tuple]
-    expectations_valid: bool
+    state: str
 
     @property
     def settled(self):
-        return self.expectations_valid and all(
+        return self.state == 'valid' and all(
             _claim_result_settled(self.latest.get(identity), identity) for identity in self.expected
         )
 
@@ -69,9 +69,11 @@ class ClaimEvidence:
         return bool(self.created)
 
     def retained_claims(self):
+        if self.state == 'not_reached':
+            return []
         retained = []
         for identity in sorted(self.expected, key=lambda item: item[1]):
-            status = _claim_status(self.latest.get(identity))
+            status = _claim_status(self.latest.get(identity), identity)
             if status in {'created', 'matched', 'unknown', 'unsettled'}:
                 retained.append(_retained_claim(identity, status))
         return retained
@@ -153,16 +155,24 @@ def _planned_object_ids(entries):
     return objects
 
 
-def reduce_claim_evidence(events, expected_claims=None, *, require_context=False):
+def reduce_claim_evidence(events, expected_claims=None, *, plan_valid=True):
     context_sets, contexts_valid, has_context = _claim_context_sets(events)
     expected = set(expected_claims) if expected_claims is not None else set().union(*context_sets)
-    valid = contexts_valid and (not require_context or has_context)
+    valid = contexts_valid and plan_valid and bool(expected)
     if expected_claims is not None and any(claims != expected for claims in context_sets):
         valid = False
     latest, created, operations_valid = _claim_operations(events, expected)
     valid = valid and operations_valid
     counts = _claim_counts(expected, latest)
-    return ClaimEvidence(expected, latest, counts, created, valid)
+    has_operations = any(
+        event.get('stage') == 'claim' and event['kind'] in {'intent', 'result'} for event in events
+    )
+    state = 'not_reached'
+    if has_context:
+        state = 'valid' if valid else 'invalid'
+    elif has_operations:
+        state = 'invalid'
+    return ClaimEvidence(expected, latest, counts, created, state)
 
 
 def _claim_context_sets(events):
@@ -209,6 +219,7 @@ def _claim_operations(events, expected):
             latest[identity] = event
         elif intents.get(operation_id) == identity:
             latest[identity] = event
+            valid = _claim_result_valid(event, identity) and valid
             if _claim_result_created(event, identity):
                 created.add(identity)
         else:
@@ -220,16 +231,16 @@ def _claim_counts(expected, latest):
     statuses = {status: 0 for status in ('created', 'matched', 'absent', 'conflict', 'unknown')}
     counts = {'expected': len(expected), **statuses, 'unsettled': 0}
     for identity in expected:
-        status = _claim_status(latest.get(identity))
+        status = _claim_status(latest.get(identity), identity)
         counts[status if status in statuses else 'unsettled'] += 1
     return counts
 
 
-def _claim_status(event):
+def _claim_status(event, identity):
     status = event.get('status') if event and event.get('kind') == 'result' else 'unsettled'
-    return (
-        status if status in {'created', 'matched', 'absent', 'conflict', 'unknown'} else 'unsettled'
-    )
+    if status not in {'created', 'matched', 'absent', 'conflict', 'unknown'}:
+        return 'unsettled'
+    return status if _claim_result_valid(event, identity) else 'unsettled'
 
 
 def _claim_result_settled(event, identity):
@@ -237,19 +248,32 @@ def _claim_result_settled(event, identity):
         event
         and event.get('kind') == 'result'
         and event.get('status') in {'created', 'matched'}
-        and event.get('remote_outcome') in {'written', 'matched'}
-        and event.get('observed_checksum') == identity[2]
+        and _claim_result_valid(event, identity)
+    )
+
+
+def _claim_result_valid(event, identity):
+    outcomes = {
+        'created': 'written',
+        'matched': 'matched',
+        'absent': 'absent',
+        'conflict': 'conflict',
+        'unknown': 'unknown',
+    }
+    status = event.get('status')
+    if event.get('kind') != 'result' or outcomes.get(status) != event.get('remote_outcome'):
+        return False
+    if status not in {'created', 'matched'}:
+        return True
+    return (
+        event.get('observed_checksum') == identity[2]
         and event.get('observed_size_bytes') == identity[3]
         and event.get('checksum_type') == 'FULL_OBJECT'
     )
 
 
 def _claim_result_created(event, identity):
-    return bool(
-        event.get('status') == 'created'
-        and event.get('remote_outcome') == 'written'
-        and _claim_result_settled(event, identity)
-    )
+    return bool(event.get('status') == 'created' and _claim_result_settled(event, identity))
 
 
 def _retained_claim(identity, status):

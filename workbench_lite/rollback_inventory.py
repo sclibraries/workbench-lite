@@ -92,7 +92,7 @@ def build_inventory(run_path):
     )
     _load_inventory_config(inputs, path)
     claim_evidence = _claim_inventory(inputs)
-    if not claim_evidence.expectations_valid:
+    if claim_evidence.state == 'invalid':
         inputs.errors.claims = (
             'Claim evidence is invalid or differs from the immutable upload plan.'
         )
@@ -480,11 +480,7 @@ def _claim_inventory(inputs):
     if inputs.stage.mode == 'no_push':
         return reduce_claim_evidence(events)
     expected = _expected_claims(inputs)
-    if expected is None:
-        evidence = reduce_claim_evidence(events, require_context=True)
-        evidence.expectations_valid = False
-        return evidence
-    return reduce_claim_evidence(events, expected, require_context=True)
+    return reduce_claim_evidence(events, expected, plan_valid=expected is not None)
 
 
 def _expected_claims(inputs):
