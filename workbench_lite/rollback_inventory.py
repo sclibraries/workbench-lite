@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .diagnostics import sanitize
-from .id_claims import claim_identities_from_plan, reduce_claim_evidence
+from .id_claims import ClaimEvidence, claim_identities_from_plan, reduce_claim_evidence
 from .runs import JournalError, atomic_write, digest, json_bytes, read_events
 
 INVENTORY_VERSION = 1
@@ -59,6 +59,7 @@ class _InventoryErrors:
     journal: str | None
     plan: str | None
     metadata: str | None
+    claims: str | None = None
 
 
 @dataclass
@@ -78,6 +79,7 @@ class _InventoryDocument:
     manifest_urls: list
     derivatives: list
     state: str
+    claim_evidence: ClaimEvidence
 
 
 def build_inventory(run_path):
@@ -89,6 +91,11 @@ def build_inventory(run_path):
         inputs.plan, inputs.stage.mode, operation_evidence
     )
     _load_inventory_config(inputs, path)
+    claim_evidence = _claim_inventory(inputs)
+    if not claim_evidence.expectations_valid:
+        inputs.errors.claims = (
+            'Claim evidence is invalid or differs from the immutable upload plan.'
+        )
     manifest_urls = _manifest_urls(key_groups['new_keys'], inputs.config_snapshot, inputs.events)
     derivatives = _local_derivatives(inputs.events)
     unresolved = _unresolved_operations(operation_evidence)
@@ -104,6 +111,7 @@ def build_inventory(run_path):
             manifest_urls,
             derivatives,
             state,
+            claim_evidence,
         )
     )
 
@@ -428,6 +436,7 @@ def _inventory_state(state):
         state.inputs.errors.journal
         or state.inputs.errors.plan
         or state.inputs.errors.metadata
+        or state.inputs.errors.claims
         or state.inputs.stage.mode == 'no_push'
     ):
         return 'invalid_evidence'
@@ -442,7 +451,7 @@ def _inventory_state(state):
 
 def _inventory_document(document):
     inputs = document.inputs
-    claim_evidence = _claim_inventory(inputs)
+    claim_evidence = document.claim_evidence
     return {
         'schema_version': INVENTORY_VERSION,
         'kind': 'rollback-inventory',
@@ -516,7 +525,9 @@ def _pending_operation_summaries(unresolved):
 
 
 def _inventory_errors(errors):
-    return [error for error in (errors.journal, errors.plan, errors.metadata) if error]
+    return [
+        error for error in (errors.journal, errors.plan, errors.metadata, errors.claims) if error
+    ]
 
 
 def write_inventory(run_path, output_path=None):
