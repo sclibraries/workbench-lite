@@ -18,7 +18,7 @@ from .retry_policy import (
     upload_error_details,
 )
 from .runs import read_events
-from .id_claims import check_id_claims
+from .id_claims import check_id_claims, verify_claims
 
 # The SDK remains optional for checks and local generation.
 try:
@@ -284,7 +284,7 @@ def push_upload_plan(
     run = _prepare_push_run(upload_plan, settings)
     _check_push_claims(run, id_claims)
     _process_push_entries(run)
-    _finish_push_run(run)
+    _finish_push_run(run, id_claims)
     return _build_push_report(run)
 
 
@@ -341,14 +341,29 @@ def _process_push_entries(run):
             run.verified.append(outcome.verified_identity)
 
 
-def _finish_push_run(run):
+def _finish_push_run(run, id_claims):
     settings = run.settings
+    verified_claims = _verify_final_claims(run, id_claims)
     _write_legacy_rollback(
         settings.rollback_path, settings.dry_run, run.results, settings.journal, run.errors
     )
     _record_verified_batch(
-        settings.journal, settings.dry_run, run.entries, run.verified, run.errors
+        settings.journal,
+        settings.dry_run,
+        run.entries,
+        run.verified,
+        verified_claims,
+        run.errors,
     )
+
+
+def _verify_final_claims(run, claims):
+    settings = run.settings
+    if settings.dry_run or claims is None or run.stopped or run.errors:
+        return []
+    verified, errors = verify_claims(claims, settings.s3_client)
+    run.errors.extend(errors)
+    return verified
 
 
 def _ordered_entries(upload_plan):
@@ -856,7 +871,7 @@ def _write_legacy_rollback(rollback_path, dry_run, results, journal, errors):
         errors.append(f'Rollback inventory could not be written: {operation_error(exc)}')
 
 
-def _record_verified_batch(journal, dry_run, entries, verified, errors):
+def _record_verified_batch(journal, dry_run, entries, verified, verified_claims, errors):
     if not journal or dry_run or errors or len(verified) != len(entries) or not entries:
         return
     journal.append(
@@ -866,6 +881,7 @@ def _record_verified_batch(journal, dry_run, entries, verified, errors):
             'run_id': journal.run_id,
             'verification_contract': 's3-sha256-v1',
             'verified_count': len(verified),
+            'verified_claims': verified_claims,
             'manifest_count': sum(entry.role == 'manifest' for entry in entries),
             'publication_owner': 'workbench-lite',
             'plan_sha256': hashlib.sha256(

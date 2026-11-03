@@ -113,6 +113,7 @@ never delete by prefix.
 | Data/audit upload | Stop subsequent uploads on any required failure | Exit 1; retain acknowledgments/unknown intents; no manifest; held |
 | Remote byte verification | Stop subsequent uploads on mismatch/read failure | Exit 1; acknowledged upload remains recorded; held |
 | Manifest upload/verification | Stop immediately; no automatic rollback | Exit 1; possibly directly accessible manifest; held |
+| Final claim checks | Check every plan-derived claim once with a read-only checksum-enabled HEAD before finalization | Missing, changed, wrong checksum/type, or failed HEAD: exit 1; no receipt; held |
 | Journal intent/result persistence | Abort all remote writes | Exit 1; missing receipt means unknown operation; held |
 | Summary persistence | Do not write the completion receipt | Exit 1; finalization incomplete; held |
 | Receipt write or marker removal | Keep the pending marker when possible | Exit 1; finalization incomplete; held |
@@ -129,7 +130,10 @@ Claims are reserved in the private bucket at `{s3_prefix}/_ids/{canonical_id}.js
 The read pass covers the validated package rows, whether or not generated files are present.
 Execute starts claim creation only after existing blocking checks have passed; every
 successful claim uses a conditional upload followed by one checksum-enabled verification
-HEAD. A claim remains reserved after later upload failure or rollback.
+HEAD. After content verification, finalization performs another read-only checksum-enabled
+HEAD, without reading object bodies, for every claim derived from the immutable upload plan.
+Each must still have the planned SHA-256 and size with checksum type `FULL_OBJECT`. A claim
+remains reserved after later upload failure or rollback.
 
 ## Durable completion and inspection
 
@@ -162,11 +166,20 @@ contract are retained but report held under this inspector; do not relabel or ed
 them to bypass reconciliation. Existing generated-only runs can still proceed to
 execute if their original input/plan checks pass.
 
-The receipt also requires an exact expected claim set with settled `created` or `matched`
-evidence for every claim, including its key, SHA-256, size and FULL_OBJECT checksum type.
-Missing, altered, conflicting or unknown claim evidence keeps publication held.
-`inspect-run` reports claim counts and lists any unsettled claim intent as an unknown
-operation. Claims are not content-plan entries or `push` results.
+The receipt contains `verified_claims`, one row for each plan-derived claim, with exactly
+`key`, `checksum`, `size_bytes` and `checksum_type`. Receipt inspection checks that the
+rows cover the plan-derived claims exactly, with no duplicates or altered identities;
+`verified_count` continues to count content-plan entries only. Inspection is offline and
+does not recheck S3. A missing or changed claim, a checksum or size mismatch, a checksum
+type other than `FULL_OBJECT`, or a failed final HEAD prevents the receipt, returns a
+nonzero result and holds the batch. An interrupted final check leaves no receipt; resume
+checks every claim again from S3 before finalization.
+
+Claim journal events are recovery records for inspection, reconciliation and resume.
+The journal reader validates each event type's shape and reports malformed claim events as
+journal errors. Inspection reports claim counts and any unresolved claim intent as an
+unknown operation. Claim journal values do not authorize a receipt; the receipt records the
+final S3 checks. Claims are not content-plan entries or `push` results.
 
 `summary.json` and `summary.txt` are cached before final commit and can still show
 `running`/held after success. Push's immediate report also remains held pending

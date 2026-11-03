@@ -12,13 +12,13 @@ from botocore.exceptions import BotoCoreError, ClientError
 
 from .config import ConfigError, load_config
 from .diagnostics import operation_error
+from .id_claims import reduce_claim_evidence
 from .locks import lock_destination
 from .rollback_inventory import build_inventory
 from .runs import (
     JournalError,
     RunJournal,
     atomic_write,
-    claim_evidence_for_run,
     json_bytes,
     read_events,
 )
@@ -772,7 +772,7 @@ def run_rollback(run_path, client, *, execute=False, confirm=None, config_path=N
     source_path, inventory, source_events, source_config = _validate_source(
         run_path, client, config_path=config_path
     )
-    claim_evidence = claim_evidence_for_run(source_path, source_events)
+    claim_evidence = reduce_claim_evidence(source_events)
     _validate_rollback_confirmation(inventory, execute, confirm, claim_evidence)
     _lock_rollback_targets(locks, source_path, client, inventory)
     candidate_keys = {(item['bucket'], item['key']) for item in inventory.get('new_keys') or []}

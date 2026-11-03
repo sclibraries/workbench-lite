@@ -64,22 +64,25 @@ the inventory no longer reports `needs_reconciliation`; conflicts remain exclude
 from `new_keys` and are listed separately.
 
 ID claims are recorded separately from planned content. `retained_claims` lists claims
-confirmed as `created` or `matched` and unsettled claims as `unknown` or `unsettled`;
-`claim_counts` also reports absent and conflicting claims. A claim is never included in
-`new_keys` and rollback never deletes it. If an execute run created claims but a later
-claim conflict stopped content uploads, its reviewable inventory may have no `new_keys`:
-preview reports zero deletions, and confirmed execute completes with nothing deleted.
-This empty-scope exception applies only when the inventory shows a claim created by that
-run. Expected claim identities are checked against the immutable upload plan. Once claim
-context is recorded, missing, reduced, altered, or malformed claim evidence makes the
-inventory `invalid_evidence`, and rollback refuses before deleting content. A successful
-`created` or `matched` result must record the expected checksum and size with checksum type
-`FULL_OBJECT`; any mismatch is invalid evidence. A settled conflict is valid evidence but
-does not confirm a claim creation. Unknown claim operations still require reconciliation and
-block rollback. When no claim context was recorded, the claim phase was not reached; the
-inventory preserves the run's journal state as `incomplete_stage` or
-`needs_reconciliation`. A valid conflict result with no unresolved claim operation does not
-by itself invalidate the inventory; confirmed content remains eligible for normal rollback.
+confirmed as `created` or `matched` and unresolved claims as `unknown` or `unsettled`;
+`claim_counts` also reports absent and conflicting claims. Claims are never included in
+`new_keys` and rollback never deletes them. Claim journal events support recovery and
+reporting only; their checksum values and agreement with the upload plan do not determine
+which content keys are eligible for rollback. A malformed claim event is a journal error
+and makes the inventory `invalid_evidence`, like other malformed journal records.
+
+Pending claim intents and unknown claim results still require reconciliation and block
+rollback. A resolved claim conflict does not by itself block rollback; confirmed content
+remains eligible under the normal content rules. With no claim context, the claim phase was
+not reached, and an interrupted run keeps its normal `incomplete_stage` or
+`needs_reconciliation` state.
+
+If claims were created but a later claim conflict stopped content uploads, a reviewable
+inventory can have no `new_keys`. Preview reports zero deletions. Execute permits this
+empty-scope case only when the journal records at least one acknowledged `created` claim
+result from the run; a later `matched` result does not erase that creation history. This
+creation record is the only claim fact rollback uses for the exception. Execute then exits
+successfully without deleting anything. Claims remain reserved after rollback.
 
 ```sh
 workbench-lite reconcile workbench-lite-runs/RUN_ID

@@ -14,7 +14,7 @@ from uuid import uuid4
 
 from .diagnostics import sanitize
 from . import __version__
-from .id_claims import claim_identities_from_plan, reduce_claim_evidence
+from .id_claims import claim_identities_from_plan, reduce_claim_evidence, validate_claim_event
 
 SCHEMA_VERSION = 1
 EXIT_STATES = {0: 'completed', 4: 'completed-with-errors', 130: 'interrupted', 143: 'interrupted'}
@@ -157,6 +157,7 @@ def read_events(path):
                         not isinstance(event['pid'], int) or event['pid'] <= 0
                     ):
                         raise ValueError('Invalid process identity')
+                    validate_claim_event(event, events)
                     events.append(event)
                 except (ValueError, KeyError, TypeError, UnicodeDecodeError):
                     error = 'Malformed or truncated journal; valid prefix retained.'
@@ -217,14 +218,13 @@ def _valid_receipt_event(event, receipt):
 
 
 def _valid_publication_receipt(path, events, receipt):
-    if (
-        receipt.get('verification_contract') != 's3-sha256-v1'
-        or not claim_evidence_for_run(path, events).settled
-    ):
+    if not isinstance(receipt, dict) or receipt.get('verification_contract') != 's3-sha256-v1':
         return False
     try:
         plan_path = Path(path) / 'upload-plan.json'
         if digest(plan_path) != receipt['plan_sha256']:
+            return False
+        if not _verified_claims_match_plan(path, receipt):
             return False
         plan = json.loads(plan_path.read_text())['entries']
         results = _push_stage_results(events)
@@ -254,6 +254,30 @@ def _valid_publication_receipt(path, events, receipt):
         )
     except (OSError, ValueError, KeyError, TypeError):
         return False
+
+
+def _verified_claims_match_plan(path, receipt):
+    expected = _expected_claims_from_run(path)
+    claims = receipt.get('verified_claims')
+    if expected is None or not isinstance(claims, list) or len(claims) != len(expected):
+        return False
+    observed = set()
+    required = {'key', 'checksum', 'size_bytes', 'checksum_type'}
+    for claim in claims:
+        if not isinstance(claim, dict) or set(claim) != required:
+            return False
+        key, checksum, size = claim['key'], claim['checksum'], claim['size_bytes']
+        if (
+            not isinstance(key, str)
+            or not isinstance(checksum, str)
+            or not isinstance(size, int)
+            or isinstance(size, bool)
+            or claim['checksum_type'] != 'FULL_OBJECT'
+        ):
+            return False
+        observed.add((key, checksum, size))
+    expected_rows = {(key, checksum, size) for _, key, checksum, size in expected}
+    return len(observed) == len(claims) and observed == expected_rows
 
 
 def _push_stage_results(events):
@@ -344,16 +368,6 @@ def _receipt_matches_plan(evidence):
     )
 
 
-def claim_evidence_for_run(path, events):
-    if not any(
-        event['kind'] == 'stage_started' and event['stage'] in {'push', 'push-dry-run'}
-        for event in events
-    ):
-        return reduce_claim_evidence(events)
-    expected = _expected_claims_from_run(path)
-    return reduce_claim_evidence(events, expected, plan_valid=expected is not None)
-
-
 def _expected_claims_from_run(path):
     try:
         path = Path(path)
@@ -399,7 +413,7 @@ def inspect_run(path):
         'journal_error': error,
         'event_count': len(events),
         'counts': counts,
-        'claim_counts': claim_evidence_for_run(path, events).counts,
+        'claim_counts': reduce_claim_evidence(events).counts,
         'retry_count': retry_count,
         'classification_counts': classification_counts,
         'push_artifacts': push_artifacts,
@@ -631,7 +645,7 @@ class RunJournal:
             and verified
             and verified['manifest_count'] >= 1
             and not inspect_run(self.path)['unknown_operations']
-            and claim_evidence_for_run(self.path, events).settled
+            and _valid_publication_receipt(self.path, events, verified)
         ):
             fields['publication_receipt'] = verified
         pending = self.path / 'publication-pending'

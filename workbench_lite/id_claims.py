@@ -19,6 +19,15 @@ except ImportError:
 else:
     STORAGE_ERRORS = (OSError, BotoCoreError, ClientError, S3UploadFailedError)
 
+_CLAIM_OUTCOMES = {
+    'created': 'written',
+    'matched': 'matched',
+    'absent': 'absent',
+    'conflict': 'conflict',
+    'unknown': 'unknown',
+}
+_CLAIM_EVIDENCE_FIELDS = ('observed_checksum', 'observed_size_bytes', 'checksum_type')
+
 
 @dataclass(frozen=True)
 class IdClaim:
@@ -59,12 +68,6 @@ class ClaimEvidence:
     state: str
 
     @property
-    def settled(self):
-        return self.state == 'valid' and all(
-            _claim_result_settled(self.latest.get(identity), identity) for identity in self.expected
-        )
-
-    @property
     def has_confirmed_creation(self):
         return bool(self.created)
 
@@ -73,7 +76,7 @@ class ClaimEvidence:
             return []
         retained = []
         for identity in sorted(self.expected, key=lambda item: item[1]):
-            status = _claim_status(self.latest.get(identity), identity)
+            status = _claim_status(self.latest.get(identity))
             if status in {'created', 'matched', 'unknown', 'unsettled'}:
                 retained.append(_retained_claim(identity, status))
         return retained
@@ -137,6 +140,35 @@ def claim_identities_from_plan(entries, config, batch_id):
     return {_claim_identity(claim.identity()) for claim in claims}
 
 
+def verify_claims(claims, client):
+    verified, errors = [], []
+    for claim in claims:
+        try:
+            observed = client.inspect_object(claim.bucket, claim.key)
+        except STORAGE_ERRORS as exc:
+            errors.append(
+                f'Final ID claim check failed for {claim.raw_id!r}: {operation_error(exc)}'
+            )
+            continue
+        if not _identity_matches(observed, claim):
+            errors.append(
+                f'Final ID claim check failed for {claim.raw_id!r}: '
+                'missing or mismatched SHA-256, size, or FULL_OBJECT checksum type.'
+            )
+            continue
+        verified.append(_verified_claim(claim, observed))
+    return verified, errors
+
+
+def _verified_claim(claim, observed):
+    return {
+        'key': claim.key,
+        'checksum': claim.checksum,
+        'size_bytes': claim.size_bytes,
+        'checksum_type': observed.checksum_type,
+    }
+
+
 def _planned_object_ids(entries):
     objects = {}
     for entry in entries:
@@ -155,12 +187,112 @@ def _planned_object_ids(entries):
     return objects
 
 
-def reduce_claim_evidence(events, expected_claims=None, *, plan_valid=True):
+def validate_claim_event(event, prior_events):
+    if event.get('stage') != 'claim':
+        return
+    if event['kind'] == 'context':
+        _validate_claim_context_event(event, prior_events)
+    elif event['kind'] in {'intent', 'result'}:
+        _validate_claim_operation_event(event, prior_events)
+    else:
+        raise ValueError('Unknown claim journal event type')
+
+
+def _validate_claim_context_event(event, prior_events):
+    claims = event.get('expected_claims')
+    if not isinstance(claims, list) or not claims:
+        raise ValueError('Invalid claim context')
+    if any(
+        not isinstance(claim, dict)
+        or set(claim) != {'bucket', 'key', 'checksum', 'size_bytes'}
+        or not _valid_claim_identity(claim)
+        for claim in claims
+    ):
+        raise ValueError('Invalid claim identity')
+    current = {_claim_identity(claim) for claim in claims}
+    if len(current) != len(claims):
+        raise ValueError('Duplicate claim identity')
+    previous = next(
+        (
+            item
+            for item in reversed(prior_events)
+            if item.get('stage') == 'claim' and item['kind'] == 'context'
+        ),
+        None,
+    )
+    if previous:
+        if current != {_claim_identity(claim) for claim in previous['expected_claims']}:
+            raise ValueError('Claim contexts disagree')
+
+
+def _validate_claim_operation_event(event, prior_events):
+    if not _valid_claim_identity(event):
+        raise ValueError('Invalid claim operation identity')
+    operation_id = event.get('operation_id')
+    attempt = event.get('attempt')
+    if not isinstance(operation_id, str) or not operation_id:
+        raise ValueError('Invalid claim operation ID')
+    if not isinstance(attempt, int) or isinstance(attempt, bool) or attempt < 1:
+        raise ValueError('Invalid claim attempt')
+    context = next(
+        (
+            item
+            for item in reversed(prior_events)
+            if item.get('stage') == 'claim' and item['kind'] == 'context'
+        ),
+        None,
+    )
+    identity = _claim_identity(event)
+    if context is None or identity not in {
+        _claim_identity(claim) for claim in context.get('expected_claims', [])
+    }:
+        raise ValueError('Claim operation has no matching context')
+    if event['kind'] == 'intent':
+        return
+    _validate_claim_result_event(event, prior_events, identity)
+
+
+def _validate_claim_result_event(event, prior_events, identity):
+    status = event.get('status')
+    if _CLAIM_OUTCOMES.get(status) != event.get('remote_outcome'):
+        raise ValueError('Invalid claim result status or outcome')
+    intents = [
+        item
+        for item in prior_events
+        if item.get('stage') == 'claim'
+        and item['kind'] == 'intent'
+        and item.get('operation_id') == event.get('operation_id')
+    ]
+    if not any(_claim_identity(item) == identity for item in intents):
+        raise ValueError('Claim result has no matching intent')
+    _validate_claim_result_fields(event, status)
+
+
+def _validate_claim_result_fields(event, status):
+    present = [field in event for field in _CLAIM_EVIDENCE_FIELDS]
+    if status in {'created', 'matched'} and not all(present):
+        raise ValueError('Successful claim result is missing verification fields')
+    if any(present) and not all(present):
+        raise ValueError('Incomplete claim result evidence')
+    if not all(present):
+        return
+    checksum, size, checksum_type = (event[field] for field in _CLAIM_EVIDENCE_FIELDS)
+    if status in {'created', 'matched'} and (
+        not _valid_checksum(checksum) or not _valid_size(size) or not isinstance(checksum_type, str)
+    ):
+        raise ValueError('Invalid successful claim verification fields')
+    if checksum is not None and not _valid_checksum(checksum):
+        raise ValueError('Invalid claim result checksum')
+    if size is not None and not _valid_size(size):
+        raise ValueError('Invalid claim result size')
+    if checksum_type is not None and not isinstance(checksum_type, str):
+        raise ValueError('Invalid claim result checksum type')
+
+
+def reduce_claim_evidence(events):
     context_sets, contexts_valid, has_context = _claim_context_sets(events)
-    expected = set(expected_claims) if expected_claims is not None else set().union(*context_sets)
-    valid = contexts_valid and plan_valid and bool(expected)
-    if expected_claims is not None and any(claims != expected for claims in context_sets):
-        valid = False
+    expected = set().union(*context_sets) if context_sets else set()
+    valid = contexts_valid and bool(expected)
     latest, created, operations_valid = _claim_operations(events, expected)
     valid = valid and operations_valid
     counts = _claim_counts(expected, latest)
@@ -219,8 +351,8 @@ def _claim_operations(events, expected):
             latest[identity] = event
         elif intents.get(operation_id) == identity:
             latest[identity] = event
-            valid = _claim_result_valid(event, identity) and valid
-            if _claim_result_created(event, identity):
+            valid = _claim_result_valid(event) and valid
+            if _claim_result_created(event):
                 created.add(identity)
         else:
             valid = False
@@ -231,49 +363,43 @@ def _claim_counts(expected, latest):
     statuses = {status: 0 for status in ('created', 'matched', 'absent', 'conflict', 'unknown')}
     counts = {'expected': len(expected), **statuses, 'unsettled': 0}
     for identity in expected:
-        status = _claim_status(latest.get(identity), identity)
+        status = _claim_status(latest.get(identity))
         counts[status if status in statuses else 'unsettled'] += 1
     return counts
 
 
-def _claim_status(event, identity):
+def _claim_status(event):
     status = event.get('status') if event and event.get('kind') == 'result' else 'unsettled'
     if status not in {'created', 'matched', 'absent', 'conflict', 'unknown'}:
         return 'unsettled'
-    return status if _claim_result_valid(event, identity) else 'unsettled'
+    return status if _claim_result_valid(event) else 'unsettled'
 
 
-def _claim_result_settled(event, identity):
-    return bool(
-        event
-        and event.get('kind') == 'result'
-        and event.get('status') in {'created', 'matched'}
-        and _claim_result_valid(event, identity)
-    )
-
-
-def _claim_result_valid(event, identity):
-    outcomes = {
-        'created': 'written',
-        'matched': 'matched',
-        'absent': 'absent',
-        'conflict': 'conflict',
-        'unknown': 'unknown',
-    }
+def _claim_result_valid(event):
     status = event.get('status')
-    if event.get('kind') != 'result' or outcomes.get(status) != event.get('remote_outcome'):
+    if event.get('kind') != 'result' or _CLAIM_OUTCOMES.get(status) != event.get('remote_outcome'):
         return False
-    if status not in {'created', 'matched'}:
+    fields = [field in event for field in _CLAIM_EVIDENCE_FIELDS]
+    if status in {'created', 'matched'} and not all(fields):
+        return False
+    if any(fields) and not all(fields):
+        return False
+    if not all(fields):
         return True
-    return (
-        event.get('observed_checksum') == identity[2]
-        and event.get('observed_size_bytes') == identity[3]
-        and event.get('checksum_type') == 'FULL_OBJECT'
-    )
+    checksum, size, checksum_type = (event[field] for field in _CLAIM_EVIDENCE_FIELDS)
+    if status in {'created', 'matched'} and (
+        not _valid_checksum(checksum) or not _valid_size(size) or not isinstance(checksum_type, str)
+    ):
+        return False
+    if checksum is not None and not _valid_checksum(checksum):
+        return False
+    if size is not None and not _valid_size(size):
+        return False
+    return checksum_type is None or isinstance(checksum_type, str)
 
 
-def _claim_result_created(event, identity):
-    return bool(event.get('status') == 'created' and _claim_result_settled(event, identity))
+def _claim_result_created(event):
+    return bool(event.get('status') == 'created' and _claim_result_valid(event))
 
 
 def _retained_claim(identity, status):
@@ -305,6 +431,18 @@ def _valid_claim_identity(claim):
         and not isinstance(size, bool)
         and size >= 0
     )
+
+
+def _valid_checksum(value):
+    return (
+        isinstance(value, str)
+        and len(value) == 64
+        and all(character in '0123456789abcdef' for character in value)
+    )
+
+
+def _valid_size(value):
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 0
 
 
 def _effective_prefix(config):

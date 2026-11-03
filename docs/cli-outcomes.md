@@ -9,7 +9,7 @@ report. Publication and recovery limits are described in the linked guides.
 | Code | Meaning |
 | --- | --- |
 | 0 | Command completed without required failures |
-| 1 | Processing aborted, required upload artifact missing, upload or claim storage failed, or evidence/rollback inventory could not be written |
+| 1 | Processing aborted, required upload artifact missing, upload or claim storage/final verification failed, or evidence/rollback inventory could not be written |
 | 2 | Invalid arguments, including execute with dummy files or without a required generated directory |
 | 3 | Input/configuration validation errors, invalid manifests, or a package ID claim conflict |
 | 4 | Generation or URL verification completed independent work with failures |
@@ -63,7 +63,20 @@ existing execute guard still rejects reuse. The generated-output and run locks a
 before the reference and run are examined; destination locks are held through reconciliation,
 upload verification, receipt commit and release.
 
-Read-only inspection derives current state from the valid journal prefix. It neither modifies evidence nor calls S3. It returns 1 for journal damage, an incomplete stage or unknown operations; otherwise it returns the recorded terminal exit status. A claim phase with no recorded claim context was not reached, so inspection preserves the run's existing interruption state. Successful claim results must match the expected checksum and size with checksum type `FULL_OBJECT`; a settled conflict is a valid resolved outcome, while mismatched success evidence holds publication. Local PID/hostname liveness helps distinguish running from inferred interrupted stages; this is advisory, not a lock or proof of process identity. A torn final line is reported without discarding earlier records. Do not append to a damaged journal. Stored summaries are checkpoints and may be stale after abrupt termination; use inspection for the current view.
+Read-only inspection derives current state from the valid journal prefix. It neither modifies evidence nor calls S3. It returns 1 for journal damage, an incomplete stage or unknown operations; otherwise it returns the recorded terminal exit status. Claim events are validated by type, and a malformed claim event makes the journal invalid. A claim phase with no recorded claim context was not reached, so inspection preserves the run's existing interruption state. Claim counts and unresolved claim operations support inspection, reconciliation and resume; claim journal values do not authorize publication. Local PID/hostname liveness helps distinguish running from inferred interrupted stages; this is advisory, not a lock or proof of process identity. A torn final line is reported without discarding earlier records. Do not append to a damaged journal. Stored summaries are checkpoints and may be stale after abrupt termination; use inspection for the current view.
+
+Before committing a successful execute receipt, finalization performs one read-only,
+checksum-enabled `HeadObject` for each claim derived from the immutable upload plan, with
+no object readback. It requires the planned SHA-256 and size with checksum type
+`FULL_OBJECT`. The receipt's
+`verified_claims` field contains exactly one row per claim, each with `key`, `checksum`,
+`size_bytes` and `checksum_type`; `verified_count` remains the number of content-plan
+entries. Inspection validates the rows against the plan without calling S3. A missing or
+changed claim, mismatched checksum or size, wrong checksum type, or failed final HEAD
+returns 1 and leaves publication held without a receipt. Resume repeats all final claim
+checks fresh after an interruption. On a successful execute with N expected claims and M
+claims absent on the initial read pass, claim storage makes `2N + M` HEAD requests and M
+PUT requests; an online dry run makes N HEAD requests.
 
 The unanchored `workbench-lite-runs/` gitignore rule covers default directories at any repository depth. Arbitrary `--run-dir` paths need their own ignore rule or an external location. Logs never determine the fixed machine-wide lock location. Archive or delete resolved evidence only after an explicit retention/reconciliation review; unresolved runs retain rollback provenance.
 
