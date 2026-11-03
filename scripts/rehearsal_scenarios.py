@@ -631,7 +631,7 @@ def _resume_interrupted_rollback(ctx, directory, source, prefix):
         raise ScenarioMismatch('rollback source hold was not retained')
     remaining = storage_listing(ctx.storage, ctx.args.private_bucket, f'{prefix}/')
     remaining.update(storage_listing(ctx.storage, ctx.args.public_bucket, f'{prefix}/'))
-    root = claim_root(prefix)
+    root = f'{ctx.args.private_bucket}/{claim_root(prefix)}'
     claims = {key for key in remaining if key.startswith(root)}
     content = set(remaining) - claims
     if content:
@@ -646,7 +646,7 @@ def _resume_interrupted_rollback(ctx, directory, source, prefix):
 def _assert_only_claims_remain(ctx, prefix):
     remaining = storage_listing(ctx.storage, ctx.args.private_bucket, prefix)
     remaining.update(storage_listing(ctx.storage, ctx.args.public_bucket, prefix))
-    root = claim_root(prefix)
+    root = f'{ctx.args.private_bucket}/{claim_root(prefix)}'
     claims = {key for key in remaining if key.startswith(root)}
     content = set(remaining) - claims
     if content:
@@ -727,8 +727,8 @@ def case_15(ctx, alias, directory, source, config, prefix):
         raise ScenarioMismatch('initial batch did not retain its completed publication receipt')
     if inspect_run(second_run)['publication']['state'] != 'held':
         raise ScenarioMismatch('duplicate batch was not held')
-    root = claim_root(prefix)
-    claims = sum(key.startswith(root) for listing in after.values() for key in listing)
+    root = f'{ctx.args.private_bucket}/{claim_root(prefix)}'
+    claims = sum(key.startswith(root) for key in after[ctx.args.private_bucket])
     if claims < 1:
         raise ScenarioMismatch('initial batch claim was not retained')
     return {

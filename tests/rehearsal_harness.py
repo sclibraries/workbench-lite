@@ -619,7 +619,7 @@ class FaultClient:
         self.client = self
         self.mode = mode
         self._claim_root = claim_root(claim_prefix)
-        wrapped_meta = getattr(self.client, 'meta', None)
+        wrapped_meta = getattr(client, 'meta', None)
         self.endpoint_url = getattr(client, 'endpoint_url', None) or getattr(
             wrapped_meta, 'endpoint_url', TEST_ENDPOINT
         )
@@ -627,13 +627,9 @@ class FaultClient:
             wrapped_meta, 'region_name', 'us-east-1'
         )
         self.meta = getattr(
-            self.client,
+            client,
             'meta',
-            getattr(
-                client,
-                'meta',
-                SimpleNamespace(endpoint_url=self.endpoint_url, region_name=self.region_name),
-            ),
+            SimpleNamespace(endpoint_url=self.endpoint_url, region_name=self.region_name),
         )
         self.put_calls = getattr(client, 'put_calls', [])
         self.delete_calls = getattr(client, 'delete_calls', [])
