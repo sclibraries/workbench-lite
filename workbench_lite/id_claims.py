@@ -253,8 +253,7 @@ def _validate_claim_operation_event(event, prior_events):
 
 
 def _validate_claim_result_event(event, prior_events, identity):
-    status = event.get('status')
-    if _CLAIM_OUTCOMES.get(status) != event.get('remote_outcome'):
+    if not _claim_result_valid(event):
         raise ValueError('Invalid claim result status or outcome')
     intents = [
         item
@@ -265,28 +264,6 @@ def _validate_claim_result_event(event, prior_events, identity):
     ]
     if not any(_claim_identity(item) == identity for item in intents):
         raise ValueError('Claim result has no matching intent')
-    _validate_claim_result_fields(event, status)
-
-
-def _validate_claim_result_fields(event, status):
-    present = [field in event for field in _CLAIM_EVIDENCE_FIELDS]
-    if status in {'created', 'matched'} and not all(present):
-        raise ValueError('Successful claim result is missing verification fields')
-    if any(present) and not all(present):
-        raise ValueError('Incomplete claim result evidence')
-    if not all(present):
-        return
-    checksum, size, checksum_type = (event[field] for field in _CLAIM_EVIDENCE_FIELDS)
-    if status in {'created', 'matched'} and (
-        not _valid_checksum(checksum) or not _valid_size(size) or not isinstance(checksum_type, str)
-    ):
-        raise ValueError('Invalid successful claim verification fields')
-    if checksum is not None and not _valid_checksum(checksum):
-        raise ValueError('Invalid claim result checksum')
-    if size is not None and not _valid_size(size):
-        raise ValueError('Invalid claim result size')
-    if checksum_type is not None and not isinstance(checksum_type, str):
-        raise ValueError('Invalid claim result checksum type')
 
 
 def reduce_claim_evidence(events):
@@ -377,7 +354,13 @@ def _claim_status(event):
 
 def _claim_result_valid(event):
     status = event.get('status')
-    if event.get('kind') != 'result' or _CLAIM_OUTCOMES.get(status) != event.get('remote_outcome'):
+    if (
+        event.get('kind') != 'result'
+        or not isinstance(status, str)
+        or status not in _CLAIM_OUTCOMES
+        or 'remote_outcome' not in event
+        or _CLAIM_OUTCOMES[status] != event['remote_outcome']
+    ):
         return False
     fields = [field in event for field in _CLAIM_EVIDENCE_FIELDS]
     if status in {'created', 'matched'} and not all(fields):
@@ -500,7 +483,7 @@ def check_id_claims(claims, read_client, write_client, journal, *, dry_run):
 
 
 def _record_expected_claims(claims, journal):
-    if journal is None:
+    if journal is None or not claims:
         return
     journal.append(
         'context',
