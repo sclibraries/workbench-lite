@@ -18,6 +18,7 @@ from rehearsal_harness import (
     TEST_PRIVATE_BUCKET,
     TEST_PUBLIC_BUCKET,
     FileS3Client,
+    FaultClient,
     cli_client_factory,
     clear_dead_test_locks,
     invoke_cli,
@@ -27,6 +28,7 @@ from rehearsal_harness import (
     start_worker,
 )
 from workbench_lite.runs import inspect_run, read_events
+from workbench_lite.s3_client import create_s3_client
 
 
 class RehearsalScenarioTests(unittest.TestCase):
@@ -57,6 +59,15 @@ class RehearsalScenarioTests(unittest.TestCase):
 
     def assert_contract_case(self, number):
         self.assertEqual(SCENARIOS_BY_NUMBER[number]['number'], number)
+
+    def test_fault_client_uses_inner_boto_endpoint(self):
+        with patch.dict('os.environ', {'AWS_EC2_METADATA_DISABLED': 'true'}):
+            client = create_s3_client('http://localhost:4566', 'us-east-1', None)
+        wrapped = FaultClient(client)
+        self.assertEqual(wrapped.endpoint_url, 'http://localhost:4566')
+        self.assertEqual(wrapped.meta.endpoint_url, 'http://localhost:4566')
+        self.assertEqual(wrapped.region_name, 'us-east-1')
+        self.assertIs(wrapped.client, wrapped)
 
     def assert_sentinels(self):
         for (bucket, key), checksum in self.sentinels.items():
