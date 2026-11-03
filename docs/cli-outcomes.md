@@ -17,6 +17,11 @@ report. Publication and recovery limits are described in the linked guides.
 
 A source missing at required preflight validation produces 3. A source disappearing afterward stops push with 1; generation may finish independent work and return 4. Missing-file warnings never make a missing upload successful. Invalid execute flags are rejected before input access. SIGKILL cannot write a terminal event; inspection identifies the incomplete stage instead.
 
+`check` returns 3 when different row IDs have the same canonical form: Unicode NFC
+normalization, then case folding, then the storage-segment normalizer. Parent and page IDs
+share one namespace, and comparison does not rewrite their original spelling. Exact duplicate
+IDs and upload-plan collisions continue to be reported by their existing checks.
+
 ## Run locations and workflow
 
 Each check, generation, standalone push or verification creates an exclusively allocated run ID under `./workbench-lite-runs` relative to the invocation directory. `--run-dir /absolute/root` overrides that root. The CLI prints the resolved run directory to stderr; JSON reports include `run_id` and `run_path`. Run directories are 0700 and evidence files are 0600. No automatic retention expiry or deletion is performed.

@@ -1,4 +1,5 @@
 import csv
+import unicodedata
 from collections import Counter, defaultdict
 from dataclasses import dataclass
 from pathlib import Path
@@ -7,7 +8,7 @@ from urllib.parse import urlparse
 
 from .config import ConfigError, load_config, normalize_additional_files
 from .models import CheckReport, PageRecord, UploadPlanEntry, WorkbenchObject
-from .storage_plan import build_upload_plan
+from .storage_plan import _normalize_segment, build_upload_plan
 from .preflight import safe_source, validate_content
 
 
@@ -119,7 +120,8 @@ def _build_check_plan(inputs, row_validation):
     upload_plan = build_upload_plan(
         objects, inputs.config, inputs.config_path, inputs.input_dir, run_id=inputs.run_id
     )
-    _validate_upload_plan_collisions(upload_plan, inputs.errors)
+    plan_collision_pairs = _validate_upload_plan_collisions(upload_plan, inputs.errors)
+    _validate_canonical_id_collisions(inputs.rows, inputs.errors, plan_collision_pairs)
     _validate_planned_content(
         upload_plan, inputs.input_dir, inputs.allow_dummy_files, inputs.errors
     )
@@ -296,6 +298,35 @@ def _validate_duplicate_ids(rows: List[Dict[str, str]], errors: List[str]) -> No
     duplicates = sorted(identifier for identifier, count in Counter(ids).items() if count > 1)
     if duplicates:
         errors.append('Duplicate id values: ' + ', '.join(duplicates))
+
+
+def _canonical_id(identifier: str) -> str:
+    normalized = unicodedata.normalize('NFC', identifier).casefold()
+    return _normalize_segment(normalized)
+
+
+def _validate_canonical_id_collisions(
+    rows: List[Dict[str, str]],
+    validation_errors: List[str],
+    plan_collision_pairs: set[frozenset[str]],
+) -> None:
+    ids_by_canonical: Dict[str, List[tuple[int, str]]] = defaultdict(list)
+    for row_number, row in enumerate(rows, start=2):
+        identifier = row.get('id', '')
+        if identifier:
+            ids_by_canonical[_canonical_id(identifier)].append((row_number, identifier))
+
+    for equivalent_ids in ids_by_canonical.values():
+        for index, (row_number, identifier) in enumerate(equivalent_ids):
+            for other_row_number, other_identifier in equivalent_ids[index + 1 :]:
+                if identifier == other_identifier:
+                    continue
+                if frozenset((identifier, other_identifier)) in plan_collision_pairs:
+                    continue
+                validation_errors.append(
+                    f'Canonical ID collision: CSV row {row_number} id {identifier!r} '
+                    f'is equivalent to CSV row {other_row_number} id {other_identifier!r}.'
+                )
 
 
 def _validate_child_parent_ids(
@@ -485,8 +516,9 @@ def _build_objects(
 
 def _validate_upload_plan_collisions(
     upload_plan: List[UploadPlanEntry], validation_errors: List[str]
-) -> None:
+) -> set[frozenset[str]]:
     seen: Dict[tuple[str, str], UploadPlanEntry] = {}
+    reported_id_pairs: set[frozenset[str]] = set()
     for entry in upload_plan:
         key = (entry.bucket, entry.key)
         if key not in seen:
@@ -494,6 +526,11 @@ def _validate_upload_plan_collisions(
             continue
 
         previous = seen[key]
+        for field in ('object_id', 'page_id'):
+            previous_id = getattr(previous, field)
+            current_id = getattr(entry, field)
+            if previous_id and current_id and previous_id != current_id:
+                reported_id_pairs.add(frozenset((previous_id, current_id)))
         validation_errors.append(
             'Upload plan collision for bucket '
             f'{entry.bucket!r}, key {entry.key!r}: '
@@ -501,3 +538,4 @@ def _validate_upload_plan_collisions(
             f'collides with role={previous.role}, object_id={previous.object_id}, '
             f'page_id={previous.page_id}.'
         )
+    return reported_id_pairs

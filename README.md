@@ -24,6 +24,11 @@ must reference a parent row. Page weights must be numeric and unique within each
 parent. Source paths must stay inside `input_dir`. The CLI accepts one-page TIFFs;
 multi-frame TIFFs need to be split into page files first.
 
+Row IDs are compared by canonical form: Unicode NFC normalization, case folding, then
+the storage-segment normalizer. Parent and page IDs share one namespace. `check` rejects
+different original IDs with the same canonical form; it preserves the original spelling.
+Exact duplicate IDs and upload-plan collisions remain covered by their existing checks.
+
 ## Configuration
 
 Create a YAML mapping in your working directory. Put the CSV and source files under
