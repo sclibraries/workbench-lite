@@ -1093,6 +1093,8 @@ class InterleavedIdClaimTests(unittest.TestCase):
             ('result', 'status'),
             ('result', 'remote_outcome'),
             ('result', 'unknown_status'),
+            ('result', 'missing_status_and_outcome'),
+            ('result', 'unknown_status_without_outcome'),
         )
         for index, (kind, defect) in enumerate(cases):
             with self.subTest(kind=kind, defect=defect):
@@ -1239,11 +1241,18 @@ class InterleavedIdClaimTests(unittest.TestCase):
         event = next(
             event for event in events if event.get('stage') == 'claim' and event['kind'] == kind
         )
+        operation_id = event.get('operation_id')
         if defect == 'identity':
             event['expected_claims'][0].pop('key')
         elif defect == 'unknown_status':
             event['status'] = 'unrecognized'
             event['remote_outcome'] = 'unrecognized'
+        elif defect == 'missing_status_and_outcome':
+            event.pop('status')
+            event.pop('remote_outcome')
+        elif defect == 'unknown_status_without_outcome':
+            event['status'] = 'unrecognized'
+            event.pop('remote_outcome')
         else:
             event.pop(defect)
         self._write_events(run_path, events)
@@ -1251,6 +1260,9 @@ class InterleavedIdClaimTests(unittest.TestCase):
         inspected = self.invoke('inspect-run', run_path, '--format', 'json')
         self.assertIsNotNone(error)
         self.assertNotEqual(inspected['exit'], 0, inspected['stdout'] + inspected['stderr'])
+        if kind == 'result':
+            pending = {item['operation_id'] for item in inspect_run(run_path)['unknown_operations']}
+            self.assertIn(operation_id, pending)
 
     @staticmethod
     def _rollback_execute_arguments(config, run_path):
@@ -1457,6 +1469,17 @@ class InterleavedIdClaimTests(unittest.TestCase):
         self.assertIn('claim_check', payload['preflight'])
         self.assertEqual(payload['preflight']['claim_check']['status'], 'not_run')
         no_client.assert_not_called()
+
+    def test_header_only_push_keeps_exit_and_journal_valid(self):
+        config = self.package('header-only', parent_ids=())
+
+        result = self.push(config, dry_run=True, offline=True, name='header-only-runs')
+
+        self.assertEqual(result['exit'], 0, result['stdout'] + result['stderr'])
+        run_path = next((self.root / 'header-only-runs').iterdir())
+        events, error = read_events(run_path)
+        self.assertIsNone(error)
+        self.assertFalse(any(event.get('stage') == 'claim' for event in events))
 
     def test_claim_read_and_write_failures_exit_one_and_hold_the_batch(self):
         for label, wrapper in (
