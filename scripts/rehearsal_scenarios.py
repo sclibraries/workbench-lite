@@ -631,8 +631,12 @@ def _resume_interrupted_rollback(ctx, directory, source, prefix):
         raise ScenarioMismatch('rollback source hold was not retained')
     remaining = storage_listing(ctx.storage, ctx.args.private_bucket, f'{prefix}/')
     remaining.update(storage_listing(ctx.storage, ctx.args.public_bucket, f'{prefix}/'))
-    root = f'{ctx.args.private_bucket}/{claim_root(prefix)}'
-    claims = {key for key in remaining if key.startswith(root)}
+    interrupted_prefix = f'{prefix}/interrupted'
+    roots = {
+        f'{ctx.args.private_bucket}/{claim_root(prefix)}',
+        f'{ctx.args.private_bucket}/{claim_root(interrupted_prefix)}',
+    }
+    claims = {key for key in remaining if any(key.startswith(root) for root in roots)}
     content = set(remaining) - claims
     if content:
         raise ScenarioMismatch(
