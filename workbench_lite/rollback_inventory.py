@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .diagnostics import sanitize
+from .id_claims import claim_identities_from_plan, reduce_claim_evidence
 from .runs import JournalError, atomic_write, digest, json_bytes, read_events
 
 INVENTORY_VERSION = 1
@@ -118,7 +119,7 @@ def _read_inventory_inputs(path):
 
 
 def _load_inventory_config(inputs, path):
-    inputs.config_snapshot, config_error = _read_config_snapshot(path)
+    inputs.config_snapshot, config_error = _read_config_snapshot(path, inputs.metadata)
     inputs.errors.metadata = config_error or inputs.errors.metadata
 
 
@@ -352,10 +353,21 @@ def _has_unresolved_push(identity, evidence):
     )
 
 
-def _read_config_snapshot(path):
-    config = _read_json(path / 'config.json') if (path / 'config.json').exists() else {}
+def _read_config_snapshot(path, metadata):
+    config_path = path / 'config.json'
+    if not config_path.exists():
+        return {}, 'Configuration snapshot is unavailable.'
+    config = _read_json(config_path)
     if not isinstance(config, dict):
         return {}, 'Configuration snapshot has an invalid structure.'
+    snapshot_hashes = metadata.get('snapshot_hashes')
+    if not isinstance(snapshot_hashes, dict) or not isinstance(snapshot_hashes.get('config'), str):
+        return {}, 'Configuration snapshot hash is unavailable.'
+    try:
+        if digest(config_path) != snapshot_hashes['config']:
+            return {}, 'Configuration snapshot checksum does not match run metadata.'
+    except OSError:
+        return {}, 'Configuration snapshot is unreadable.'
     return config, None
 
 
@@ -430,7 +442,7 @@ def _inventory_state(state):
 
 def _inventory_document(document):
     inputs = document.inputs
-    retained_claims, claim_counts = _claim_inventory(inputs.stage.events)
+    claim_evidence = _claim_inventory(inputs)
     return {
         'schema_version': INVENTORY_VERSION,
         'kind': 'rollback-inventory',
@@ -444,8 +456,8 @@ def _inventory_document(document):
         'planned': inputs.plan,
         'operations': document.operations,
         'pending_operations': _pending_operation_summaries(document.unresolved),
-        'claim_counts': claim_counts,
-        'retained_claims': retained_claims,
+        'claim_counts': claim_evidence.counts,
+        'retained_claims': claim_evidence.retained_claims(),
         **document.key_groups,
         'local_derivatives': document.derivatives,
         'manifest_urls': document.manifest_urls,
@@ -454,91 +466,30 @@ def _inventory_document(document):
     }
 
 
-def _claim_identity(event):
-    return (
-        event.get('bucket'),
-        event.get('key'),
-        event.get('checksum'),
-        event.get('size_bytes'),
-    )
+def _claim_inventory(inputs):
+    events = inputs.stage.events
+    if inputs.stage.mode == 'no_push':
+        return reduce_claim_evidence(events)
+    expected = _expected_claims(inputs)
+    if expected is None:
+        evidence = reduce_claim_evidence(events, require_context=True)
+        evidence.expectations_valid = False
+        return evidence
+    return reduce_claim_evidence(events, expected, require_context=True)
 
 
-def _claim_inventory(events):
-    expected = _expected_claims(events)
-    intents, results = _claim_operations(events)
-    retained = []
-    counts = _claim_counts(expected, intents, results)
-    for identity in expected:
-        status = _claim_operation_status(intents.get(identity, []), results)
-        if status in {'created', 'matched', 'unknown', 'unsettled'}:
-            retained.append(_retained_claim(identity, status))
-    return sorted(retained, key=lambda claim: claim['key']), counts
-
-
-def _expected_claims(events):
-    expected = set()
-    for event in events:
-        if event['kind'] == 'context' and event.get('stage') == 'claim':
-            claims = event.get('expected_claims')
-            if isinstance(claims, list):
-                expected.update(_claim_identity(item) for item in claims if isinstance(item, dict))
-    return expected
-
-
-def _claim_operations(events):
-    intents = {}
-    results = {}
-    for event in events:
-        if event.get('stage') != 'claim':
-            continue
-        if event['kind'] == 'intent':
-            intents.setdefault(_claim_identity(event), []).append(event)
-        elif event['kind'] == 'result':
-            results[event['operation_id']] = event
-    return intents, results
-
-
-def _claim_counts(expected, intents, results):
-    counts = {
-        status: 0
-        for status in (
-            'expected',
-            'created',
-            'matched',
-            'absent',
-            'conflict',
-            'unknown',
-            'unsettled',
-        )
-    }
-    counts['expected'] = len(expected)
-    for identity in expected:
-        status = _claim_operation_status(intents.get(identity, []), results)
-        counts[status] += 1
-    return counts
-
-
-def _retained_claim(identity, status):
-    return {
-        'bucket': identity[0],
-        'key': identity[1],
-        'checksum': identity[2],
-        'size_bytes': identity[3],
-        'status': status,
-    }
-
-
-def _claim_operation_status(intents, results):
-    if not intents:
-        return 'unsettled'
-    intent = max(intents, key=lambda event: event['sequence'])
-    result = results.get(intent['operation_id'])
-    if result is None or result['sequence'] < intent['sequence']:
-        return 'unsettled'
-    status = result.get('status')
-    if status in {'created', 'matched', 'absent', 'conflict', 'unknown'}:
-        return status
-    return 'unsettled'
+def _expected_claims(inputs):
+    if inputs.errors.plan or inputs.errors.metadata:
+        return None
+    batch_id = inputs.metadata.get('batch_id')
+    if not isinstance(batch_id, str) or not batch_id:
+        return None
+    try:
+        config = dict(inputs.config_snapshot)
+        config['batch_id'] = batch_id
+        return claim_identities_from_plan(inputs.plan, config, batch_id)
+    except (TypeError, ValueError):
+        return None
 
 
 def _inventory_source(inputs):

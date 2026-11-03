@@ -14,6 +14,7 @@ from uuid import uuid4
 
 from .diagnostics import sanitize
 from . import __version__
+from .id_claims import claim_identities_from_plan, reduce_claim_evidence
 
 SCHEMA_VERSION = 1
 EXIT_STATES = {0: 'completed', 4: 'completed-with-errors', 130: 'interrupted', 143: 'interrupted'}
@@ -216,7 +217,10 @@ def _valid_receipt_event(event, receipt):
 
 
 def _valid_publication_receipt(path, events, receipt):
-    if receipt.get('verification_contract') != 's3-sha256-v1' or not _claims_settled(events):
+    if (
+        receipt.get('verification_contract') != 's3-sha256-v1'
+        or not claim_evidence_for_run(path, events).settled
+    ):
         return False
     try:
         plan_path = Path(path) / 'upload-plan.json'
@@ -340,91 +344,42 @@ def _receipt_matches_plan(evidence):
     )
 
 
-def _claim_identity(claim):
-    return (
-        claim.get('bucket'),
-        claim.get('key'),
-        claim.get('checksum'),
-        claim.get('size_bytes'),
-    )
-
-
-def _valid_claim_identity(claim):
-    checksum = claim.get('checksum')
-    size = claim.get('size_bytes')
-    return (
-        isinstance(claim.get('bucket'), str)
-        and bool(claim['bucket'])
-        and isinstance(claim.get('key'), str)
-        and bool(claim['key'])
-        and isinstance(checksum, str)
-        and len(checksum) == 64
-        and all(character in '0123456789abcdef' for character in checksum)
-        and isinstance(size, int)
-        and not isinstance(size, bool)
-        and size >= 0
-    )
-
-
-def _claim_expectations(events):
-    expected = set()
-    for event in events:
-        if event['kind'] != 'context' or event.get('stage') != 'claim':
-            continue
-        claims = event.get('expected_claims')
-        if not isinstance(claims, list) or any(
-            not isinstance(claim, dict) or not _valid_claim_identity(claim) for claim in claims
-        ):
-            return None
-        expected.update(_claim_identity(claim) for claim in claims)
-    return expected
-
-
-def _claims_settled(events):
-    expected = _claim_expectations(events)
+def claim_evidence_for_run(path, events):
+    if not any(
+        event['kind'] == 'stage_started' and event['stage'] in {'push', 'push-dry-run'}
+        for event in events
+    ):
+        return reduce_claim_evidence(events)
+    expected = _expected_claims_from_run(path)
     if expected is None:
-        return False
-    if not expected:
-        return True
-    intents = {event['operation_id']: event for event in events if event['kind'] == 'intent'}
-    latest = {}
-    for event in events:
-        if event['kind'] == 'result' and event.get('stage') == 'claim':
-            identity = _claim_identity(event)
-            operation = intents.get(event.get('operation_id'))
-            if operation and _claim_identity(operation) == identity:
-                latest[identity] = event
-    return all(
-        latest.get(identity, {}).get('status') in {'created', 'matched'}
-        and latest[identity].get('remote_outcome') in {'written', 'matched'}
-        and latest[identity].get('observed_checksum') == identity[2]
-        and latest[identity].get('observed_size_bytes') == identity[3]
-        and latest[identity].get('checksum_type') == 'FULL_OBJECT'
-        for identity in expected
-    )
+        evidence = reduce_claim_evidence(events, require_context=True)
+        evidence.expectations_valid = False
+        return evidence
+    return reduce_claim_evidence(events, expected, require_context=True)
 
 
-def _claim_counts(events):
-    expected = _claim_expectations(events) or set()
-    statuses = {status: 0 for status in ('created', 'matched', 'absent', 'conflict', 'unknown')}
-    latest = {}
-    for event in events:
-        if event['kind'] == 'result' and event.get('stage') == 'claim':
-            identity = _claim_identity(event)
-            if identity in expected:
-                latest[identity] = event
-    unsettled = 0
-    for identity in expected:
-        status = latest.get(identity, {}).get('status', 'unsettled')
-        if status not in statuses:
-            unsettled += 1
-        else:
-            statuses[status] += 1
-    return {
-        'expected': len(expected),
-        **statuses,
-        'unsettled': unsettled,
-    }
+def _expected_claims_from_run(path):
+    try:
+        path = Path(path)
+        metadata = json.loads((path / 'run.json').read_text(encoding='utf-8'))
+        snapshot_hashes = metadata['snapshot_hashes']
+        if not isinstance(snapshot_hashes, dict) or not isinstance(metadata['batch_id'], str):
+            return None
+        plan_path = path / 'upload-plan.json'
+        config_path = path / 'config.json'
+        if digest(plan_path) != metadata['plan_sha256']:
+            return None
+        if digest(config_path) != snapshot_hashes['config']:
+            return None
+        plan = json.loads(plan_path.read_text(encoding='utf-8'))
+        entries = plan['entries']
+        if not isinstance(entries, list):
+            return None
+        config = json.loads(config_path.read_text(encoding='utf-8'))
+        config['batch_id'] = metadata['batch_id']
+        return claim_identities_from_plan(entries, config, metadata['batch_id'])
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
 
 
 def inspect_run(path):
@@ -448,7 +403,7 @@ def inspect_run(path):
         'journal_error': error,
         'event_count': len(events),
         'counts': counts,
-        'claim_counts': _claim_counts(events),
+        'claim_counts': claim_evidence_for_run(path, events).counts,
         'retry_count': retry_count,
         'classification_counts': classification_counts,
         'push_artifacts': push_artifacts,
@@ -680,7 +635,7 @@ class RunJournal:
             and verified
             and verified['manifest_count'] >= 1
             and not inspect_run(self.path)['unknown_operations']
-            and _claims_settled(events)
+            and claim_evidence_for_run(self.path, events).settled
         ):
             fields['publication_receipt'] = verified
         pending = self.path / 'publication-pending'

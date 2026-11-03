@@ -42,6 +42,41 @@ class IdClaim:
         }
 
 
+@dataclass(frozen=True)
+class _ClaimResult:
+    status: str
+    outcome: str
+    observed: object | None = None
+    evidence: dict | None = None
+
+
+@dataclass
+class ClaimEvidence:
+    expected: set[tuple]
+    latest: dict[tuple, dict]
+    counts: dict[str, int]
+    created: set[tuple]
+    expectations_valid: bool
+
+    @property
+    def settled(self):
+        return self.expectations_valid and all(
+            _claim_result_settled(self.latest.get(identity), identity) for identity in self.expected
+        )
+
+    @property
+    def has_confirmed_creation(self):
+        return bool(self.created)
+
+    def retained_claims(self):
+        retained = []
+        for identity in sorted(self.expected, key=lambda item: item[1]):
+            status = _claim_status(self.latest.get(identity))
+            if status in {'created', 'matched', 'unknown', 'unsettled'}:
+                retained.append(_retained_claim(identity, status))
+        return retained
+
+
 @dataclass
 class ClaimCheckResult:
     expected_count: int
@@ -81,6 +116,171 @@ def build_id_claims(objects, config, config_path):
                 )
             )
     return sorted(claims, key=lambda claim: claim.canonical_id)
+
+
+def claim_identities_from_plan(entries, config, batch_id):
+    prefix = _effective_prefix(config)
+    bucket = str(config.get('s3_private_bucket') or DEFAULT_PRIVATE_BUCKET)
+    normalized_batch = _normalize_segment(str(config.get('batch_id') or batch_id))
+    objects = _planned_object_ids(entries)
+    claims = []
+    for object_id, page_ids in objects.items():
+        claims.append(_make_claim(prefix, bucket, normalized_batch, object_id, 'object'))
+        claims.extend(
+            _make_claim(prefix, bucket, normalized_batch, page_id, 'page', object_id)
+            for page_id in page_ids
+        )
+    if not claims:
+        raise ValueError('Immutable upload plan contains no claimable IDs.')
+    return {_claim_identity(claim.identity()) for claim in claims}
+
+
+def _planned_object_ids(entries):
+    objects = {}
+    for entry in entries:
+        if not isinstance(entry, dict):
+            raise ValueError('Upload plan entries have an invalid structure.')
+        object_id = entry.get('object_id', '')
+        page_id = entry.get('page_id', '')
+        if not isinstance(object_id, str) or not isinstance(page_id, str):
+            raise ValueError('Upload plan identifiers have an invalid structure.')
+        if page_id and not object_id:
+            raise ValueError('Upload plan page has no parent object ID.')
+        if object_id:
+            objects.setdefault(object_id, set())
+            if page_id:
+                objects[object_id].add(page_id)
+    return objects
+
+
+def reduce_claim_evidence(events, expected_claims=None, *, require_context=False):
+    context_sets, contexts_valid, has_context = _claim_context_sets(events)
+    expected = set(expected_claims) if expected_claims is not None else set().union(*context_sets)
+    valid = contexts_valid and (not require_context or has_context)
+    if expected_claims is not None and any(claims != expected for claims in context_sets):
+        valid = False
+    latest, created, operations_valid = _claim_operations(events, expected)
+    valid = valid and operations_valid
+    counts = _claim_counts(expected, latest)
+    return ClaimEvidence(expected, latest, counts, created, valid)
+
+
+def _claim_context_sets(events):
+    contexts = [
+        event for event in events if event['kind'] == 'context' and event.get('stage') == 'claim'
+    ]
+    sets = []
+    valid = True
+    for context in contexts:
+        claims = context.get('expected_claims')
+        if not isinstance(claims, list) or any(
+            not isinstance(claim, dict) or not _valid_claim_identity(claim) for claim in claims
+        ):
+            return sets, False, bool(contexts)
+        identities = [_claim_identity(claim) for claim in claims]
+        claim_set = set(identities)
+        valid = valid and len(identities) == len(claim_set)
+        sets.append(claim_set)
+    if sets and any(claim_set != sets[0] for claim_set in sets[1:]):
+        valid = False
+    return sets, valid, bool(contexts)
+
+
+def _claim_operations(events, expected):
+    intents, latest, created = {}, {}, set()
+    valid = True
+    for event in events:
+        if event.get('stage') != 'claim' or event['kind'] not in {'intent', 'result'}:
+            continue
+        operation_id = event.get('operation_id')
+        if (
+            not _valid_claim_identity(event)
+            or not isinstance(operation_id, str)
+            or not operation_id
+        ):
+            valid = False
+            continue
+        identity = _claim_identity(event)
+        if identity not in expected:
+            valid = False
+            continue
+        if event['kind'] == 'intent':
+            intents[operation_id] = identity
+            latest[identity] = event
+        elif intents.get(operation_id) == identity:
+            latest[identity] = event
+            if _claim_result_created(event, identity):
+                created.add(identity)
+        else:
+            valid = False
+    return latest, created, valid
+
+
+def _claim_counts(expected, latest):
+    statuses = {status: 0 for status in ('created', 'matched', 'absent', 'conflict', 'unknown')}
+    counts = {'expected': len(expected), **statuses, 'unsettled': 0}
+    for identity in expected:
+        status = _claim_status(latest.get(identity))
+        counts[status if status in statuses else 'unsettled'] += 1
+    return counts
+
+
+def _claim_status(event):
+    status = event.get('status') if event and event.get('kind') == 'result' else 'unsettled'
+    return (
+        status if status in {'created', 'matched', 'absent', 'conflict', 'unknown'} else 'unsettled'
+    )
+
+
+def _claim_result_settled(event, identity):
+    return bool(
+        event
+        and event.get('kind') == 'result'
+        and event.get('status') in {'created', 'matched'}
+        and event.get('remote_outcome') in {'written', 'matched'}
+        and event.get('observed_checksum') == identity[2]
+        and event.get('observed_size_bytes') == identity[3]
+        and event.get('checksum_type') == 'FULL_OBJECT'
+    )
+
+
+def _claim_result_created(event, identity):
+    return bool(
+        event.get('status') == 'created'
+        and event.get('remote_outcome') == 'written'
+        and _claim_result_settled(event, identity)
+    )
+
+
+def _retained_claim(identity, status):
+    return {
+        'bucket': identity[0],
+        'key': identity[1],
+        'checksum': identity[2],
+        'size_bytes': identity[3],
+        'status': status,
+    }
+
+
+def _claim_identity(claim):
+    return claim.get('bucket'), claim.get('key'), claim.get('checksum'), claim.get('size_bytes')
+
+
+def _valid_claim_identity(claim):
+    checksum = claim.get('checksum')
+    size = claim.get('size_bytes')
+    return (
+        isinstance(claim.get('bucket'), str)
+        and bool(claim['bucket'])
+        and isinstance(claim.get('key'), str)
+        and bool(claim['key'])
+        and isinstance(checksum, str)
+        and len(checksum) == 64
+        and all(character in '0123456789abcdef' for character in checksum)
+        and isinstance(size, int)
+        and not isinstance(size, bool)
+        and size >= 0
+    )
 
 
 def _effective_prefix(config):
@@ -154,15 +354,17 @@ def _read_claims(claims, client, journal, result):
         try:
             observed = client.inspect_object(claim.bucket, claim.key)
             if observed is None:
-                _record_claim_result(journal, operation, claim, 'absent', 'absent')
+                _record_claim_result(journal, operation, claim, _ClaimResult('absent', 'absent'))
                 missing.append(claim)
             elif _identity_matches(observed, claim):
-                _record_claim_result(journal, operation, claim, 'matched', 'matched', observed)
+                _record_claim_result(
+                    journal, operation, claim, _ClaimResult('matched', 'matched', observed)
+                )
                 result.matched_count += 1
             else:
                 _record_read_conflict(claim, client, journal, operation, observed, result)
         except STORAGE_ERRORS as exc:
-            _record_claim_result(journal, operation, claim, 'unknown', 'unknown')
+            _record_claim_result(journal, operation, claim, _ClaimResult('unknown', 'unknown'))
             _fail(result, f'ID claim read failed for {claim.raw_id!r}: {operation_error(exc)}')
             return missing
     return missing
@@ -171,7 +373,7 @@ def _read_claims(claims, client, journal, result):
 def _record_read_conflict(claim, client, journal, operation, observed, result):
     owner = _read_owner(client, claim.bucket, claim.key)
     message = _conflict_message(claim, owner)
-    _record_claim_result(journal, operation, claim, 'conflict', 'conflict', observed)
+    _record_claim_result(journal, operation, claim, _ClaimResult('conflict', 'conflict', observed))
     result.status = 'conflict'
     result.refusal_code = 3
     result.conflict_count += 1
@@ -197,7 +399,7 @@ def _create_claim(claim, directory, read_client, write_client, journal, result):
     except STORAGE_ERRORS as exc:
         if _is_precondition_failed(exc):
             return _resolve_claim_race(claim, read_client, journal, operation, result)
-        _record_claim_result(journal, operation, claim, 'unknown', 'unknown')
+        _record_claim_result(journal, operation, claim, _ClaimResult('unknown', 'unknown'))
         _fail(result, f'ID claim write failed for {claim.raw_id!r}: {operation_error(exc)}')
         return False
     return _verify_created_claim(claim, write_client, journal, operation, result)
@@ -207,16 +409,18 @@ def _resolve_claim_race(claim, client, journal, operation, result):
     try:
         observed = client.inspect_object(claim.bucket, claim.key)
         if observed is not None and _identity_matches(observed, claim):
-            _record_claim_result(journal, operation, claim, 'matched', 'matched', observed)
+            _record_claim_result(
+                journal, operation, claim, _ClaimResult('matched', 'matched', observed)
+            )
             result.matched_count += 1
             return True
         owner = _read_owner(client, claim.bucket, claim.key) if observed is not None else None
     except STORAGE_ERRORS as exc:
-        _record_claim_result(journal, operation, claim, 'unknown', 'unknown')
+        _record_claim_result(journal, operation, claim, _ClaimResult('unknown', 'unknown'))
         message = f'ID claim reconciliation failed for {claim.raw_id!r}: {operation_error(exc)}'
         _fail(result, message)
         return False
-    _record_claim_result(journal, operation, claim, 'conflict', 'conflict', observed)
+    _record_claim_result(journal, operation, claim, _ClaimResult('conflict', 'conflict', observed))
     result.status = 'conflict'
     result.refusal_code = 3
     result.conflict_count += 1
@@ -228,30 +432,39 @@ def _verify_created_claim(claim, client, journal, operation, result):
     try:
         observed = client.inspect_object(claim.bucket, claim.key)
     except STORAGE_ERRORS as exc:
-        _record_claim_result(journal, operation, claim, 'unknown', 'unknown')
+        _record_claim_result(journal, operation, claim, _ClaimResult('unknown', 'unknown'))
         _fail(result, f'ID claim verification failed for {claim.raw_id!r}: {operation_error(exc)}')
         return False
     evidence = _identity_evidence(observed)
     if observed is None or not _identity_matches(observed, claim):
-        _record_claim_result(journal, operation, claim, 'unknown', 'unknown', evidence=evidence)
+        _record_claim_result(
+            journal, operation, claim, _ClaimResult('unknown', 'unknown', evidence=evidence)
+        )
         _fail(
             result,
             f'ID claim verification failed for {claim.raw_id!r}: checksum or size mismatch.',
         )
         return False
-    _record_claim_result(journal, operation, claim, 'created', 'written', evidence=evidence)
+    _record_claim_result(
+        journal, operation, claim, _ClaimResult('created', 'written', evidence=evidence)
+    )
     result.created_count += 1
     return True
 
 
-def _record_claim_result(journal, operation, claim, status, outcome, observed=None, evidence=None):
+def _record_claim_result(journal, operation, claim, result):
     if journal is None or operation is None:
         return
-    details = evidence or _identity_evidence(observed)
+    details = result.evidence or _identity_evidence(result.observed)
     journal.result(
         operation,
         'claim',
-        {**claim.identity(), **details, 'status': status, 'remote_outcome': outcome},
+        {
+            **claim.identity(),
+            **details,
+            'status': result.status,
+            'remote_outcome': result.outcome,
+        },
     )
 
 

@@ -14,7 +14,14 @@ from .config import ConfigError, load_config
 from .diagnostics import operation_error
 from .locks import lock_destination
 from .rollback_inventory import build_inventory
-from .runs import JournalError, RunJournal, atomic_write, json_bytes, read_events
+from .runs import (
+    JournalError,
+    RunJournal,
+    atomic_write,
+    claim_evidence_for_run,
+    json_bytes,
+    read_events,
+)
 from .storage_plan import DEFAULT_PRIVATE_BUCKET, DEFAULT_PUBLIC_BUCKET
 
 
@@ -765,7 +772,8 @@ def run_rollback(run_path, client, *, execute=False, confirm=None, config_path=N
     source_path, inventory, source_events, source_config = _validate_source(
         run_path, client, config_path=config_path
     )
-    _validate_rollback_confirmation(inventory, execute, confirm)
+    claim_evidence = claim_evidence_for_run(source_path, source_events)
+    _validate_rollback_confirmation(inventory, execute, confirm, claim_evidence)
     _lock_rollback_targets(locks, source_path, client, inventory)
     candidate_keys = {(item['bucket'], item['key']) for item in inventory.get('new_keys') or []}
     used_by = _later_reuse(source_path, source_events, source_config, candidate_keys)
@@ -775,17 +783,13 @@ def run_rollback(run_path, client, *, execute=False, confirm=None, config_path=N
     return _preview_rollback(inventory, client, report, used_by)
 
 
-def _validate_rollback_confirmation(inventory, execute, confirm):
+def _validate_rollback_confirmation(inventory, execute, confirm, claim_evidence):
     if confirm is not None and not execute:
         raise JournalError('--confirm is valid only with --execute.')
     if execute and confirm != inventory['run_id']:
         raise JournalError('--execute requires --confirm matching the source run ID.')
-    if execute and not inventory.get('new_keys') and not _has_created_claim(inventory):
+    if execute and not inventory.get('new_keys') and not claim_evidence.has_confirmed_creation:
         raise JournalError('Rollback refused: the source run has no confirmed new keys.')
-
-
-def _has_created_claim(inventory):
-    return any(claim.get('status') == 'created' for claim in inventory.get('retained_claims') or [])
 
 
 def _lock_rollback_targets(locks, source_path, client, inventory):
