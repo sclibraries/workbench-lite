@@ -30,7 +30,7 @@ from rehearsal_harness import (
 )
 from workbench_lite import cli
 from workbench_lite.locks import WriterLocks
-from workbench_lite.runs import inspect_run, read_events
+from workbench_lite.runs import _valid_publication_receipt, inspect_run, read_events
 from workbench_lite.s3_client import ObjectIdentity
 
 
@@ -47,6 +47,38 @@ def claim_body(raw_id, canonical_id, kind, batch_segment, parent_id=None):
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(',', ':')).encode(
         'utf-8'
     )
+
+
+READ_CONFLICT_CASES = (
+    (
+        'raw-id',
+        ('parent',),
+        (),
+        'parent',
+        claim_body('PARENT', 'parent', 'object', 'package'),
+        ('package', 'object'),
+        'PARENT',
+    ),
+    (
+        'kind',
+        ('parent',),
+        (),
+        'parent',
+        claim_body('parent', 'parent', 'page', 'package', 'elsewhere'),
+        ('package', 'page'),
+        'parent',
+    ),
+    (
+        'parent',
+        ('parent',),
+        (('page-1', 'parent'),),
+        'page-1',
+        claim_body('page-1', 'page-1', 'page', 'package', 'another-parent'),
+        ('package', 'page'),
+        'page-1',
+    ),
+    ('malformed', ('parent',), (), 'parent', b'{', 'owner unavailable', 'parent'),
+)
 
 
 class ClaimOperationFileS3Client(FileS3Client):
@@ -94,6 +126,19 @@ class ClaimVerificationMismatchClient(FileS3Client):
             else:
                 result[self.field] = 'COMPOSITE'
         return result
+
+
+class SecondClaimConflictClient(FileS3Client):
+    def __init__(self, root, prefix='claims'):
+        super().__init__(root)
+        self.conflict_key = f'{claim_root(prefix)}beta.json'
+        self.injected = False
+
+    def put_object(self, **kwargs):
+        if kwargs['Key'] == self.conflict_key and not self.injected:
+            self.injected = True
+            self.seed(kwargs['Bucket'], kwargs['Key'], b'concurrent claim bytes')
+        return super().put_object(**kwargs)
 
 
 class InterleavedFileS3Client(FileS3Client):
@@ -291,29 +336,14 @@ class InterleavedIdClaimTests(unittest.TestCase):
         factory=None,
         extra_patches=(),
     ):
-        arguments = ['push', '--config', config]
-        if dry_run:
-            arguments.append('--dry-run')
-        else:
-            arguments.append('--execute')
-        if offline:
-            arguments.append('--offline')
-        if output is not None:
-            arguments.extend(['--generated-dir', output])
-        if resume:
-            arguments.append('--resume')
+        arguments = ['push', '--config', config, '--dry-run' if dry_run else '--execute']
+        arguments.extend(['--offline'] if offline else [])
+        arguments.extend(['--generated-dir', output] if output is not None else [])
+        arguments.extend(['--resume'] if resume else [])
         arguments.extend(
-            [
-                '--endpoint-url',
-                TEST_ENDPOINT,
-                '--region',
-                'us-east-1',
-                '--format',
-                'json',
-                '--run-dir',
-                self.root / name,
-            ]
+            ['--endpoint-url', TEST_ENDPOINT, '--region', 'us-east-1', '--format', 'json']
         )
+        arguments.extend(['--run-dir', self.root / name])
         return self.invoke(
             *arguments,
             factory=factory
@@ -364,54 +394,25 @@ class InterleavedIdClaimTests(unittest.TestCase):
         self.assertEqual(self.store.put_calls, [])
 
     def test_read_pass_refuses_raw_id_kind_parent_and_malformed_claims(self):
-        cases = [
-            (
-                'raw-id',
-                ('parent',),
-                (),
-                'parent',
-                claim_body('PARENT', 'parent', 'object', 'package'),
-                ('package', 'object'),
-                'PARENT',
-            ),
-            (
-                'kind',
-                ('parent',),
-                (),
-                'parent',
-                claim_body('parent', 'parent', 'page', 'package', 'elsewhere'),
-                ('package', 'page'),
-                'parent',
-            ),
-            (
-                'parent',
-                ('parent',),
-                (('page-1', 'parent'),),
-                'page-1',
-                claim_body('page-1', 'page-1', 'page', 'package', 'another-parent'),
-                ('package', 'page'),
-                'page-1',
-            ),
-            ('malformed', ('parent',), (), 'parent', b'{', 'owner unavailable', 'parent'),
-        ]
-        for label, parents, pages, identifier, body, owner, conflicting_raw_id in cases:
-            with self.subTest(conflict=label):
-                prefix = f'read-{label}'
-                config = self.package(
-                    f'read-{label}', parent_ids=parents, pages=pages, prefix=prefix
-                )
-                output = self.generate(config, f'read-{label}-generated')
-                self.seed_claim(identifier, body, prefix=prefix)
+        for case in READ_CONFLICT_CASES:
+            with self.subTest(conflict=case[0]):
+                self._assert_read_pass_conflict(case)
 
-                result = self.push(config, output, name=f'read-{label}-push-runs')
-
-                self.assertEqual(result['exit'], 3, result['stdout'] + result['stderr'])
-                self.assertIn(identifier, result['stdout'] + result['stderr'])
-                self.assertIn(conflicting_raw_id, result['stdout'] + result['stderr'])
-                for detail in owner if isinstance(owner, tuple) else (owner,):
-                    self.assertIn(detail, result['stdout'] + result['stderr'])
-                self.assertEqual(self.store.put_calls, [])
-                self.store.put_calls.clear()
+    def _assert_read_pass_conflict(self, case):
+        label, parents, pages, identifier, body, owner, conflicting_raw_id = case
+        prefix = f'read-{label}'
+        config = self.package(f'read-{label}', parent_ids=parents, pages=pages, prefix=prefix)
+        output = self.generate(config, f'read-{label}-generated')
+        self.seed_claim(identifier, body, prefix=prefix)
+        result = self.push(config, output, name=f'read-{label}-push-runs')
+        details = owner if isinstance(owner, tuple) else (owner,)
+        self.assertEqual(result['exit'], 3, result['stdout'] + result['stderr'])
+        self.assertIn(identifier, result['stdout'] + result['stderr'])
+        self.assertIn(conflicting_raw_id, result['stdout'] + result['stderr'])
+        for detail in details:
+            self.assertIn(detail, result['stdout'] + result['stderr'])
+        self.assertEqual(self.store.put_calls, [])
+        self.store.put_calls.clear()
 
     def test_parent_and_page_ids_share_claim_namespace_across_batches(self):
         first = self.package('namespace-object', batch_id='first', parent_ids=('shared',))
@@ -464,30 +465,18 @@ class InterleavedIdClaimTests(unittest.TestCase):
         second = self.package('interleave-second', batch_id='second', parent_ids=('beta', 'alpha'))
         first_output = self.generate(first, 'interleave-first-generated')
         second_output = self.generate(second, 'interleave-second-generated')
-        # Separate lock roots model different hosts; each writer still takes normal locks.
+        codes = self._run_interleaved_packages(first, second, first_output, second_output)
+
+        self.assertEqual(sorted(codes), [0, 3])
+        self.assertEqual(
+            [keys[:2] for keys in self.store.claim_heads_by_thread.values()],
+            [['claims/_ids/alpha.json', 'claims/_ids/beta.json']] * 2,
+        )
+
+    def _run_interleaved_packages(self, first, second, first_output, second_output):
         lock_roots = [self.root / 'host-one-locks', self.root / 'host-two-locks']
         for lock_root in lock_roots:
             lock_root.mkdir(mode=0o700)
-
-        def execute(config, output, run_name, lock_root):
-            arguments = [
-                'push',
-                '--config',
-                str(config),
-                '--execute',
-                '--generated-dir',
-                str(output),
-                '--endpoint-url',
-                TEST_ENDPOINT,
-                '--region',
-                'us-east-1',
-                '--format',
-                'json',
-                '--run-dir',
-                str(self.root / run_name),
-            ]
-            return cli.main(arguments, lock_factory=lambda: WriterLocks(lock_root))
-
         with (
             patch('workbench_lite.cli.create_s3_client', return_value=self.store),
             patch('sys.stdout'),
@@ -495,16 +484,41 @@ class InterleavedIdClaimTests(unittest.TestCase):
             ThreadPoolExecutor(max_workers=2) as executor,
         ):
             futures = [
-                executor.submit(execute, first, first_output, 'host-one-runs', lock_roots[0]),
-                executor.submit(execute, second, second_output, 'host-two-runs', lock_roots[1]),
+                executor.submit(
+                    self._execute_with_lock_root,
+                    first,
+                    first_output,
+                    'host-one-runs',
+                    lock_roots[0],
+                ),
+                executor.submit(
+                    self._execute_with_lock_root,
+                    second,
+                    second_output,
+                    'host-two-runs',
+                    lock_roots[1],
+                ),
             ]
-            codes = [future.result(timeout=20) for future in futures]
+            return [future.result(timeout=20) for future in futures]
 
-        self.assertEqual(sorted(codes), [0, 3])
-        self.assertEqual(
-            [keys[:2] for keys in self.store.claim_heads_by_thread.values()],
-            [['claims/_ids/alpha.json', 'claims/_ids/beta.json']] * 2,
-        )
+    def _execute_with_lock_root(self, config, output, run_name, lock_root):
+        arguments = [
+            'push',
+            '--config',
+            str(config),
+            '--execute',
+            '--generated-dir',
+            str(output),
+            '--endpoint-url',
+            TEST_ENDPOINT,
+            '--region',
+            'us-east-1',
+            '--format',
+            'json',
+            '--run-dir',
+            str(self.root / run_name),
+        ]
+        return cli.main(arguments, lock_factory=lambda: WriterLocks(lock_root))
 
     def test_same_batch_unchanged_rerun_reuses_deterministic_claims(self):
         config = self.package('same-batch', pages=(('page-1', 'parent'),))
@@ -573,6 +587,12 @@ class InterleavedIdClaimTests(unittest.TestCase):
         )
         output = self.generate(config, 'prefix-with-ids-segment-generated')
         run_path = self.run_path(output)
+        content_keys, expected_claims = self._assert_prefix_uploads(
+            config, output, run_path, prefix
+        )
+        self._assert_prefix_rollback(config, run_path, prefix, content_keys, expected_claims)
+
+    def _assert_prefix_uploads(self, config, output, run_path, prefix):
         plan = json.loads((run_path / 'upload-plan.json').read_text())['entries']
         content_keys = {(entry['bucket'], entry['key']) for entry in plan}
         expected_claims = {
@@ -594,7 +614,9 @@ class InterleavedIdClaimTests(unittest.TestCase):
             self.assertTrue(self.store._path(bucket, key).is_file(), key)
         self.assertEqual(set(self.content_puts(prefix)), content_keys)
         self.assertEqual(self.claim_keys(prefix=prefix), expected_claims)
+        return content_keys, expected_claims
 
+    def _assert_prefix_rollback(self, config, run_path, prefix, content_keys, expected_claims):
         rollback_args = [
             'rollback',
             run_path,
@@ -657,6 +679,20 @@ class InterleavedIdClaimTests(unittest.TestCase):
         self.assertEqual(self.claim_keys(prefix='trimmed'), {'trimmed/_ids/parent.json'})
 
     def test_existing_blockers_still_precede_all_claim_writes(self):
+        self._assert_invalid_package_precedes_claim_writes()
+        self.assertEqual(self.store.put_calls, [])
+
+        config = self.package('blockers', pages=(('page-1', 'parent'),))
+        output = self.generate(config, 'blockers-generated')
+        self._assert_missing_artifact_precedes_claim_writes(config, output)
+        output = self.generate(config, 'blockers-size-generated')
+        self._assert_oversized_plan_precedes_claim_writes(config, output)
+        output = self.generate(config, 'blockers-preflight-generated')
+        self._assert_preflight_precedes_claim_writes(config, output)
+        output = self.generate(config, 'blockers-destination-generated')
+        self._assert_destination_conflict_precedes_claim_writes(config, output)
+
+    def _assert_invalid_package_precedes_claim_writes(self):
         invalid = self.package('blockers-invalid', parent_ids=('duplicate', 'duplicate'))
         no_client = Mock(side_effect=AssertionError('validation failure created an S3 client'))
         invalid_result = self.push(
@@ -668,8 +704,7 @@ class InterleavedIdClaimTests(unittest.TestCase):
         no_client.assert_not_called()
         self.assertEqual(self.store.put_calls, [])
 
-        config = self.package('blockers', pages=(('page-1', 'parent'),))
-        output = self.generate(config, 'blockers-generated')
+    def _assert_missing_artifact_precedes_claim_writes(self, config, output):
         run_path = self.run_path(output)
         plan = json.loads((run_path / 'upload-plan.json').read_text())['entries']
         manifest = next(entry for entry in plan if entry['role'] == 'manifest')
@@ -681,15 +716,14 @@ class InterleavedIdClaimTests(unittest.TestCase):
         self.assertEqual(self.store.put_calls, [])
         self.assertEqual(self.claim_keys(), set())
 
-        output = self.generate(config, 'blockers-size-generated')
+    def _assert_oversized_plan_precedes_claim_writes(self, config, output):
         with patch('workbench_lite.push.MAX_SINGLE_PUT_BYTES', 1):
             oversized = self.push(config, output, name='oversized-runs')
         self.assertEqual(oversized['exit'], 1)
         self.assertEqual(self.store.put_calls, [])
         self.assertEqual(self.claim_keys(), set())
 
-        output = self.generate(config, 'blockers-preflight-generated')
-
+    def _assert_preflight_precedes_claim_writes(self, config, output):
         def denied_factory(*args, **kwargs):
             return PreflightDenied(self.store)
 
@@ -703,7 +737,7 @@ class InterleavedIdClaimTests(unittest.TestCase):
         self.assertEqual(self.store.put_calls, [])
         self.assertEqual(self.claim_keys(), set())
 
-        output = self.generate(config, 'blockers-destination-generated')
+    def _assert_destination_conflict_precedes_claim_writes(self, config, output):
         run_path = self.run_path(output)
         plan = json.loads((run_path / 'upload-plan.json').read_text())['entries']
         master = next(entry for entry in plan if entry['role'] == 'master_tiff')
@@ -823,8 +857,29 @@ class InterleavedIdClaimTests(unittest.TestCase):
         config = self.package('claim-interruption')
         output = self.generate(config, 'claim-interruption-generated')
         run_path = self.run_path(output)
+        self._interrupt_claim_write(config, output)
+        self._assert_interrupted_claim_is_unknown(run_path, config)
+        self._assert_reconcile_is_head_only(run_path)
+        resumed = self.push(config, output, name='claim-interruption-runs', resume=True)
+        self.assertEqual(resumed['exit'], 0, resumed['stdout'] + resumed['stderr'])
+        self.assertEqual(inspect_run(run_path)['publication']['state'], 'ready_for_review')
+
+    def _interrupt_claim_write(self, config, output):
         ready = self.root / 'claim-put-ready'
-        arguments = [
+        arguments = self._claim_push_arguments(config, output, 'claim-interruption-runs')
+        process, _ = start_worker(
+            arguments,
+            storage_root=self.storage_root,
+            lock_root=self.lock_root,
+            fault='claim_after_1',
+            ready_file=ready,
+            hold_barrier=True,
+            claim_prefix='claims',
+        )
+        self._kill_at_barrier(process, ready, 'claim PUT')
+
+    def _claim_push_arguments(self, config, output, name):
+        return [
             'push',
             '--config',
             str(config),
@@ -838,27 +893,21 @@ class InterleavedIdClaimTests(unittest.TestCase):
             '--format',
             'json',
             '--run-dir',
-            str(self.root / 'claim-interruption-runs'),
+            str(self.root / name),
         ]
-        process, _ = start_worker(
-            arguments,
-            storage_root=self.storage_root,
-            lock_root=self.lock_root,
-            fault='claim_after_1',
-            ready_file=ready,
-            hold_barrier=True,
-            claim_prefix='claims',
-        )
+
+    def _kill_at_barrier(self, process, ready, operation):
         deadline = time.monotonic() + 15
         while time.monotonic() < deadline and process.poll() is None and not ready.exists():
             time.sleep(0.02)
         if not ready.exists():
             stdout, stderr = process.communicate(timeout=15)
-            self.fail(f'push never reached the claim PUT barrier: {stdout}\n{stderr}')
+            self.fail(f'push never reached the {operation} barrier: {stdout}\n{stderr}')
         process.send_signal(signal.SIGKILL)
         process.communicate(timeout=15)
         clear_dead_test_locks(self.lock_root, process.pid)
 
+    def _assert_interrupted_claim_is_unknown(self, run_path, config):
         inspected = inspect_run(run_path)
         self.assertTrue(
             any(item.get('stage') == 'claim' for item in inspected['unknown_operations'])
@@ -880,42 +929,24 @@ class InterleavedIdClaimTests(unittest.TestCase):
         )
         self.assertEqual(rollback['exit'], 1)
 
+    def _assert_reconcile_is_head_only(self, run_path):
         before_gets = len(self.store.get_calls)
         reconciled = self.invoke('reconcile', run_path, '--format', 'json')
         self.assertEqual(reconciled['exit'], 0, reconciled['stdout'] + reconciled['stderr'])
         events, error = read_events(run_path)
         self.assertIsNone(error)
-        claim_results = [
+        results = [
             event for event in events if event['kind'] == 'result' and event.get('stage') == 'claim'
         ]
-        self.assertTrue(any(event.get('status') == 'matched' for event in claim_results))
-        self.assertFalse(any(event.get('status') == 'created' for event in claim_results))
+        self.assertTrue(any(event.get('status') == 'matched' for event in results))
+        self.assertFalse(any(event.get('status') == 'created' for event in results))
         self.assertEqual(len(self.store.get_calls), before_gets)
-
-        resumed = self.push(config, output, name='claim-interruption-runs', resume=True)
-        self.assertEqual(resumed['exit'], 0, resumed['stdout'] + resumed['stderr'])
-        self.assertEqual(inspect_run(run_path)['publication']['state'], 'ready_for_review')
 
     def test_claim_conflict_on_resume_exits_three(self):
         config = self.package('claim-resume-conflict')
         output = self.generate(config, 'claim-resume-conflict-generated')
         ready = self.root / 'claim-before-ready'
-        arguments = [
-            'push',
-            '--config',
-            str(config),
-            '--execute',
-            '--generated-dir',
-            str(output),
-            '--endpoint-url',
-            TEST_ENDPOINT,
-            '--region',
-            'us-east-1',
-            '--format',
-            'json',
-            '--run-dir',
-            str(self.root / 'claim-resume-conflict-runs'),
-        ]
+        arguments = self._claim_push_arguments(config, output, 'claim-resume-conflict-runs')
         process, _ = start_worker(
             arguments,
             storage_root=self.storage_root,
@@ -925,15 +956,7 @@ class InterleavedIdClaimTests(unittest.TestCase):
             hold_barrier=True,
             claim_prefix='claims',
         )
-        deadline = time.monotonic() + 15
-        while time.monotonic() < deadline and process.poll() is None and not ready.exists():
-            time.sleep(0.02)
-        if not ready.exists():
-            stdout, stderr = process.communicate(timeout=15)
-            self.fail(f'push never reached the claim PUT barrier: {stdout}\n{stderr}')
-        process.send_signal(signal.SIGKILL)
-        process.communicate(timeout=15)
-        clear_dead_test_locks(self.lock_root, process.pid)
+        self._kill_at_barrier(process, ready, 'claim PUT')
         self.seed_claim('parent', claim_body('other-parent', 'parent', 'object', 'package'))
 
         resumed = self.push(config, output, name='claim-resume-conflict-runs', resume=True)
@@ -942,67 +965,106 @@ class InterleavedIdClaimTests(unittest.TestCase):
         self.assertEqual(self.content_puts(), [])
 
     def test_receipt_requires_claim_evidence_to_be_present_settled_and_unaltered(self):
-        cases = ('missing', 'conflict', 'unknown', 'altered')
+        cases = ('remove', 'conflict', 'unknown', 'altered', 'empty')
         for label in cases:
             with self.subTest(evidence=label):
-                config = self.package(f'receipt-{label}')
+                config = self.package(f'receipt-{label}', prefix=f'receipt-{label}')
                 output = self.generate(config, f'receipt-{label}-generated')
                 pushed = self.push(config, output, name=f'receipt-{label}-runs')
                 self.assertEqual(pushed['exit'], 0, pushed['stdout'] + pushed['stderr'])
                 run_path = self.run_path(output)
-                expected = {
-                    'bucket': TEST_PRIVATE_BUCKET,
-                    'key': self.claim_key('parent'),
-                    'checksum': 'a' * 64,
-                    'size_bytes': 87,
-                }
-                self._rewrite_with_claim_evidence(run_path, expected, label)
+                self._mutate_claim_journal(run_path, label)
 
                 self.assertEqual(inspect_run(run_path)['publication']['state'], 'held')
 
-    @staticmethod
-    def _rewrite_with_claim_evidence(run_path, expected, case):
+    def test_receipt_derives_empty_and_reduced_expected_sets_from_the_plan(self):
+        for case in ('empty', 'reduced', 'altered_expected'):
+            with self.subTest(expected_claims=case):
+                config = self.package(
+                    f'receipt-plan-{case}',
+                    parent_ids=('alpha', 'beta'),
+                    prefix=f'receipt-plan-{case}',
+                )
+                output = self.generate(config, f'receipt-plan-{case}-generated')
+                pushed = self.push(config, output, name=f'receipt-plan-{case}-runs')
+                self.assertEqual(pushed['exit'], 0, pushed['stdout'] + pushed['stderr'])
+                run_path = self.run_path(output)
+                self._mutate_claim_journal(run_path, case)
+                self.assertEqual(inspect_run(run_path)['publication']['state'], 'held')
+
+    def test_claim_evidence_reducer_agrees_across_inspection_receipt_and_inventory(self):
+        config = self.package('claim-reducer')
+        output = self.generate(config, 'claim-reducer-generated')
+        self.assertEqual(self.push(config, output)['exit'], 0)
+        run_path = self.run_path(output)
+        self._append_pending_claim_intent(run_path)
+
+        inspected = inspect_run(run_path)
+        inventory = self.invoke('rollback-inventory', run_path, '--format', 'json')
         events, error = read_events(run_path)
-        if error:
-            raise AssertionError(error)
-        claim_context = {
-            'kind': 'context',
-            'stage': 'claim',
-            'expected_claims': [expected],
-        }
-        additions = [claim_context]
-        if case != 'missing':
-            identity = dict(expected)
-            status = {'conflict': 'conflict', 'unknown': 'unknown', 'altered': 'matched'}[case]
-            if case == 'altered':
-                identity['checksum'] = 'b' * 64
-            additions.extend(
-                [
-                    {
-                        'kind': 'intent',
-                        'stage': 'claim',
-                        'operation_id': 'synthetic-claim-operation',
-                        **identity,
-                    },
-                    {
-                        'kind': 'result',
-                        'stage': 'claim',
-                        'operation_id': 'synthetic-claim-operation',
-                        'status': status,
-                        'remote_outcome': 'unknown' if status == 'unknown' else status,
-                        **identity,
-                    },
-                ]
-            )
-        index = (
-            next(
-                index
-                for index, event in enumerate(events)
-                if event['kind'] == 'stage_started' and event.get('stage') == 'push'
-            )
-            + 1
+        receipt = self._publication_receipt(events)
+
+        self.assertIsNone(error)
+        self.assertEqual(inspected['publication']['state'], 'held')
+        self.assertEqual(inspected['claim_counts'], inventory['payload']['claim_counts'])
+        self.assertEqual(inspected['claim_counts']['unsettled'], 1)
+        self.assertFalse(_valid_publication_receipt(run_path, events, receipt))
+
+    def _mutate_claim_journal(self, run_path, case):
+        events, error = read_events(run_path)
+        self.assertIsNone(error)
+        context = next(
+            event
+            for event in events
+            if event['kind'] == 'context' and event.get('stage') == 'claim'
         )
-        events[index:index] = additions
+        expected = context['expected_claims']
+        if case in {'empty', 'reduced', 'altered_expected'}:
+            if case == 'empty':
+                context['expected_claims'] = []
+            elif case == 'reduced':
+                context['expected_claims'] = expected[:-1]
+            else:
+                expected[-1]['checksum'] = '0' * 64
+            self._write_events(run_path, events)
+            return
+        operation = self._created_claim_operation(events, expected[-1])
+        if case == 'remove':
+            events = [event for event in events if event.get('operation_id') != operation]
+        else:
+            result = next(
+                event
+                for event in events
+                if event.get('operation_id') == operation and event['kind'] == 'result'
+            )
+            self._alter_claim_result(result, case)
+        self._write_events(run_path, events)
+
+    @staticmethod
+    def _created_claim_operation(events, identity):
+        def matches(event):
+            return all(event.get(key) == value for key, value in identity.items())
+
+        result = next(
+            event
+            for event in reversed(events)
+            if event['kind'] == 'result'
+            and event.get('stage') == 'claim'
+            and event.get('status') == 'created'
+            and matches(event)
+        )
+        return result['operation_id']
+
+    @staticmethod
+    def _alter_claim_result(result, case):
+        if case == 'altered':
+            result['observed_checksum'] = '0' * 64
+        else:
+            result['status'] = case
+            result['remote_outcome'] = case
+
+    @staticmethod
+    def _write_events(run_path, events):
         for sequence, event in enumerate(events, 1):
             event['sequence'] = sequence
         (Path(run_path) / 'events.jsonl').write_text(
@@ -1010,25 +1072,48 @@ class InterleavedIdClaimTests(unittest.TestCase):
             encoding='utf-8',
         )
 
+    def _append_pending_claim_intent(self, run_path):
+        events, error = read_events(run_path)
+        self.assertIsNone(error)
+        identity = next(
+            event['expected_claims'][0]
+            for event in events
+            if event['kind'] == 'context' and event.get('stage') == 'claim'
+        )
+        events.append(
+            {
+                'sequence': len(events) + 1,
+                'kind': 'intent',
+                'stage': 'claim',
+                'operation_id': 'synthetic-pending-claim',
+                'attempt': 1,
+                **identity,
+            }
+        )
+        self._write_events(run_path, events)
+
+    @staticmethod
+    def _publication_receipt(events):
+        return next(
+            event['publication_receipt']
+            for event in reversed(events)
+            if event.get('publication_receipt')
+        )
+
     def test_claim_only_run_rolls_back_without_deleting_claims_and_later_batch_is_refused(self):
-        class SecondClaimConflict(FileS3Client):
-            def __init__(self, root):
-                super().__init__(root)
-                self.injected = False
-
-            def put_object(self, **kwargs):
-                if kwargs['Key'] == 'claims/_ids/beta.json' and not self.injected:
-                    self.injected = True
-                    self.seed(kwargs['Bucket'], kwargs['Key'], b'concurrent claim bytes')
-                return super().put_object(**kwargs)
-
-        self.store = SecondClaimConflict(self.storage_root)
         first = self.package('claim-only', parent_ids=('alpha', 'beta'))
         first_output = self.generate(first, 'claim-only-generated')
-        refused = self.push(first, first_output, name='claim-only-runs')
-        self.assertEqual(refused['exit'], 3, refused['stdout'] + refused['stderr'])
+        self._refuse_second_claim(first, first_output, 'claim-only-runs')
         run_path = self.run_path(first_output)
+        self._assert_claim_only_rollback(first, run_path)
+        self._assert_later_claim_batch_refused()
 
+    def _refuse_second_claim(self, config, output, run_name):
+        self.store = SecondClaimConflictClient(self.storage_root)
+        refused = self.push(config, output, name=run_name)
+        self.assertEqual(refused['exit'], 3, refused['stdout'] + refused['stderr'])
+
+    def _assert_claim_only_rollback(self, config, run_path):
         inventory = self.invoke('rollback-inventory', run_path, '--format', 'json')
         self.assertEqual(inventory['exit'], 0, inventory['stdout'] + inventory['stderr'])
         self.assertEqual(inventory['payload']['new_keys'], [])
@@ -1036,7 +1121,7 @@ class InterleavedIdClaimTests(unittest.TestCase):
             'rollback',
             run_path,
             '--config',
-            first,
+            config,
             '--endpoint-url',
             TEST_ENDPOINT,
             '--region',
@@ -1050,7 +1135,7 @@ class InterleavedIdClaimTests(unittest.TestCase):
             'rollback',
             run_path,
             '--config',
-            first,
+            config,
             '--endpoint-url',
             TEST_ENDPOINT,
             '--region',
@@ -1065,12 +1150,27 @@ class InterleavedIdClaimTests(unittest.TestCase):
         self.assertIn('claims/_ids/alpha.json', self.claim_keys())
         self.assertEqual(self.content_puts(), [])
 
+    def _assert_later_claim_batch_refused(self):
         second = self.package('claim-only-later', batch_id='later', parent_ids=('alpha',))
-        second_output = self.generate(second, 'claim-only-later-generated')
+        output = self.generate(second, 'claim-only-later-generated')
         self.store.put_calls.clear()
-        later = self.push(second, second_output, name='claim-only-later-runs')
+        later = self.push(second, output, name='claim-only-later-runs')
         self.assertEqual(later['exit'], 3, later['stdout'] + later['stderr'])
         self.assertEqual(self.store.put_calls, [])
+
+    def test_created_claim_still_allows_rollback_after_refused_resume(self):
+        config = self.package('claim-resume-rollback', parent_ids=('alpha', 'beta'))
+        output = self.generate(config, 'claim-resume-rollback-generated')
+        self._refuse_second_claim(config, output, 'claim-resume-rollback-runs')
+        resumed = self.push(config, output, name='claim-resume-rollback-runs', resume=True)
+        self.assertEqual(resumed['exit'], 3, resumed['stdout'] + resumed['stderr'])
+        run_path = self.run_path(output)
+        inventory = self.invoke('rollback-inventory', run_path, '--format', 'json')
+        statuses = {item['key']: item['status'] for item in inventory['payload']['retained_claims']}
+        self.assertEqual(inventory['exit'], 0, inventory['stdout'] + inventory['stderr'])
+        self.assertEqual(statuses['claims/_ids/alpha.json'], 'matched')
+        self.assertEqual(inventory['payload']['claim_counts']['conflict'], 1)
+        self._assert_claim_only_rollback(config, run_path)
 
     def test_online_dry_run_checks_claims_with_and_without_generated_files(self):
         for generated in (False, True):

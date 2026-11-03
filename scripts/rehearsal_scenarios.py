@@ -627,11 +627,19 @@ def _resume_interrupted_rollback(ctx, directory, source, prefix):
         ctx, directory, config, run_path, execute=True, label_suffix=' (resume)'
     )
     ctx.require_exit(resume, 0, 'resume')
+    _assert_resumed_rollback_state(ctx, run_path, prefix)
+    return resume, removed_locks
+
+
+def _assert_resumed_rollback_state(ctx, run_path, prefix):
     if not (run_path / 'rollback-hold.json').exists():
         raise ScenarioMismatch('rollback source hold was not retained')
     remaining = storage_listing(ctx.storage, ctx.args.private_bucket, f'{prefix}/')
     remaining.update(storage_listing(ctx.storage, ctx.args.public_bucket, f'{prefix}/'))
     interrupted_prefix = f'{prefix}/interrupted'
+    _assert_interrupted_claim_fingerprints(
+        run_path, remaining, ctx.args.private_bucket, interrupted_prefix
+    )
     roots = {
         f'{ctx.args.private_bucket}/{claim_root(prefix)}',
         f'{ctx.args.private_bucket}/{claim_root(interrupted_prefix)}',
@@ -644,7 +652,32 @@ def _resume_interrupted_rollback(ctx, directory, source, prefix):
         )
     if not claims:
         raise ScenarioMismatch('resumed rollback did not retain its ID claims')
-    return resume, removed_locks
+
+
+def _assert_interrupted_claim_fingerprints(run_path, remaining, bucket, prefix):
+    events, error = read_events(run_path)
+    if error:
+        raise ScenarioMismatch(f'interrupted run journal is unreadable: {error}')
+    context = next(
+        (event for event in events if event['kind'] == 'context' and event.get('stage') == 'claim'),
+        None,
+    )
+    expected = context.get('expected_claims') if context else None
+    if not expected:
+        raise ScenarioMismatch('interrupted run has no expected ID claims')
+    root = claim_root(prefix)
+    for claim in expected:
+        if not isinstance(claim, dict):
+            raise ScenarioMismatch('interrupted run claim identity has an invalid structure')
+        key = claim.get('key')
+        if claim.get('bucket') != bucket or not isinstance(key, str) or not key.startswith(root):
+            raise ScenarioMismatch('interrupted run claim identity is outside its exact claim root')
+        observed = remaining.get(f'{bucket}/{key}')
+        fingerprint = (observed or {}).get('sha256'), (observed or {}).get('size_bytes')
+        if observed is None or fingerprint != (claim.get('checksum'), claim.get('size_bytes')):
+            raise ScenarioMismatch(f'interrupted run claim is missing or changed: {key}')
+        if observed['checksum_type'] != 'FULL_OBJECT':
+            raise ScenarioMismatch(f'interrupted run claim is not a full-object checksum: {key}')
 
 
 def _assert_only_claims_remain(ctx, prefix):

@@ -69,6 +69,16 @@ class RehearsalScenarioTests(unittest.TestCase):
         self.assertEqual(wrapped.region_name, 'us-east-1')
         self.assertIs(wrapped.client, wrapped)
 
+    def test_fault_client_delegates_upload_to_wrapped_boto_client(self):
+        with patch.dict('os.environ', {'AWS_EC2_METADATA_DISABLED': 'true'}):
+            client = create_s3_client('http://localhost:4566', 'us-east-1', None)
+        wrapped = FaultClient(client)
+        with patch.object(client, 'upload_file') as upload_file:
+            wrapped.upload_file('synthetic-source', TEST_PRIVATE_BUCKET, 'run/file.bin', 'a' * 64)
+        upload_file.assert_called_once_with(
+            'synthetic-source', TEST_PRIVATE_BUCKET, 'run/file.bin', 'a' * 64
+        )
+
     def assert_sentinels(self):
         for (bucket, key), checksum in self.sentinels.items():
             found = self.store.listing(bucket, key)
@@ -390,9 +400,11 @@ class RehearsalScenarioTests(unittest.TestCase):
         return manifest_path, original_manifest
 
     def _stored_keys(self):
-        return set(self.store.listing(TEST_PRIVATE_BUCKET)) | set(
-            self.store.listing(TEST_PUBLIC_BUCKET)
-        )
+        return {
+            (bucket, key)
+            for bucket in (TEST_PRIVATE_BUCKET, TEST_PUBLIC_BUCKET)
+            for key in self.store.listing(bucket)
+        }
 
     def _append_synthetic_page(self):
         image_path = self.package_root / 'page-2.tif'
@@ -423,7 +435,29 @@ class RehearsalScenarioTests(unittest.TestCase):
         self.assertEqual(manifest_path.read_bytes(), original_manifest)
         run_path = Path(json.loads((output / '.workbench-run.json').read_text())['run_path'])
         self.assertEqual(inspect_run(run_path)['publication']['state'], 'held')
-        self.assertTrue(self._stored_keys() - keys_before)
+        self._assert_additive_storage_delta(run_path, keys_before)
+
+    def _assert_additive_storage_delta(self, run_path, keys_before):
+        events, error = read_events(run_path)
+        self.assertIsNone(error)
+        context = next(
+            event
+            for event in events
+            if event['kind'] == 'context' and event.get('stage') == 'claim'
+        )
+        expected_claims = {(claim['bucket'], claim['key']) for claim in context['expected_claims']}
+        plan = json.loads((run_path / 'upload-plan.json').read_text())['entries']
+        expected_content = {
+            (entry['bucket'], entry['key'])
+            for entry in plan
+            if (entry['bucket'], entry['key']) not in keys_before
+        }
+        actual_delta = self._stored_keys() - keys_before
+        actual_claims = actual_delta & expected_claims
+        actual_content = actual_delta - actual_claims
+        self.assertTrue(expected_content)
+        self.assertEqual(actual_content, expected_content)
+        self.assertEqual(actual_claims, expected_claims - keys_before)
 
     def test_scenario_09_conflicting_existing_content(self):
         self.assert_contract_case(9)

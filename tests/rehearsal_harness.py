@@ -666,6 +666,13 @@ class FaultClient:
         return self._wrapped.head_bucket(**kwargs)
 
     def upload_file(self, source_path, bucket, key, checksum):
+        if isinstance(self._wrapped, FileS3Client):
+            return self._upload_file_fake(source_path, bucket, key, checksum)
+        if key.startswith(self._claim_root):
+            return self._wrapped.upload_file(source_path, bucket, key, checksum)
+        return self._upload_file_wrapped(source_path, bucket, key, checksum)
+
+    def _upload_file_fake(self, source_path, bucket, key, checksum):
         if key.startswith(self._claim_root):
             return _upload_file_through_put(self, source_path, bucket, key, checksum)
         if self.mode == 'lost_ack':
@@ -685,6 +692,25 @@ class FaultClient:
                 'PutObject',
             )
         _upload_file_through_put(self, source_path, bucket, key, checksum)
+
+    def _upload_file_wrapped(self, source_path, bucket, key, checksum):
+        if self.mode == 'lost_ack':
+            self._wrapped.upload_file(source_path, bucket, key, checksum)
+            from botocore.exceptions import EndpointConnectionError
+
+            raise EndpointConnectionError(endpoint_url='http://synthetic.invalid')
+        if self.mode == 'retry_three' and self.failures_remaining:
+            self.failures_remaining -= 1
+            from botocore.exceptions import ClientError
+
+            raise ClientError(
+                {
+                    'Error': {'Code': 'ServiceUnavailable'},
+                    'ResponseMetadata': {'HTTPStatusCode': 503},
+                },
+                'PutObject',
+            )
+        return self._wrapped.upload_file(source_path, bucket, key, checksum)
 
     def head_object(self, **kwargs):
         return self._raw_client().head_object(**kwargs)
