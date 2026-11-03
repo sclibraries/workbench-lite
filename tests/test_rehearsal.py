@@ -21,6 +21,7 @@ from rehearsal_harness import (
     cli_client_factory,
     clear_dead_test_locks,
     invoke_cli,
+    is_claim_key,
     make_synthetic_package,
     spawn_worker,
     start_worker,
@@ -209,7 +210,14 @@ class RehearsalScenarioTests(unittest.TestCase):
         self.assertEqual(result['exit'], 1)
         summary = inspect_run(run_path)
         self.assertEqual(summary['state'], 'failed')
-        self.assertEqual(len(self.store.put_calls), 0)
+        claim_writes = [
+            identity for identity in self.store.put_calls if is_claim_key(identity[1], 'run')
+        ]
+        content_writes = [
+            identity for identity in self.store.put_calls if not is_claim_key(identity[1], 'run')
+        ]
+        self.assertTrue(claim_writes)
+        self.assertEqual(content_writes, [])
         self.assert_sentinels()
 
     def test_scenario_06_sigint_and_sigterm_mid_batch(self):
@@ -249,6 +257,7 @@ class RehearsalScenarioTests(unittest.TestCase):
             fault='upload_before_2',
             ready_file=self.root / f'{name}-ready',
             kill_signal=stop_signal,
+            claim_prefix=f'{name}-prefix',
         )
         self.assertEqual(child.returncode, expected, child.stderr)
         self._assert_interrupted_upload(output)
