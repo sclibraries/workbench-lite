@@ -640,6 +640,15 @@ class CheckCommandTest(unittest.TestCase):
                 path.parent.mkdir(parents=True, exist_ok=True)
                 if path.suffix == '.jpg':
                     Image.new('RGB', (8, 8)).save(path)
+                elif path.name == 'parent.json':
+                    path.write_text(
+                        json.dumps(
+                            {
+                                '@id': 'https://manifests.example.org/'
+                                'workbench-lite/sample/manifests/parent.json'
+                            }
+                        )
+                    )
                 else:
                     path.write_text('{}')
 
