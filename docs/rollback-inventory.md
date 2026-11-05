@@ -12,14 +12,19 @@ workbench-lite rollback-inventory workbench-lite-runs/RUN_ID --output /secure/pa
 The JSON includes the run/batch identity, input hashes and sanitized references,
 planned objects, recorded operation outcomes, confirmed new S3 keys, unknown
 outcomes, previously published objects reused by checksum, manifest replacement
-holds, local derivatives, and manifest URLs when a base URL was configured in
-YAML or passed to `generate --manifest-base-url`. These URLs follow the generated
-manifest `@id` and are listed only for confirmed uploads.
+holds, local derivatives, and manifest URLs when a base was recorded with the run.
+The inventory validates and normalizes that base with the same public URL rule as
+generation, then joins the full planned manifest key; for new runs, each inventory
+URL equals the manifest `@id`. HTTPS is allowed for public hosts; HTTP is allowed
+only for `localhost`, `127.0.0.1` or `[::1]`. URLs with userinfo, queries,
+fragments, whitespace, control characters or backslashes are refused. URLs are
+listed only for confirmed uploads.
 It also reports `claim_counts` and `retained_claims`; claims are durable registry
 records, not upload-plan entries or rollback candidates.
 Older generated folders may have no recorded generate stage. For those
-older test outputs, a command-line-only base URL cannot be reconstructed from
-the journal; the inventory lists no manifest URL unless YAML supplies one.
+older outputs, the inventory uses only a base present in the run's config snapshot
+or recorded generation options. A missing or invalid recorded base produces no
+manifest URL; current configuration is never consulted.
 The `aspace` section explicitly records that the CLI made no ArchivesSpace change.
 Staff must restore any separately reviewed File Version change from that update
 CSV's old-value column; the inventory cannot infer those prior values.

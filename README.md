@@ -39,9 +39,9 @@ input_dir: package-files
 input_csv: ingest.csv
 additional_files:
   - hocr: 3507
-manifest_base_url: https://digital.smith.edu/manifests
-cantaloupe_base_url: https://digital.smith.edu/iiif/2
-s3_private_bucket: compass-prod-i2-files
+manifest_base_url: https://manifests.example.org/manifests
+cantaloupe_base_url: https://images.example.org/iiif/2
+s3_private_bucket: your-approved-private-bucket
 s3_public_bucket: your-approved-public-bucket
 s3_prefix: workbench-lite
 batch_id: example-batch
@@ -53,8 +53,8 @@ batch_id: example-batch
 | `input_csv` | CSV path, relative to `input_dir`, unless overridden with `--input-csv`. |
 | `additional_files` | Optional list of single-field mappings for sidecars, such as `hocr: 3507`. |
 | `allow_missing_files` | Optional boolean for warning-only missing-file reports. It does not permit uploads with missing sources. |
-| `manifest_base_url` | Optional public base URL used in generated manifest identifiers. |
-| `cantaloupe_base_url` | Optional base URL used for IIIF image services. |
+| `manifest_base_url` | Required for `generate --manifests`; public base for manifest identifiers. |
+| `cantaloupe_base_url` | Required for `generate --manifests`; public base for IIIF image services. |
 | `s3_private_bucket` | Bucket for private masters and audit files. |
 | `s3_public_bucket` | Bucket for delivery assets and manifests. |
 | `s3_prefix` | Prefix shared by package destinations; defaults to `workbench-lite`. |
@@ -64,6 +64,12 @@ Set both destination buckets explicitly for the environment before an execute ru
 The public bucket defaults to `islandora-derivatives`. AWS credentials
 come from the selected AWS profile or the standard AWS credential chain; do not put
 credentials in the YAML file.
+
+For `generate --manifests`, both URL bases must be absolute HTTPS URLs, or HTTP URLs
+whose host is exactly `localhost`, `127.0.0.1` or `[::1]`. Bases cannot contain
+userinfo, queries, fragments, whitespace, control characters or backslashes. A path
+prefix is kept and trailing slashes are removed. `check` and `generate` without
+`--manifests` do not require either setting.
 
 ## S3 layout and ID reservations
 

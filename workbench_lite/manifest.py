@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from pathlib import Path
 from typing import Dict, List, Optional
-from urllib.parse import quote
 import hashlib
 import json
 
@@ -10,6 +9,7 @@ from .generate import GenerateResult, GenerateResultEntry
 from .diagnostics import operation_error
 from .runs import RecordedResults
 from .models import UploadPlanEntry, WorkbenchObject
+from .public_urls import join_image_service_url, join_manifest_url
 
 
 MANIFEST_IMAGE_MAX_DIMENSION = 2000
@@ -48,15 +48,13 @@ def generate_manifests(
 
         manifest_pages: List[Dict[str, object]] = []
         missing_reasons: List[str] = []
-        service_url_prefix = cantaloupe_base_url.rstrip('/')
-
         for page in obj.pages:
             page_canvas, page_missing = _build_canvas_entry(
                 page,
                 obj,
                 entries_by_key,
                 output_dir,
-                service_url_prefix,
+                cantaloupe_base_url,
                 page_dimensions,
             )
             if page_canvas is None:
@@ -270,7 +268,7 @@ def _manifest_id(
     manifest_path = manifest_entry.key if manifest_entry else fallback_key
 
     if manifest_base_url:
-        return manifest_base_url.rstrip('/') + '/' + manifest_path.lstrip('/')
+        return join_manifest_url(manifest_base_url, manifest_path)
 
     return manifest_path
 
@@ -285,7 +283,7 @@ def _output_path_for_entry(entry_key: str, output_dir: Path) -> Path:
 
 
 def build_cantaloupe_service_id(base_url: str, image_key: str) -> str:
-    return f'{base_url.rstrip("/")}/{quote(image_key, safe="")}'
+    return join_image_service_url(base_url, image_key)
 
 
 def _normalize_segment(value: str) -> str:

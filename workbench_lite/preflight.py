@@ -9,6 +9,10 @@ import shutil
 from .image_policy import Image, pixel_limit_error
 
 from .diagnostics import operation_error
+from .public_urls import image_service_url_base, manifest_url_base
+
+
+PUBLIC_URL_ERROR_MARKER = 'Public URL validation failed:'
 
 
 @dataclass
@@ -36,25 +40,27 @@ def safe_source(value, input_dir):
     return candidate.resolve().is_relative_to(root)
 
 
-def validate_content(path, role):
+def validate_content(path, role, *, planned_key=None):
     """Return a safe diagnostic; PDF checking is framing, not full parsing."""
     path = Path(path)
     try:
-        return _validate_role_content(path, role)
+        return _validate_role_content(path, role, planned_key)
     except Image.DecompressionBombError:
         return pixel_limit_error()
     except (OSError, ValueError) as exc:
         return 'Cannot read/decode required file: ' + operation_error(exc)
 
 
-def _validate_role_content(path, role):
+def _validate_role_content(path, role, planned_key):
     if role in {'master_tiff', 'service_jpg', 'thumbnail'}:
         return _validate_image_content(path, role)
     if role == 'pdf':
         return _validate_pdf_content(path)
     if role == 'hocr':
         return _validate_text_content(path)
-    if role in {'manifest', 'audit'}:
+    if role == 'manifest':
+        return _validate_manifest_content(path, planned_key)
+    if role == 'audit':
         return _validate_json_content(path)
     return _validate_readable_content(path)
 
@@ -90,6 +96,44 @@ def _validate_json_content(path):
     if not isinstance(value, dict):
         return 'Expected a JSON object.'
     return None
+
+
+def _validate_manifest_content(path, planned_key):
+    manifest = json.loads(path.read_text(encoding='utf-8'))
+    if not isinstance(manifest, dict):
+        return 'Expected a JSON object.'
+    if planned_key is None:
+        return None
+    try:
+        manifest_url_base(manifest.get('@id'), planned_key)
+    except ValueError:
+        return f'{PUBLIC_URL_ERROR_MARKER} manifest @id does not join its planned key.'
+    for service_id in _image_service_ids(manifest):
+        try:
+            image_service_url_base(service_id)
+        except ValueError:
+            return f'{PUBLIC_URL_ERROR_MARKER} image service @id is not one encoded key segment.'
+    return None
+
+
+def _image_service_ids(manifest):
+    for sequence in manifest.get('sequences', []):
+        if not isinstance(sequence, dict):
+            continue
+        for canvas in sequence.get('canvases', []):
+            if not isinstance(canvas, dict):
+                continue
+            for annotation in canvas.get('images', []):
+                if not isinstance(annotation, dict):
+                    continue
+                resource = annotation.get('resource')
+                service = resource.get('service') if isinstance(resource, dict) else None
+                if isinstance(service, dict):
+                    yield service.get('@id')
+
+
+def is_public_url_failure(errors):
+    return any(PUBLIC_URL_ERROR_MARKER in error for error in errors)
 
 
 def _validate_readable_content(path):
@@ -201,7 +245,7 @@ def _check_existing_generated_entry(entry, target, errors, missing):
     if not target.is_file():
         missing.append(entry.key)
         return
-    error = validate_content(target, entry.role)
+    error = validate_content(target, entry.role, planned_key=entry.key)
     if error:
         errors.append(f'{entry.object_id}/{entry.page_id}: {entry.key}: {error}')
 

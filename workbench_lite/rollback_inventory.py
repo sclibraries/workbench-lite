@@ -6,6 +6,7 @@ from pathlib import Path
 
 from .diagnostics import sanitize
 from .id_claims import ClaimEvidence, reduce_claim_evidence
+from .public_urls import join_manifest_url, normalize_public_base_url
 from .runs import JournalError, atomic_write, digest, json_bytes, read_events
 
 INVENTORY_VERSION = 1
@@ -378,13 +379,15 @@ def _manifest_urls(new_keys, config_snapshot, events):
     base = config_snapshot.get('manifest_base_url')
     if base is None:
         base = _generate_options(events).get('manifest_base_url')
-    if not isinstance(base, str) or not base.startswith(('http://', 'https://')):
+    try:
+        base = normalize_public_base_url(base)
+    except ValueError:
         return []
     return [
         {
             'bucket': item['bucket'],
             'key': item['key'],
-            'url': base.rstrip('/') + '/' + item['key'].lstrip('/'),
+            'url': join_manifest_url(base, item['key']),
         }
         for item in new_keys
         if item['role'] == 'manifest'

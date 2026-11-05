@@ -27,7 +27,8 @@ from .runs import (
     json_bytes,
 )
 from .locks import WriterLocks, LockError, lock_output_and_run, lock_destination
-from .preflight import output_readiness, storage_readiness
+from .preflight import is_public_url_failure, output_readiness, storage_readiness
+from .public_urls import normalize_public_base_url
 from .rollback_inventory import build_inventory, write_inventory
 from .rollback import run_rollback
 from .storage_plan import DEFAULT_PRIVATE_BUCKET, DEFAULT_PUBLIC_BUCKET
@@ -854,7 +855,7 @@ def _run_validated_push(args, check_report):
     local = _push_local_readiness(args, check_report.upload_plan, input_dir)
     if local['errors']:
         _print_preflight(args)
-        return 1
+        return 3 if is_public_url_failure(local['errors']) else 1
     _prepare_generated_push(args, check_report.upload_plan)
     return _run_push_with_storage(args, check_report, input_dir, dry_run, id_claims)
 
@@ -909,6 +910,10 @@ def _push_local_readiness(args, upload_plan, input_dir):
         args.generated_dir is not None and not (args.generated_dir / '.workbench-run.json').exists()
     )
     local = output_readiness(upload_plan, input_dir, args.generated_dir, new_audit=new_audit)
+    if is_public_url_failure(local['errors']):
+        local['errors'].extend(
+            f'Missing generated file: {key}' for key in local['missing_generated']
+        )
     args.preflight = {'local': local}
     args.journal.append('context', stage=args.journal.stage, preflight=args.preflight)
     return local
@@ -1043,6 +1048,12 @@ def _run_generate(args):
         _print_check(check_report, args.format, args.journal)
         return 3
     config = load_config(args.config)
+    try:
+        manifest_bases = _resolve_generation_bases(args, config)
+    except ValueError as exc:
+        args.preflight = {'local': {'errors': [str(exc)]}}
+        _print_preflight(args)
+        return 3
     input_dir = _resolve_input_dir(args.config, config)
     output_dir = args.output_dir or (input_dir / 'generated')
     local = output_readiness(check_report.upload_plan, input_dir, output_dir, generating=True)
@@ -1062,7 +1073,7 @@ def _run_generate(args):
         quality=args.quality,
         journal=args.journal,
     )
-    report = _add_requested_manifests(args, config, check_report, output_dir, report)
+    report = _add_requested_manifests(args, manifest_bases, check_report, output_dir, report)
     report = _add_requested_thumbnails(
         args, check_report.upload_plan, input_dir, output_dir, report
     )
@@ -1070,19 +1081,33 @@ def _run_generate(args):
     return 4 if report.failed_count or report.missing_source_count else 0
 
 
-def _add_requested_manifests(args, config, check_report, output_dir, report):
+def _resolve_generation_bases(args, config):
+    if not args.manifests:
+        return None
+    manifest_base = config.get('manifest_base_url')
+    if manifest_base is None:
+        manifest_base = args.manifest_base_url
+    image_base = config.get('cantaloupe_base_url')
+    if image_base is None:
+        image_base = args.cantaloupe_base_url
+    try:
+        return (
+            normalize_public_base_url(manifest_base),
+            normalize_public_base_url(image_base),
+        )
+    except ValueError as exc:
+        raise ValueError(f'Invalid manifest base URL: {exc}') from exc
+
+
+def _add_requested_manifests(args, bases, check_report, output_dir, report):
     if not args.manifests:
         return report
-    manifest_base_url = config.get('manifest_base_url')
-    if manifest_base_url is None:
-        manifest_base_url = args.manifest_base_url
+    manifest_base_url, cantaloupe_base_url = bases
     manifest_report = generate_manifests(
         objects=check_report.objects,
         upload_plan=check_report.upload_plan,
         output_dir=output_dir,
-        cantaloupe_base_url=str(
-            config.get('cantaloupe_base_url', args.cantaloupe_base_url or '/iiif/2')
-        ),
+        cantaloupe_base_url=cantaloupe_base_url,
         manifest_base_url=manifest_base_url,
         journal=args.journal,
         page_dimensions=report.page_dimensions,

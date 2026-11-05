@@ -11,7 +11,7 @@ report. Publication and recovery limits are described in the linked guides.
 | 0 | Command completed without required failures |
 | 1 | Processing aborted, required upload artifact missing, upload or claim storage/final verification failed, or evidence/rollback inventory could not be written |
 | 2 | Invalid arguments, including execute with dummy files or without a required generated directory |
-| 3 | Input/configuration validation errors, invalid manifests, or a package ID claim conflict |
+| 3 | Input/configuration validation errors, invalid manifests or public manifest URLs, or a package ID claim conflict |
 | 4 | Generation or URL verification completed independent work with failures |
 | 130 / 143 | SIGINT / SIGTERM; an interruption event is recorded when storage permits |
 
@@ -28,6 +28,22 @@ including a conditional-create race with a different owner, returns 3; claim sto
 return 1 and hold the batch. Online `push --dry-run` performs the read-only claim check with or
 without generated files. `push --dry-run --offline` reports the check as `not_run` and makes
 no storage call.
+
+`generate --manifests` requires valid `manifest_base_url` and `cantaloupe_base_url` settings
+from YAML or their flags. A YAML value takes precedence, including an empty value; a flag
+supplies a missing setting. Both bases are checked before anything in the generated directory
+is changed. They must be absolute HTTPS URLs or HTTP URLs for exactly `localhost`, `127.0.0.1`
+or `[::1]`, with no userinfo, query, fragment, whitespace, control character or backslash.
+`check` and `generate` without `--manifests` do not need either setting.
+
+Before local readiness completes, push validates every planned manifest's `@id` against its
+encoded planned S3 key and validates each image service `@id` as one encoded image-key segment
+after a valid public base. It does not compare those bases with current configuration. An
+invalid base or identifier returns 3 before storage setup or writes. Other local readiness
+failures return 1; if URL validation and another readiness check fail together, the report
+includes both and returns 3. Online and offline dry runs perform the same local URL check when
+generated files are present; offline mode creates no storage client. A dry run without
+generated files remains planning only.
 
 ## Run locations and workflow
 
