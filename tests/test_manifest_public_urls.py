@@ -171,6 +171,7 @@ class ManifestPublicUrlTests(unittest.TestCase):
             'https://example.org/%2',
             'https://example.org/%GG',
             'https://exämple.org/archive',
+            'https://K.example.org/archive',
             'https://bad_host.example/archive',
             'http://127.0.0.2/x',
             'http://[2001:db8::1]/x',
@@ -184,65 +185,10 @@ class ManifestPublicUrlTests(unittest.TestCase):
     def test_generate_manifest_ids_normalize_bases_and_join_full_keys(self):
         config = self.package()
         report = run_check(config)
-        bases = [
-            (
-                'https://manifests.example.org',
-                'https://images.example.org/iiif/2',
-                'https://manifests.example.org',
-                'https://images.example.org/iiif/2',
-            ),
-            (
-                'https://manifests.example.org/',
-                'https://images.example.org/iiif/2/',
-                'https://manifests.example.org',
-                'https://images.example.org/iiif/2',
-            ),
-            (
-                'HTTPS://MANIFESTS.EXAMPLE.ORG/Archive////',
-                'HTTPS://IMAGES.EXAMPLE.ORG/IIIF/2////',
-                'https://manifests.example.org/Archive',
-                'https://images.example.org/IIIF/2',
-            ),
-            (
-                'HTTPS://MANIFESTS.EXAMPLE.ORG/archive///',
-                'HTTPS://IMAGES.EXAMPLE.ORG/cantaloupe/iiif/2///',
-                'https://manifests.example.org/archive',
-                'https://images.example.org/cantaloupe/iiif/2',
-            ),
-        ]
-        manifest_entry = next(entry for entry in report.upload_plan if entry.role == 'manifest')
-        service_entry = next(entry for entry in report.upload_plan if entry.role == 'service_jpg')
-
-        for index, (
-            manifest_base,
-            image_base,
-            expected_manifest_base,
-            expected_image_base,
-        ) in enumerate(bases):
+        for index, base_case in enumerate(self._normalized_url_base_cases()):
+            manifest_base, image_base, _, _ = base_case
             with self.subTest(manifest_base=manifest_base, image_base=image_base):
-                output = self.root / f'joined-{index}'
-                service_report = self._generate_service_image(report, output, config)
-                generated = generate_manifests(
-                    report.objects,
-                    report.upload_plan,
-                    output,
-                    cantaloupe_base_url=image_base,
-                    manifest_base_url=manifest_base,
-                    page_dimensions=service_report.page_dimensions,
-                )
-                self.assertEqual(generated.generated_count, 1)
-                payload = json.loads(Path(generated.results[0].output_path).read_text())
-                self.assertEqual(
-                    payload['@id'],
-                    f'{expected_manifest_base}/{quote(manifest_entry.key, safe="/")}',
-                )
-                canvas = payload['sequences'][0]['canvases'][0]
-                annotation = canvas['images'][0]
-                expected_service = f'{expected_image_base}/{quote(service_entry.key, safe="")}'
-                self.assertEqual(annotation['resource']['service']['@id'], expected_service)
-                self.assertEqual(canvas['@id'], 'page/page-1')
-                self.assertEqual(annotation['on'], 'page/page-1')
-                self.assertEqual(manifest_entry.key, 'run/package/manifests/package.json')
+                self._assert_generated_ids_for_base_case(config, report, index, base_case)
 
     def test_manifest_and_service_keys_with_reserved_characters_are_encoded_without_key_changes(
         self,
@@ -580,59 +526,95 @@ class ManifestPublicUrlTests(unittest.TestCase):
                     if offline:
                         self.assertEqual(result['factory'].call_count, 0)
 
-    def test_push_rejects_manifest_and_service_ids_that_do_not_match_joined_keys(self):
-        cases = [
-            ('wrong-manifest-key', None, 'manifest', 'https://manifests.example.org/other.json'),
-            ('unencoded-manifest-key', 'demo/literal%2F', 'manifest', None),
-            (
-                'multi-segment-service-id',
-                None,
-                'service-multi-segment',
-                'https://images.example.org/iiif/2/a/b',
-            ),
-        ]
-        for name, prefix, kind, value in cases:
-            with self.subTest(name=name):
-                config = self.package(name)
-                if prefix is not None:
-                    self._update_config(config, s3_prefix=prefix)
-                output = self.root / f'{name}-generated'
-                generated = self.generate(config, output, f'{name}-generate')
-                self.assertEqual(generated['exit'], 0, generated['stdout'] + generated['stderr'])
+    def test_push_rejects_manifest_id_with_wrong_planned_key(self):
+        self._assert_push_rejects_join_mismatch(
+            'wrong-manifest-key', None, 'manifest', 'https://manifests.example.org/other.json'
+        )
 
-                if kind.startswith('service-'):
-                    report = run_check(config)
-                    manifest_entry = next(
-                        entry for entry in report.upload_plan if entry.role == 'manifest'
-                    )
-                    generated_manifest_id = f'{MANIFEST_BASE}/{quote(manifest_entry.key, safe="/")}'
-                    self.assertEqual(
-                        json.loads(self.generated_manifest(output).read_text())['@id'],
-                        generated_manifest_id,
-                    )
+    def test_push_rejects_unencoded_manifest_key(self):
+        self._assert_push_rejects_join_mismatch('unencoded-manifest-key', 'demo/literal%2F')
 
-                if value is None:
-                    report = run_check(config)
-                    manifest_entry = next(
-                        entry for entry in report.upload_plan if entry.role == 'manifest'
-                    )
-                    value = f'{MANIFEST_BASE}/{manifest_entry.key}'
-                manifest_path = self.mutate_manifest(output, kind, value)
-                if kind.startswith('service-'):
-                    changed_payload = json.loads(manifest_path.read_text(encoding='utf-8'))
-                    changed_service = changed_payload['sequences'][0]['canvases'][0]['images'][0][
-                        'resource'
-                    ]['service']
-                    self.assertEqual(changed_payload['@id'], generated_manifest_id)
-                    self.assertEqual(changed_service['@id'], value)
-                storage = Storage()
+    def test_push_rejects_service_id_with_multiple_segments(self):
+        self._assert_push_rejects_join_mismatch(
+            'multi-segment-service-id',
+            None,
+            'service-multi-segment',
+            'https://images.example.org/iiif/2/a/b',
+        )
 
-                result = self.push(config, output, name, '--execute', client=storage)
+    def test_push_checks_each_service_in_a_service_list(self):
+        config, output, manifest_path, payload = self._generated_manifest_case('service-list')
+        resource = payload['sequences'][0]['canvases'][0]['images'][0]['resource']
+        resource['service'] = [resource['service'], {'@id': '/iiif/2/relative-image'}]
+        self._write_manifest(manifest_path, payload)
+        result = self.push(config, output, 'service-list-push', '--dry-run', extra=['--offline'])
+
+        self.assert_manifest_id_error(result, output, manifest_path)
+        self.assertEqual(result['exit'], 3)
+        self.assertEqual(result['factory'].call_count, 0)
+
+    def test_push_checks_canvas_and_manifest_thumbnail_services(self):
+        for scope in ('canvas', 'manifest'):
+            with self.subTest(scope=scope):
+                config, output, manifest_path, payload = self._generated_manifest_case(
+                    f'thumbnail-service-{scope}'
+                )
+                owner = payload['sequences'][0]['canvases'][0] if scope == 'canvas' else payload
+                owner['thumbnail'] = {
+                    '@id': 'https://images.example.org/thumbnail.jpg',
+                    'service': {'@id': '/iiif/2/relative-thumbnail'},
+                }
+                self._write_manifest(manifest_path, payload)
+                result = self.push(
+                    config,
+                    output,
+                    f'thumbnail-service-{scope}-push',
+                    '--dry-run',
+                    extra=['--offline'],
+                )
 
                 self.assert_manifest_id_error(result, output, manifest_path)
                 self.assertEqual(result['exit'], 3)
-                self.assertEqual(storage.claim_calls, [])
-                self.assertEqual(storage.calls, [])
+                self.assertEqual(result['factory'].call_count, 0)
+
+    def test_wrong_manifest_containers_are_reported_without_traceback(self):
+        cases = [
+            ('sequences', None),
+            ('sequences', 'wrong-type'),
+            ('canvases', None),
+            ('canvases', 'wrong-type'),
+            ('images', None),
+            ('images', 'wrong-type'),
+        ]
+        for container, value in cases:
+            name = f'malformed-{container}-{value}'
+            with self.subTest(container=container, value=value):
+                config, output, manifest_path, payload = self._generated_manifest_case(name)
+                self._set_manifest_container(payload, container, value)
+                self._write_manifest(manifest_path, payload)
+                result = self.push(config, output, f'{name}-push', '--dry-run', extra=['--offline'])
+                errors = result['payload']['preflight']['local']['errors']
+
+                self.assertEqual(result['exit'], 1, result['stdout'] + result['stderr'])
+                self.assertTrue(
+                    any(manifest_path.relative_to(output).as_posix() in error for error in errors),
+                    errors,
+                )
+                self.assertTrue(any(f'Manifest {container}' in error for error in errors), errors)
+                self.assertNotIn('Traceback', result['stdout'] + result['stderr'])
+
+    def test_non_object_manifest_with_url_marker_in_prefix_stays_exit_one(self):
+        config, output, manifest_path, _ = self._generated_manifest_case(
+            'marker-prefix', s3_prefix='Public URL validation failed: marker'
+        )
+        manifest_path.write_text('[]', encoding='utf-8')
+
+        result = self.push(config, output, 'marker-prefix-push', '--dry-run', extra=['--offline'])
+        errors = result['payload']['preflight']['local']['errors']
+
+        self.assertEqual(result['exit'], 1, result['stdout'] + result['stderr'])
+        self.assertTrue(any('Expected a JSON object.' in error for error in errors), errors)
+        self.assertNotIn('Traceback', result['stdout'] + result['stderr'])
 
     def test_dry_run_without_generated_files_remains_planning_only(self):
         config = self.package(
@@ -811,6 +793,125 @@ class ManifestPublicUrlTests(unittest.TestCase):
         self.assertEqual(rehearsal_value['cantaloupe_base_url'], 'http://localhost:8080/iiif/2')
         self.assertEqual(shared_value['manifest_base_url'], 'http://localhost:8080/manifests')
         self.assertEqual(shared_value['cantaloupe_base_url'], 'http://localhost:8080/iiif/2')
+
+    def _normalized_url_base_cases(self):
+        return [
+            (
+                'https://manifests.example.org',
+                'https://images.example.org/iiif/2',
+                'https://manifests.example.org',
+                'https://images.example.org/iiif/2',
+            ),
+            (
+                'https://manifests.example.org/',
+                'https://images.example.org/iiif/2/',
+                'https://manifests.example.org',
+                'https://images.example.org/iiif/2',
+            ),
+            (
+                'HTTPS://MANIFESTS.EXAMPLE.ORG/Archive////',
+                'HTTPS://IMAGES.EXAMPLE.ORG/IIIF/2////',
+                'https://manifests.example.org/Archive',
+                'https://images.example.org/IIIF/2',
+            ),
+            (
+                'HTTPS://MANIFESTS.EXAMPLE.ORG/archive///',
+                'HTTPS://IMAGES.EXAMPLE.ORG/cantaloupe/iiif/2///',
+                'https://manifests.example.org/archive',
+                'https://images.example.org/cantaloupe/iiif/2',
+            ),
+        ]
+
+    def _assert_generated_ids_for_base_case(self, config, report, index, base_case):
+        manifest_base, image_base, expected_manifest_base, expected_image_base = base_case
+        output = self.root / f'joined-{index}'
+        service_report = self._generate_service_image(report, output, config)
+        generated = generate_manifests(
+            report.objects,
+            report.upload_plan,
+            output,
+            cantaloupe_base_url=image_base,
+            manifest_base_url=manifest_base,
+            page_dimensions=service_report.page_dimensions,
+        )
+        self.assertEqual(generated.generated_count, 1)
+        payload = json.loads(Path(generated.results[0].output_path).read_text())
+        manifest_entry = next(entry for entry in report.upload_plan if entry.role == 'manifest')
+        service_entry = next(entry for entry in report.upload_plan if entry.role == 'service_jpg')
+        self.assertEqual(
+            payload['@id'],
+            f'{expected_manifest_base}/{quote(manifest_entry.key, safe="/")}',
+        )
+        canvas = payload['sequences'][0]['canvases'][0]
+        annotation = canvas['images'][0]
+        expected_service = f'{expected_image_base}/{quote(service_entry.key, safe="")}'
+        self.assertEqual(annotation['resource']['service']['@id'], expected_service)
+        self.assertEqual(canvas['@id'], 'page/page-1')
+        self.assertEqual(annotation['on'], 'page/page-1')
+        self.assertEqual(manifest_entry.key, 'run/package/manifests/package.json')
+
+    def _assert_push_rejects_join_mismatch(self, name, prefix=None, kind='manifest', value=None):
+        config, output, manifest_path = self._prepare_join_mismatch_case(name, prefix, kind, value)
+        storage = Storage()
+        result = self.push(config, output, name, '--execute', client=storage)
+        self.assert_manifest_id_error(result, output, manifest_path)
+        self.assertEqual(result['exit'], 3)
+        self.assertEqual(storage.claim_calls, [])
+        self.assertEqual(storage.calls, [])
+
+    def _prepare_join_mismatch_case(self, name, prefix, kind, value):
+        config = self.package(name)
+        if prefix is not None:
+            self._update_config(config, s3_prefix=prefix)
+        output = self.root / f'{name}-generated'
+        generated = self.generate(config, output, f'{name}-generate')
+        self.assertEqual(generated['exit'], 0, generated['stdout'] + generated['stderr'])
+        manifest_key = self._planned_manifest_key(config)
+        generated_manifest_id = f'{MANIFEST_BASE}/{quote(manifest_key, safe="/")}'
+        if kind.startswith('service-'):
+            actual_id = json.loads(self.generated_manifest(output).read_text())['@id']
+            self.assertEqual(actual_id, generated_manifest_id)
+        if value is None:
+            value = f'{MANIFEST_BASE}/{manifest_key}'
+        manifest_path = self.mutate_manifest(output, kind, value)
+        if kind.startswith('service-'):
+            self._assert_service_mutation(manifest_path, generated_manifest_id, value)
+        return config, output, manifest_path
+
+    def _assert_service_mutation(self, manifest_path, expected_manifest_id, value):
+        payload = json.loads(manifest_path.read_text(encoding='utf-8'))
+        service = payload['sequences'][0]['canvases'][0]['images'][0]['resource']['service']
+        self.assertEqual(payload['@id'], expected_manifest_id)
+        self.assertEqual(service['@id'], value)
+
+    def _planned_manifest_key(self, config):
+        report = run_check(config)
+        entry = next(entry for entry in report.upload_plan if entry.role == 'manifest')
+        return entry.key
+
+    def _generated_manifest_case(self, name, *, s3_prefix=None):
+        config = self.package(name)
+        if s3_prefix is not None:
+            self._update_config(config, s3_prefix=s3_prefix)
+        output = self.root / f'{name}-generated'
+        generated = self.generate(config, output, f'{name}-generate')
+        self.assertEqual(generated['exit'], 0, generated['stdout'] + generated['stderr'])
+        manifest_path = self.generated_manifest(output)
+        payload = json.loads(manifest_path.read_text(encoding='utf-8'))
+        return config, output, manifest_path, payload
+
+    def _write_manifest(self, path, payload):
+        path.write_text(json.dumps(payload), encoding='utf-8')
+
+    def _set_manifest_container(self, payload, container, value):
+        if container == 'sequences':
+            payload['sequences'] = value
+            return
+        sequence = payload['sequences'][0]
+        if container == 'canvases':
+            sequence['canvases'] = value
+            return
+        sequence['canvases'][0]['images'] = value
 
     def _generate_service_image(self, report, output, config):
         from workbench_lite.generate import generate_service_jpgs
