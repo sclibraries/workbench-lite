@@ -131,6 +131,8 @@ class ManifestPublicUrlTests(unittest.TestCase):
             ('http://LOCALHOST:8080/', 'http://localhost:8080'),
             ('http://127.0.0.1:8080/iiif/2/', 'http://127.0.0.1:8080/iiif/2'),
             ('HTTP://[::1]:8080/manifests///', 'http://[::1]:8080/manifests'),
+            ('https://192.0.2.10/iiif', 'https://192.0.2.10/iiif'),
+            ('https://[2001:db8::1]/iiif', 'https://[2001:db8::1]/iiif'),
         ]
         with (
             patch('socket.getaddrinfo', side_effect=AssertionError('unexpected DNS lookup')),
@@ -170,6 +172,9 @@ class ManifestPublicUrlTests(unittest.TestCase):
             'https://example.org/%GG',
             'https://exämple.org/archive',
             'https://bad_host.example/archive',
+            'http://127.0.0.2/x',
+            'http://[2001:db8::1]/x',
+            'http://0.0.0.0/x',
         ]
         for value in refused:
             with self.subTest(value=value):
@@ -419,6 +424,21 @@ class ManifestPublicUrlTests(unittest.TestCase):
         self.assertEqual(generated['exit'], 0, generated['stdout'] + generated['stderr'])
         self.assertFalse(list(output.rglob('manifests/*.json')))
 
+    def test_generate_manifests_requires_both_bases_from_config_or_flags(self):
+        cases = [
+            ('missing-image-base', MANIFEST_BASE, None),
+            ('missing-manifest-base', None, IMAGE_BASE),
+        ]
+        for name, manifest_base, image_base in cases:
+            with self.subTest(name=name):
+                config = self.package(name, manifest_base=manifest_base, image_base=image_base)
+                output = self.root / f'{name}-generated'
+
+                result = self.generate(config, output, name)
+
+                self.assertEqual(result['exit'], 3)
+                self.assertFalse(output.exists())
+
     def test_push_execute_refuses_each_invalid_manifest_or_service_id_before_writes(self):
         invalid_ids = [
             ('manifest-relative', 'relative/manifest.json'),
@@ -432,10 +452,11 @@ class ManifestPublicUrlTests(unittest.TestCase):
                 output = self.root / f'execute-{kind}-generated'
                 generated = self.generate(config, output, f'generate-{kind}')
                 self.assertEqual(generated['exit'], 0, generated['stdout'] + generated['stderr'])
-                self.mutate_manifest(output, kind, value)
+                manifest_path = self.mutate_manifest(output, kind, value)
                 storage = Storage()
                 result = self.push(config, output, f'execute-{kind}', '--execute', client=storage)
 
+                self.assert_manifest_id_error(result, output, manifest_path)
                 self.assertEqual(result['exit'], 3)
                 self.assertEqual(storage.claim_calls, [])
                 self.assertEqual(storage.calls, [])
@@ -445,7 +466,7 @@ class ManifestPublicUrlTests(unittest.TestCase):
         output = self.root / 'legacy-generated'
         generated = self.generate(config, output, 'generate-legacy')
         self.assertEqual(generated['exit'], 0, generated['stdout'] + generated['stderr'])
-        self.mutate_manifest(
+        manifest_path = self.mutate_manifest(
             output, 'manifest-relative', 'workbench-lite/package/manifests/package.json'
         )
         (output / '.workbench-run.json').unlink()
@@ -453,6 +474,7 @@ class ManifestPublicUrlTests(unittest.TestCase):
 
         result = self.push(config, output, 'legacy-push', '--execute', client=storage)
 
+        self.assert_manifest_id_error(result, output, manifest_path)
         self.assertEqual(result['exit'], 3)
         self.assertEqual(storage.claim_calls, [])
         self.assertEqual(storage.calls, [])
@@ -471,6 +493,7 @@ class ManifestPublicUrlTests(unittest.TestCase):
 
         result = self.push(config, output, 'stale-push', '--execute', client=storage)
 
+        self.assert_manifest_id_error(result, output, stale_manifest)
         self.assertEqual(result['exit'], 3)
         self.assertEqual(storage.claim_calls, [])
         self.assertEqual(storage.calls, [])
@@ -513,6 +536,7 @@ class ManifestPublicUrlTests(unittest.TestCase):
         )
         inspection = self.invoke(['inspect-run', run_path, '--format', 'json'])
 
+        self.assert_manifest_id_error(result, output, manifest_path)
         self.assertEqual(result['exit'], 3, result['stdout'] + result['stderr'])
         self.assertEqual(result['factory'].call_count, 0)
         self.assertEqual(storage.claim_calls, [])
@@ -538,7 +562,7 @@ class ManifestPublicUrlTests(unittest.TestCase):
                     self.assertEqual(
                         generated['exit'], 0, generated['stdout'] + generated['stderr']
                     )
-                    self.mutate_manifest(output, kind, value)
+                    manifest_path = self.mutate_manifest(output, kind, value)
                     storage = Storage()
                     mode = '--dry-run'
                     arguments = ['push', *self.common(config, name), mode]
@@ -549,11 +573,48 @@ class ManifestPublicUrlTests(unittest.TestCase):
                     )
                     result = self.invoke(arguments, client=storage)
 
+                    self.assert_manifest_id_error(result, output, manifest_path)
                     self.assertEqual(result['exit'], 3)
                     self.assertEqual(storage.calls, [])
                     self.assertEqual(storage.claim_calls, [])
                     if offline:
                         self.assertEqual(result['factory'].call_count, 0)
+
+    def test_push_rejects_manifest_and_service_ids_that_do_not_match_joined_keys(self):
+        cases = [
+            ('wrong-manifest-key', None, 'manifest', 'https://manifests.example.org/other.json'),
+            ('unencoded-manifest-key', 'demo/literal%2F', 'manifest', None),
+            (
+                'multi-segment-service-id',
+                None,
+                'service',
+                'https://images.example.org/iiif/2/a/b',
+            ),
+        ]
+        for name, prefix, kind, value in cases:
+            with self.subTest(name=name):
+                config = self.package(name)
+                if prefix is not None:
+                    self._update_config(config, s3_prefix=prefix)
+                output = self.root / f'{name}-generated'
+                generated = self.generate(config, output, f'{name}-generate')
+                self.assertEqual(generated['exit'], 0, generated['stdout'] + generated['stderr'])
+
+                if value is None:
+                    report = run_check(config)
+                    manifest_entry = next(
+                        entry for entry in report.upload_plan if entry.role == 'manifest'
+                    )
+                    value = f'{MANIFEST_BASE}/{manifest_entry.key}'
+                manifest_path = self.mutate_manifest(output, kind, value)
+                storage = Storage()
+
+                result = self.push(config, output, name, '--execute', client=storage)
+
+                self.assert_manifest_id_error(result, output, manifest_path)
+                self.assertEqual(result['exit'], 3)
+                self.assertEqual(storage.claim_calls, [])
+                self.assertEqual(storage.calls, [])
 
     def test_dry_run_without_generated_files_remains_planning_only(self):
         config = self.package(
@@ -738,6 +799,17 @@ class ManifestPublicUrlTests(unittest.TestCase):
 
         input_dir = Path(yaml.safe_load(config.read_text(encoding='utf-8'))['input_dir'])
         return generate_service_jpgs(report.upload_plan, input_dir, output)
+
+    def assert_manifest_id_error(self, result, output, manifest_path):
+        payload = result.get('payload') or {}
+        preflight = payload.get('preflight') or {}
+        local = preflight.get('local') or {}
+        errors = local.get('errors') or []
+        relative_path = manifest_path.relative_to(output).as_posix()
+        self.assertTrue(
+            any(relative_path in error and '@id' in error for error in errors),
+            errors,
+        )
 
     def _update_config(self, config, **updates):
         value = yaml.safe_load(config.read_text(encoding='utf-8'))
