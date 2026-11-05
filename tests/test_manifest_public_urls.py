@@ -159,6 +159,7 @@ class ManifestPublicUrlTests(unittest.TestCase):
             'https://example.org/archive#section',
             'https://example.org/archive?',
             'https://example.org/archive#',
+            'https://manifests.example.org/a@b',
             'https://example.org:/archive',
             'https://example.org:0/archive',
             'https://example.org:65536/archive',
@@ -193,6 +194,9 @@ class ManifestPublicUrlTests(unittest.TestCase):
     def test_manifest_and_service_keys_with_reserved_characters_are_encoded_without_key_changes(
         self,
     ):
+        self._assert_reserved_key_urls(self._build_reserved_key_manifest())
+
+    def _build_reserved_key_manifest(self):
         config = self.package('encoded')
         report = run_check(config)
         output = self.root / 'encoded-generated'
@@ -226,6 +230,10 @@ class ManifestPublicUrlTests(unittest.TestCase):
             page_dimensions=service_report.page_dimensions,
         )
         payload = json.loads(Path(generated.results[0].output_path).read_text())
+        return payload, manifest_entry, service_entry, manifest_key, service_key
+
+    def _assert_reserved_key_urls(self, case):
+        payload, manifest_entry, service_entry, manifest_key, service_key = case
         canvas = payload['sequences'][0]['canvases'][0]
         annotation = canvas['images'][0]
 
@@ -305,6 +313,15 @@ class ManifestPublicUrlTests(unittest.TestCase):
                 )
                 self.assertEqual(result['exit'], 3)
                 self.assertFalse(output.exists())
+
+    def test_generate_refuses_at_in_base_path_without_output(self):
+        config = self.package('at-in-base-path', manifest_base='https://manifests.example.org/a@b')
+        output = self.root / 'at-in-base-path-generated'
+
+        result = self.generate(config, output, 'at-in-base-path')
+
+        self.assertEqual(result['exit'], 3)
+        self.assertFalse(output.exists())
 
     def test_generate_refusal_does_not_change_an_existing_output_folder(self):
         config = self.package('existing-output')
@@ -445,6 +462,23 @@ class ManifestPublicUrlTests(unittest.TestCase):
         self.assertEqual(storage.calls, [])
 
     def test_interrupted_resume_refuses_invalid_manifest_before_reconcile_and_retains_hold(self):
+        config, output, manifest_path, run_path = self._prepare_interrupted_resume()
+        storage = Storage()
+        result = self.push(
+            config, output, 'resume', '--execute', client=storage, extra=['--resume']
+        )
+        inspection = self.invoke(['inspect-run', run_path, '--format', 'json'])
+
+        self.assert_manifest_id_error(result, output, manifest_path)
+        self.assertEqual(result['exit'], 3, result['stdout'] + result['stderr'])
+        self.assertEqual(result['factory'].call_count, 0)
+        self.assertEqual(storage.claim_calls, [])
+        self.assertEqual(storage.calls, [])
+        self.assertEqual(inspection['payload']['publication']['state'], 'held')
+        self.assertEqual(len(inspection['payload']['unknown_operations']), 1)
+        self.assertTrue(manifest_path.is_file())
+
+    def _prepare_interrupted_resume(self):
         config = self.package('resume')
         output = self.root / 'resume-generated'
         generated = self.generate(config, output, 'generate-resume')
@@ -475,21 +509,7 @@ class ManifestPublicUrlTests(unittest.TestCase):
                 for event in recorded_events
             )
         )
-        storage = Storage()
-
-        result = self.push(
-            config, output, 'resume', '--execute', client=storage, extra=['--resume']
-        )
-        inspection = self.invoke(['inspect-run', run_path, '--format', 'json'])
-
-        self.assert_manifest_id_error(result, output, manifest_path)
-        self.assertEqual(result['exit'], 3, result['stdout'] + result['stderr'])
-        self.assertEqual(result['factory'].call_count, 0)
-        self.assertEqual(storage.claim_calls, [])
-        self.assertEqual(storage.calls, [])
-        self.assertEqual(inspection['payload']['publication']['state'], 'held')
-        self.assertEqual(len(inspection['payload']['unknown_operations']), 1)
-        self.assertTrue(manifest_path.is_file())
+        return config, output, manifest_path, run_path
 
     def test_online_and_offline_dry_runs_check_each_generated_manifest_id(self):
         invalid_ids = [
@@ -577,6 +597,46 @@ class ManifestPublicUrlTests(unittest.TestCase):
                 self.assertEqual(result['exit'], 3)
                 self.assertEqual(result['factory'].call_count, 0)
 
+    def test_url_and_sequence_errors_are_reported_together(self):
+        config, output, manifest_path, payload = self._generated_manifest_case(
+            'url-and-sequences-error'
+        )
+        payload['sequences'] = None
+        payload['thumbnail'] = {
+            'service': {'@id': '/iiif/2/relative-thumbnail'},
+        }
+        self._write_manifest(manifest_path, payload)
+
+        result = self.push(
+            config, output, 'url-and-sequences-error-push', '--dry-run', extra=['--offline']
+        )
+        errors = result['payload']['preflight']['local']['errors']
+
+        self.assertEqual(result['exit'], 3)
+        self.assertTrue(any('Manifest sequences must be a list.' in error for error in errors))
+        self.assertTrue(any('image service @id' in error for error in errors))
+
+    def test_manifest_id_and_container_errors_are_reported_together(self):
+        config, output, manifest_path, payload = self._generated_manifest_case(
+            'manifest-id-and-container-error'
+        )
+        payload['@id'] = 'relative/manifest.json'
+        self._set_manifest_container(payload, 'images', 'wrong-type')
+        self._write_manifest(manifest_path, payload)
+
+        result = self.push(
+            config,
+            output,
+            'manifest-id-and-container-error-push',
+            '--dry-run',
+            extra=['--offline'],
+        )
+        errors = result['payload']['preflight']['local']['errors']
+
+        self.assertEqual(result['exit'], 3)
+        self.assertTrue(any('manifest @id' in error for error in errors))
+        self.assertTrue(any('Manifest images must be a list.' in error for error in errors))
+
     def test_wrong_manifest_containers_are_reported_without_traceback(self):
         cases = [
             ('sequences', None),
@@ -653,7 +713,7 @@ class ManifestPublicUrlTests(unittest.TestCase):
         self.assertEqual(result['exit'], 0, result['stdout'] + result['stderr'])
         self.assertEqual(result['factory'].call_count, 0)
 
-    def test_other_readiness_failures_stay_exit_one_and_mixed_errors_are_reported(self):
+    def test_other_readiness_failures_stay_exit_one(self):
         for failure in ('missing', 'unreadable', 'non-object'):
             with self.subTest(failure=failure):
                 config = self.package(f'readiness-{failure}')
@@ -687,6 +747,7 @@ class ManifestPublicUrlTests(unittest.TestCase):
                         )
                 self.assertEqual(result['exit'], 1, result['stdout'] + result['stderr'])
 
+    def test_mixed_url_and_readiness_failures_report_both_and_exit_three(self):
         config = self.package('mixed-readiness')
         output = self.root / 'mixed-readiness-generated'
         generated = self.generate(config, output, 'mixed-readiness-generate')
