@@ -587,7 +587,7 @@ class ManifestPublicUrlTests(unittest.TestCase):
             (
                 'multi-segment-service-id',
                 None,
-                'service',
+                'service-multi-segment',
                 'https://images.example.org/iiif/2/a/b',
             ),
         ]
@@ -600,6 +600,17 @@ class ManifestPublicUrlTests(unittest.TestCase):
                 generated = self.generate(config, output, f'{name}-generate')
                 self.assertEqual(generated['exit'], 0, generated['stdout'] + generated['stderr'])
 
+                if kind.startswith('service-'):
+                    report = run_check(config)
+                    manifest_entry = next(
+                        entry for entry in report.upload_plan if entry.role == 'manifest'
+                    )
+                    generated_manifest_id = f'{MANIFEST_BASE}/{quote(manifest_entry.key, safe="/")}'
+                    self.assertEqual(
+                        json.loads(self.generated_manifest(output).read_text())['@id'],
+                        generated_manifest_id,
+                    )
+
                 if value is None:
                     report = run_check(config)
                     manifest_entry = next(
@@ -607,6 +618,13 @@ class ManifestPublicUrlTests(unittest.TestCase):
                     )
                     value = f'{MANIFEST_BASE}/{manifest_entry.key}'
                 manifest_path = self.mutate_manifest(output, kind, value)
+                if kind.startswith('service-'):
+                    changed_payload = json.loads(manifest_path.read_text(encoding='utf-8'))
+                    changed_service = changed_payload['sequences'][0]['canvases'][0]['images'][0][
+                        'resource'
+                    ]['service']
+                    self.assertEqual(changed_payload['@id'], generated_manifest_id)
+                    self.assertEqual(changed_service['@id'], value)
                 storage = Storage()
 
                 result = self.push(config, output, name, '--execute', client=storage)
