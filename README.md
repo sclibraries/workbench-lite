@@ -67,7 +67,7 @@ credentials in the YAML file.
 
 For `generate --manifests`, both URL bases must be absolute HTTPS URLs, or HTTP URLs
 whose host is exactly `localhost`, `127.0.0.1` or `[::1]`. Bases cannot contain
-userinfo, queries or fragments (including empty query or fragment delimiters),
+`@` anywhere, userinfo, queries or fragments (including empty query or fragment delimiters),
 whitespace, control characters or backslashes. Hosts must be ASCII DNS names or IP
 literals (IPv6 literals use brackets); ports, when present, must be from 1 through
 65535. Paths cannot contain malformed percent escapes. A path prefix is kept and

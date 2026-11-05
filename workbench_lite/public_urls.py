@@ -30,6 +30,8 @@ def _validate_url_characters(value: str) -> None:
         raise ValueError('URL must be a non-empty absolute URL.')
     if any(character.isspace() or unicodedata.category(character) == 'Cc' for character in value):
         raise ValueError('URL cannot contain whitespace or control characters.')
+    if '@' in value:
+        raise ValueError('URL cannot contain @ characters.')
     if '\\' in value or '?' in value or '#' in value:
         raise ValueError('URL cannot contain backslashes, queries, or fragments.')
 
