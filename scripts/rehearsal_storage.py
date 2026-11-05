@@ -153,6 +153,8 @@ def make_config(source_root, directory, bucket_private, bucket_public, prefix):
     value['s3_private_bucket'] = bucket_private
     value['s3_public_bucket'] = bucket_public
     value['s3_prefix'] = prefix
+    value['manifest_base_url'] = 'http://localhost:8080/manifests'
+    value['cantaloupe_base_url'] = 'http://localhost:8080/iiif/2'
     target = directory / 'config.yml'
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text(yaml.safe_dump(value, sort_keys=False), encoding='utf-8')

@@ -739,6 +739,8 @@ def make_synthetic_package(root, *, pages=2, batch_id='package', prefix='run'):
     config.write_text(
         f'input_dir: {root}\ninput_csv: input.csv\n'
         f'batch_id: {batch_id}\ns3_prefix: {prefix}\n'
+        'manifest_base_url: http://localhost:8080/manifests\n'
+        'cantaloupe_base_url: http://localhost:8080/iiif/2\n'
         f's3_private_bucket: {TEST_PRIVATE_BUCKET}\n'
         f's3_public_bucket: {TEST_PUBLIC_BUCKET}\n',
         encoding='utf-8',

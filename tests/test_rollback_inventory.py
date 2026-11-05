@@ -200,9 +200,9 @@ class RollbackInventoryTests(unittest.TestCase):
     def test_manifest_url_uses_generate_flag_when_yaml_has_no_base(self):
         from test_outcomes import Storage, package
 
-        config = package(self.root)
+        config = package(self.root, include_public_bases=False)
         output = self.root / 'generated'
-        base_url = 'https://digital.example.edu/manifests'
+        base_url = 'https://manifests.example.org/archive'
         common = ['--config', str(config), '--run-dir', str(self.root / 'runs')]
         with contextlib.redirect_stdout(io.StringIO()):
             self.assertEqual(
@@ -216,6 +216,8 @@ class RollbackInventoryTests(unittest.TestCase):
                         '--thumbnails',
                         '--manifest-base-url',
                         base_url,
+                        '--cantaloupe-base-url',
+                        'https://images.example.org/iiif/2',
                     ]
                 ),
                 0,

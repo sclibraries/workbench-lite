@@ -95,8 +95,14 @@ class Storage:
         self.written[key] = Path(source).read_bytes()
 
 
-def package(root):
-    (root / 'sample.yml').write_text('input_dir: .\ninput_csv: input.csv\n')
+def package(root, *, include_public_bases=True):
+    public_bases = (
+        'manifest_base_url: https://manifests.example.org\n'
+        'cantaloupe_base_url: https://images.example.org/iiif/2\n'
+        if include_public_bases
+        else ''
+    )
+    (root / 'sample.yml').write_text('input_dir: .\ninput_csv: input.csv\n' + public_bases)
     (root / 'input.csv').write_text(
         'title,id,field_model,parent_id,field_weight,file\n'
         'Parent,parent,Paged Content,,,parent.pdf\n'
@@ -311,6 +317,8 @@ class OutcomesTest(unittest.TestCase):
             report.objects,
             report.upload_plan,
             generated,
+            cantaloupe_base_url='https://images.example.org/iiif/2',
+            manifest_base_url='https://manifests.example.org',
             page_dimensions=service_report.page_dimensions,
         )
         args = [
@@ -398,6 +406,8 @@ class OutcomesTest(unittest.TestCase):
             plan.objects,
             plan.upload_plan,
             generated,
+            cantaloupe_base_url='https://images.example.org/iiif/2',
+            manifest_base_url='https://manifests.example.org',
             page_dimensions=service_report.page_dimensions,
         )
         out = io.StringIO()

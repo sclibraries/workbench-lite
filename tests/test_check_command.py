@@ -56,7 +56,11 @@ class CheckCommandTest(unittest.TestCase):
         config_path = package_dir / 'sample.yml'
         csv_path = package_dir / 'input.csv'
         config_path.write_text(
-            'input_dir: files\ninput_csv: input.csv\nadditional_files:\n  - hocr: 3507\n',
+            'input_dir: files\n'
+            'input_csv: input.csv\n'
+            'manifest_base_url: https://manifests.example.org\n'
+            'cantaloupe_base_url: https://images.example.org/iiif/2\n'
+            'additional_files:\n  - hocr: 3507\n',
             encoding='utf-8',
         )
         csv_path.write_text(

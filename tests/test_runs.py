@@ -274,7 +274,7 @@ class RunTests(unittest.TestCase):
         from test_outcomes import package
         from workbench_lite.config import load_config
 
-        config = package(self.root)
+        config = package(self.root, include_public_bases=False)
         with config.open('a') as f:
             f.write(
                 'password: SECRET_CONFIG\nmanifest_base_url: https://user:SECRET_URL@host/path?token=SECRET_QUERY\n'

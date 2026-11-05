@@ -1,4 +1,6 @@
 input_dir: .
 input_csv: synthetic_package.csv
+manifest_base_url: https://manifests.example.org
+cantaloupe_base_url: https://images.example.org/iiif/2
 additional_files:
   - hocr: 3507

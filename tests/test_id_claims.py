@@ -343,6 +343,8 @@ class InterleavedIdClaimTests(unittest.TestCase):
         config.write_text(
             f'input_dir: .\ninput_csv: input.csv\nbatch_id: {batch_id}\n'
             f'{prefix_setting}s3_private_bucket: {private_bucket}\n'
+            'manifest_base_url: https://manifests.example.org\n'
+            'cantaloupe_base_url: https://images.example.org/iiif/2\n'
             f's3_public_bucket: {public_bucket}\n',
             encoding='utf-8',
         )
