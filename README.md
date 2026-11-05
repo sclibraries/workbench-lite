@@ -67,9 +67,13 @@ credentials in the YAML file.
 
 For `generate --manifests`, both URL bases must be absolute HTTPS URLs, or HTTP URLs
 whose host is exactly `localhost`, `127.0.0.1` or `[::1]`. Bases cannot contain
-userinfo, queries, fragments, whitespace, control characters or backslashes. A path
-prefix is kept and trailing slashes are removed. `check` and `generate` without
-`--manifests` do not require either setting.
+userinfo, queries or fragments (including empty query or fragment delimiters),
+whitespace, control characters or backslashes. Hosts must be ASCII DNS names or IP
+literals (IPv6 literals use brackets); ports, when present, must be from 1 through
+65535. Paths cannot contain malformed percent escapes. A path prefix is kept and
+trailing slashes are removed; scheme and hostname are normalized to lowercase. DNS
+names cannot have a trailing dot. Validation makes no DNS or HTTP requests.
+`check` and `generate` without `--manifests` do not require either setting.
 
 ## S3 layout and ID reservations
 

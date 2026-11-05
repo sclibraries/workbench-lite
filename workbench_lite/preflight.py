@@ -15,6 +15,10 @@ from .public_urls import image_service_url_base, manifest_url_base
 PUBLIC_URL_ERROR_MARKER = 'Public URL validation failed:'
 
 
+class PublicUrlFailure(str):
+    """A public URL diagnostic that retains its type through readiness checks."""
+
+
 @dataclass
 class _OutputReadiness:
     input_dir: Path
@@ -92,48 +96,89 @@ def _validate_text_content(path):
 
 
 def _validate_json_content(path):
-    value = json.loads(path.read_text(encoding='utf-8'))
-    if not isinstance(value, dict):
-        return 'Expected a JSON object.'
-    return None
+    _, error = _read_json_object(path)
+    return error
 
 
 def _validate_manifest_content(path, planned_key):
-    manifest = json.loads(path.read_text(encoding='utf-8'))
-    if not isinstance(manifest, dict):
-        return 'Expected a JSON object.'
+    manifest, error = _read_json_object(path)
+    if error:
+        return error
     if planned_key is None:
         return None
     try:
         manifest_url_base(manifest.get('@id'), planned_key)
     except ValueError:
-        return f'{PUBLIC_URL_ERROR_MARKER} manifest @id does not join its planned key.'
+        return PublicUrlFailure(
+            f'{PUBLIC_URL_ERROR_MARKER} manifest @id does not join its planned key.'
+        )
+    error = _manifest_container_error(manifest)
+    if error:
+        return error
     for service_id in _image_service_ids(manifest):
         try:
             image_service_url_base(service_id)
         except ValueError:
-            return f'{PUBLIC_URL_ERROR_MARKER} image service @id is not one encoded key segment.'
+            return PublicUrlFailure(
+                f'{PUBLIC_URL_ERROR_MARKER} image service @id is not one encoded key segment.'
+            )
+    return None
+
+
+def _read_json_object(path):
+    value = json.loads(path.read_text(encoding='utf-8'))
+    if not isinstance(value, dict):
+        return None, 'Expected a JSON object.'
+    return value, None
+
+
+def _manifest_container_error(manifest):
+    sequences = manifest.get('sequences', [])
+    if not isinstance(sequences, list):
+        return 'Manifest sequences must be a list.'
+    for sequence in sequences:
+        if not isinstance(sequence, dict):
+            return 'Manifest sequences must contain objects.'
+        canvases = sequence.get('canvases', [])
+        if not isinstance(canvases, list):
+            return 'Manifest canvases must be a list.'
+        for canvas in canvases:
+            if not isinstance(canvas, dict):
+                return 'Manifest canvases must contain objects.'
+            if not isinstance(canvas.get('images', []), list):
+                return 'Manifest images must be a list.'
     return None
 
 
 def _image_service_ids(manifest):
+    yield from _service_ids(manifest.get('thumbnail'))
     for sequence in manifest.get('sequences', []):
         if not isinstance(sequence, dict):
             continue
         for canvas in sequence.get('canvases', []):
             if not isinstance(canvas, dict):
                 continue
+            yield from _service_ids(canvas.get('thumbnail'))
             for annotation in canvas.get('images', []):
                 if not isinstance(annotation, dict):
                     continue
-                resource = annotation.get('resource')
-                service = resource.get('service') if isinstance(resource, dict) else None
-                if isinstance(service, dict):
-                    yield service.get('@id')
+                yield from _service_ids(annotation.get('resource'))
+
+
+def _service_ids(container):
+    items = container if isinstance(container, list) else [container]
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        services = item.get('service')
+        services = services if isinstance(services, list) else [services]
+        for service in services:
+            if isinstance(service, dict):
+                yield service.get('@id')
 
 
 def is_public_url_failure(errors):
-    return any(PUBLIC_URL_ERROR_MARKER in error for error in errors)
+    return any(isinstance(error, PublicUrlFailure) for error in errors)
 
 
 def _validate_readable_content(path):
@@ -247,7 +292,11 @@ def _check_existing_generated_entry(entry, target, errors, missing):
         return
     error = validate_content(target, entry.role, planned_key=entry.key)
     if error:
-        errors.append(f'{entry.object_id}/{entry.page_id}: {entry.key}: {error}')
+        diagnostic = f'{entry.object_id}/{entry.page_id}: {entry.key}: {error}'
+        if isinstance(error, PublicUrlFailure):
+            errors.append(PublicUrlFailure(diagnostic))
+        else:
+            errors.append(diagnostic)
 
 
 def _check_output_capacity(root, required_bytes, errors):

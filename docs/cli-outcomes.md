@@ -32,8 +32,7 @@ no storage call.
 `generate --manifests` requires valid `manifest_base_url` and `cantaloupe_base_url` settings
 from YAML or their flags. A YAML value takes precedence, including an empty value; a flag
 supplies a missing setting. Both bases are checked before anything in the generated directory
-is changed. They must be absolute HTTPS URLs or HTTP URLs for exactly `localhost`, `127.0.0.1`
-or `[::1]`, with no userinfo, query, fragment, whitespace, control character or backslash.
+is changed, and both must satisfy the public URL rule in [README Configuration](../README.md#configuration).
 `check` and `generate` without `--manifests` do not need either setting.
 
 Before local readiness completes, push validates every planned manifest's `@id` against its

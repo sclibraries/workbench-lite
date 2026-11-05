@@ -37,6 +37,8 @@ def _validate_url_characters(value: str) -> None:
 def _parse_public_url(value: str):
     try:
         parsed = urlsplit(value)
+        if not parsed.netloc.isascii():
+            raise ValueError('URL authority must be ASCII.')
         hostname = parsed.hostname
         port = parsed.port
     except ValueError as exc:
@@ -108,9 +110,10 @@ def image_service_url_base(value: str) -> str:
     if not isinstance(value, str) or '/' not in value:
         raise ValueError('Image service @id must have an encoded path segment.')
     base, encoded_key = value.rsplit('/', 1)
-    if not base or base.endswith('/') or '%2F' not in encoded_key.upper():
+    if not base or base.endswith('/'):
         raise ValueError('Image service @id must encode its image key in one segment.')
-    if quote(unquote(encoded_key), safe='') != encoded_key:
+    decoded_key = unquote(encoded_key)
+    if '/' not in decoded_key or quote(decoded_key, safe='') != encoded_key:
         raise ValueError('Image service @id has a non-canonical encoded path segment.')
     normalize_public_base_url(base)
     return base
