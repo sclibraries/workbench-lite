@@ -124,6 +124,8 @@ class ClaimVerificationMismatchClient(FileS3Client):
                 ).decode('ascii')
             elif self.field == 'ContentLength':
                 result[self.field] += 1
+            elif self.field == 'ChecksumTypeMissing':
+                result.pop('ChecksumType')
             else:
                 result[self.field] = 'COMPOSITE'
         return result
@@ -857,6 +859,7 @@ class InterleavedIdClaimTests(unittest.TestCase):
             'ChecksumSHA256',
             'ContentLength',
             'ChecksumType',
+            'ChecksumTypeMissing',
         )
         for field in cases:
             with self.subTest(field=field):

@@ -6,7 +6,7 @@ import tempfile
 from types import SimpleNamespace
 import unittest
 from botocore.exceptions import ClientError
-from workbench_lite.s3_client import Boto3S3Client
+from workbench_lite.s3_client import Boto3S3Client, VerificationResult
 
 
 class ConditionalStore:
@@ -115,20 +115,30 @@ class S3PublicationTests(unittest.TestCase):
         }
         client = Boto3S3Client(store)
         self.assertTrue(client.verify_file('bucket', 'key', checksum, 12))
+        self.assertIsNone(VerificationResult(False, None, None, 'missing').checksum_type)
         store.head_object.assert_called_once_with(
             Bucket='bucket', Key='key', ChecksumMode='ENABLED'
         )
         store.get_object.assert_not_called()
-        for changes in [
-            {'ChecksumSHA256': None},
-            {'ChecksumSHA256': 'bad base64'},
-            {'ContentLength': 11},
-            {'ChecksumType': 'COMPOSITE'},
-        ]:
-            with self.subTest(changes=changes):
+        cases = [
+            ({'ChecksumSHA256': None}, False),
+            ({'ChecksumSHA256': 'bad base64'}, False),
+            ({'ContentLength': 11}, False),
+            ({'ChecksumType': 'COMPOSITE'}, False),
+            ({}, True),
+        ]
+        for changes, missing_type in cases:
+            with self.subTest(changes=changes, missing_type=missing_type):
                 saved = dict(store.head_object.return_value)
-                store.head_object.return_value.update(changes)
-                self.assertFalse(client.verify_file('bucket', 'key', checksum, 12))
+                if missing_type:
+                    store.head_object.return_value.pop('ChecksumType')
+                else:
+                    store.head_object.return_value.update(changes)
+                result = client.verify_file('bucket', 'key', checksum, 12)
+                self.assertFalse(result)
+                if missing_type:
+                    self.assertIsNone(result.evidence()['checksum_type'])
+                    self.assertIsNone(client.inspect_object('bucket', 'key').checksum_type)
                 store.head_object.return_value = saved
         store.get_object.assert_not_called()
 
@@ -140,15 +150,22 @@ class S3PublicationTests(unittest.TestCase):
         store.head_object.return_value = {
             'ChecksumSHA256': base64.b64encode(hashlib.sha256(value).digest()).decode(),
             'ContentLength': len(value),
+            'ChecksumType': 'FULL_OBJECT',
         }
         body = io.BytesIO(b'changed!')
         store.get_object.return_value = {'Body': body}
-        self.assertFalse(
-            Boto3S3Client(store, full_readback=True).verify_file(
-                'bucket', 'key', hashlib.sha256(value).hexdigest(), len(value)
-            )
-        )
+        client = Boto3S3Client(store, full_readback=True)
+        checksum = hashlib.sha256(value).hexdigest()
+        self.assertFalse(client.verify_file('bucket', 'key', checksum, len(value)))
         self.assertTrue(body.closed)
+
+        store.head_object.return_value.pop('ChecksumType')
+        store.get_object.reset_mock()
+        store.get_object.return_value = {'Body': io.BytesIO(value)}
+        result = client.verify_file('bucket', 'key', checksum, len(value))
+        self.assertFalse(result)
+        self.assertIsNone(result.evidence()['checksum_type'])
+        store.get_object.assert_not_called()
 
     def test_checksum_head_access_denial_does_not_fall_back_to_download(self):
         from unittest.mock import Mock

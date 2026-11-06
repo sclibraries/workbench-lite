@@ -654,6 +654,34 @@ class PublicationTests(unittest.TestCase):
         )
         self.assertIn('previously_published (unchanged)', (self.run / 'summary.txt').read_text())
 
+        entry = next(entry for entry in self.plan if entry.role == 'pdf')
+        original_verify = store.verify_file
+
+        def verify_missing_type(bucket, key, checksum, size_bytes):
+            result = original_verify(bucket, key, checksum, size_bytes)
+            if key != entry.key:
+                return result
+            from workbench_lite.s3_client import VerificationResult
+
+            return VerificationResult(
+                result.matches, result.checksum, result.size_bytes, result.method, None
+            )
+
+        store.verify_file = verify_missing_type
+        previous_calls = list(store.calls)
+        self.regenerate()
+        code, report = self.execute_json(store)
+
+        self.assertEqual(code, 1)
+        self.assertEqual(store.calls, previous_calls)
+        missing_type_row = next(row for row in report['results'] if row['key'] == entry.key)
+        self.assertNotEqual(missing_type_row['status'], 'unchanged')
+        self.assertIsNone(missing_type_row['previous_checksum'])
+        self.assertIsNone(missing_type_row['previous_checksum_type'])
+        publication = inspect_run(self.run)['publication']
+        self.assertEqual(publication['state'], 'held')
+        self.assertNotIn('receipt', publication)
+
     def test_inspection_rejects_mismatched_checksum_for_reused_key(self):
         store = Storage()
         self.assertEqual(self.execute(store), 0)

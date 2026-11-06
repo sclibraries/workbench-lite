@@ -1,5 +1,6 @@
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -654,8 +655,6 @@ class CheckCommandTest(unittest.TestCase):
 
             fake_module_dir = Path(temp_dir) / 'fake_boto3'
             fake_module_dir.mkdir()
-            upload_log = Path(temp_dir) / 'uploads.jsonl'
-            head_log = Path(temp_dir) / 'heads.jsonl'
             (fake_module_dir / 'boto3.py').write_text(
                 r"""import io, json, os, hashlib, base64
 from types import SimpleNamespace
@@ -675,18 +674,20 @@ class FakeClient:
     def head_bucket(self, **kwargs): return {}
     def list_objects_v2(self, **kwargs): return {'KeyCount': 0}
     def head_object(self, Bucket, Key, **kwargs):
+        stage = 'claim' if Key.startswith('workbench-lite/_ids/') else 'content'
         with open(os.environ['FAKE_BOTO3_HEAD_LOG'], 'a') as handle:
-            stage = 'claim' if Key.startswith('workbench-lite/_ids/') else 'content'
             handle.write(json.dumps({'key': Key, 'stage': stage}) + '\n')
         if (Bucket, Key) not in self.written:
             raise ClientError({'Error': {'Code': '404'}}, 'HeadObject')
         value = self.written[Bucket, Key]
         checksum = base64.b64encode(hashlib.sha256(value).digest()).decode()
-        return {
+        response = {
             'ContentLength': len(value),
             'ChecksumSHA256': checksum,
-            'ChecksumType': 'FULL_OBJECT',
         }
+        if stage == 'claim' or not os.environ.get('FAKE_BOTO3_MISSING_CONTENT_TYPE'):
+            response['ChecksumType'] = 'FULL_OBJECT'
+        return response
     def get_object(self, Bucket, Key): return {'Body': io.BytesIO(self.written[Bucket, Key])}
     def put_object(self, Bucket, Key, Body, IfNoneMatch, ChecksumAlgorithm, ChecksumSHA256):
         assert IfNoneMatch == '*'
@@ -701,60 +702,111 @@ class FakeClient:
                 encoding='utf-8',
             )
 
-            env = os.environ.copy()
-            env['PYTHONPATH'] = (
-                f'{PACKAGE_ROOT}{os.pathsep}{PACKAGE_ROOT / "tests"}{os.pathsep}{fake_module_dir}'
-            )
-            env['FAKE_BOTO3_UPLOAD_LOG'] = str(upload_log)
-            env['FAKE_BOTO3_HEAD_LOG'] = str(head_log)
+            for mode, missing_type in (('full-object', False), ('missing-type', True)):
+                with self.subTest(mode=mode):
+                    self._assert_fake_boto3_push_mode(
+                        temp_dir,
+                        config_path,
+                        csv_path,
+                        generated_dir,
+                        fake_module_dir,
+                        mode,
+                        missing_type,
+                    )
 
-            result = subprocess.run(
-                [
-                    sys.executable,
-                    '-m',
-                    'cli_test_runner',
-                    'push',
-                    '--config',
-                    str(config_path),
-                    '--input-csv',
-                    str(csv_path),
-                    '--execute',
-                    '--generated-dir',
-                    str(generated_dir),
-                    '--endpoint-url',
-                    'http://localhost:4566',
-                    '--region',
-                    'us-east-1',
-                    '--format',
-                    'json',
-                ],
-                cwd=PROJECT_ROOT,
-                env=env,
-                text=True,
-                capture_output=True,
-                check=False,
-            )
+    def _assert_fake_boto3_push_mode(
+        self, temp_dir, config_path, csv_path, generated_dir, fake_module_dir, mode, missing_type
+    ):
+        mode_generated_dir = Path(temp_dir) / f'{mode}-generated'
+        shutil.copytree(generated_dir, mode_generated_dir)
+        upload_log = Path(temp_dir) / f'{mode}-uploads.jsonl'
+        head_log = Path(temp_dir) / f'{mode}-heads.jsonl'
+        env = os.environ.copy()
+        env['PYTHONPATH'] = (
+            f'{PACKAGE_ROOT}{os.pathsep}{PACKAGE_ROOT / "tests"}{os.pathsep}{fake_module_dir}'
+        )
+        env['FAKE_BOTO3_UPLOAD_LOG'] = str(upload_log)
+        env['FAKE_BOTO3_HEAD_LOG'] = str(head_log)
+        if missing_type:
+            env['FAKE_BOTO3_MISSING_CONTENT_TYPE'] = '1'
+        else:
+            env.pop('FAKE_BOTO3_MISSING_CONTENT_TYPE', None)
 
-            self.assertEqual(result.returncode, 0, result.stderr)
-            payload = json.loads(result.stdout)
-            upload_rows = [
-                json.loads(line) for line in upload_log.read_text(encoding='utf-8').splitlines()
-            ]
-            head_rows = [
-                json.loads(line) for line in head_log.read_text(encoding='utf-8').splitlines()
-            ]
-
+        result = subprocess.run(
+            [
+                sys.executable,
+                '-m',
+                'cli_test_runner',
+                'push',
+                '--config',
+                str(config_path),
+                '--input-csv',
+                str(csv_path),
+                '--execute',
+                '--generated-dir',
+                str(mode_generated_dir),
+                '--run-dir',
+                str(Path(temp_dir) / f'{mode}-runs'),
+                '--endpoint-url',
+                'http://localhost:4566',
+                '--region',
+                'us-east-1',
+                '--format',
+                'json',
+            ],
+            cwd=PROJECT_ROOT,
+            env=env,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 1 if missing_type else 0, result.stderr)
+        self.assertTrue(upload_log.exists(), result.stdout + result.stderr)
+        payload = json.loads(result.stdout)
+        upload_rows = [
+            json.loads(line) for line in upload_log.read_text(encoding='utf-8').splitlines()
+        ]
+        head_rows = [json.loads(line) for line in head_log.read_text(encoding='utf-8').splitlines()]
         content_upload_rows = [row for row in upload_rows if row['stage'] == 'content']
         content_head_rows = [row for row in head_rows if row['stage'] == 'content']
+
         self.assertEqual(payload['planned_count'], 7)
-        self.assertEqual(payload['uploaded_count'], 7)
         self.assertEqual(payload['missing_generated_count'], 0)
-        self.assertEqual(len(content_upload_rows), 7)
-        self.assertIn(
-            'workbench-lite/sample/manifests/parent.json',
-            [row['key'] for row in content_upload_rows],
-        )
         self.assertTrue(content_head_rows)
+        if missing_type:
+            self._assert_missing_content_type_holds(payload, content_upload_rows)
+        else:
+            self.assertEqual(payload['uploaded_count'], 7)
+            self.assertEqual(len(content_upload_rows), 7)
+            self.assertIn(
+                'workbench-lite/sample/manifests/parent.json',
+                [row['key'] for row in content_upload_rows],
+            )
+
+    def _assert_missing_content_type_holds(self, payload, content_upload_rows):
+        self.assertEqual(payload['uploaded_count'], 1)
+        self.assertEqual(payload['unattempted_count'], 6)
+        self.assertIn('Upload verification failed', ' '.join(payload['errors']))
+        self.assertEqual(len(content_upload_rows), 1)
+        events = [
+            json.loads(line)
+            for line in (Path(payload['run_path']) / 'events.jsonl')
+            .read_text(encoding='utf-8')
+            .splitlines()
+        ]
+        verification_events = [
+            event
+            for event in events
+            if event.get('kind') == 'result' and event.get('stage') == 'verify-upload'
+        ]
+        self.assertEqual(len(verification_events), 1)
+        self.assertEqual(verification_events[0]['status'], 'failed')
+        self.assertIsNone(verification_events[0]['checksum_type'])
+        from workbench_lite.runs import inspect_run
+
+        publication = inspect_run(payload['run_path'])['publication']
+        self.assertEqual(publication['state'], 'held')
+        self.assertNotIn('receipt', publication)
 
     def test_push_uploads_existing_source_entries_with_s3_client(self):
         from workbench_lite.check import run_check

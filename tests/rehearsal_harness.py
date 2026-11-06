@@ -555,7 +555,7 @@ class FileS3Client:
         return ObjectIdentity(
             checksum,
             metadata.get('ContentLength'),
-            metadata.get('ChecksumType', 'FULL_OBJECT'),
+            metadata.get('ChecksumType'),
             metadata.get('ETag'),
         )
 

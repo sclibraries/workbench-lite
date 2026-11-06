@@ -14,7 +14,7 @@ class VerificationResult:
     checksum: Optional[str]
     size_bytes: Optional[int]
     method: str
-    checksum_type: str = 'FULL_OBJECT'
+    checksum_type: Optional[str] = None
 
     def __bool__(self):
         return self.matches
@@ -85,7 +85,7 @@ class Boto3S3Client:
         return ObjectIdentity(
             checksum=checksum,
             size_bytes=metadata.get('ContentLength'),
-            checksum_type=metadata.get('ChecksumType', 'FULL_OBJECT'),
+            checksum_type=metadata.get('ChecksumType'),
             etag=metadata.get('ETag'),
         )
 
@@ -121,7 +121,7 @@ class Boto3S3Client:
         except (binascii.Error, ValueError, TypeError):
             pass
         size = metadata.get('ContentLength')
-        checksum_type = metadata.get('ChecksumType', 'FULL_OBJECT')
+        checksum_type = metadata.get('ChecksumType')
         matches = stored == checksum and size == size_bytes and checksum_type == 'FULL_OBJECT'
         result = VerificationResult(matches, stored, size, 's3-sha256', checksum_type)
         if not matches or not self.full_readback:
