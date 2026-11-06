@@ -106,30 +106,30 @@ def _validate_manifest_content(path, planned_key):
         return error
     if planned_key is None:
         return None
-    url_errors = _manifest_url_errors(manifest, planned_key)
-    diagnostics = url_errors + _manifest_container_errors(manifest)
+    url_errors = []
+    try:
+        manifest_url_base(manifest.get('@id'), planned_key)
+    except ValueError:
+        url_errors.append(f'{PUBLIC_URL_ERROR_MARKER} manifest @id does not join its planned key.')
+    container_errors = []
+    for kind, value in _manifest_content_items(manifest):
+        if kind == 'error':
+            _append_container_error(container_errors, value)
+            continue
+        for service_id in _service_ids(value):
+            try:
+                image_service_url_base(service_id)
+            except ValueError:
+                url_errors.append(
+                    f'{PUBLIC_URL_ERROR_MARKER} image service @id is not one encoded key segment.'
+                )
+    diagnostics = url_errors + container_errors
     if not diagnostics:
         return None
     message = '; '.join(diagnostics)
     if url_errors:
         return PublicUrlFailure(message)
     return message
-
-
-def _manifest_url_errors(manifest, planned_key):
-    errors = []
-    try:
-        manifest_url_base(manifest.get('@id'), planned_key)
-    except ValueError:
-        errors.append(f'{PUBLIC_URL_ERROR_MARKER} manifest @id does not join its planned key.')
-    for service_id in _image_service_ids(manifest):
-        try:
-            image_service_url_base(service_id)
-        except ValueError:
-            errors.append(
-                f'{PUBLIC_URL_ERROR_MARKER} image service @id is not one encoded key segment.'
-            )
-    return errors
 
 
 def _read_json_object(path):
@@ -139,55 +139,37 @@ def _read_json_object(path):
     return value, None
 
 
-def _manifest_container_errors(manifest):
-    errors = []
+def _manifest_content_items(manifest):
+    yield 'resource', manifest.get('thumbnail')
     sequences = manifest.get('sequences', [])
     if not isinstance(sequences, list):
-        return ['Manifest sequences must be a list.']
+        yield 'error', 'Manifest sequences must be a list.'
+        return
     for sequence in sequences:
         if not isinstance(sequence, dict):
-            _append_container_error(errors, 'Manifest sequences must contain objects.')
+            yield 'error', 'Manifest sequences must contain objects.'
             continue
         canvases = sequence.get('canvases', [])
         if not isinstance(canvases, list):
-            _append_container_error(errors, 'Manifest canvases must be a list.')
+            yield 'error', 'Manifest canvases must be a list.'
             continue
         for canvas in canvases:
             if not isinstance(canvas, dict):
-                _append_container_error(errors, 'Manifest canvases must contain objects.')
+                yield 'error', 'Manifest canvases must contain objects.'
                 continue
-            if not isinstance(canvas.get('images', []), list):
-                _append_container_error(errors, 'Manifest images must be a list.')
-    return errors
+            yield 'resource', canvas.get('thumbnail')
+            annotations = canvas.get('images', [])
+            if not isinstance(annotations, list):
+                yield 'error', 'Manifest images must be a list.'
+                continue
+            for annotation in annotations:
+                if isinstance(annotation, dict):
+                    yield 'resource', annotation.get('resource')
 
 
 def _append_container_error(errors, message):
     if message not in errors:
         errors.append(message)
-
-
-def _image_service_ids(manifest):
-    yield from _service_ids(manifest.get('thumbnail'))
-    sequences = manifest.get('sequences', [])
-    if not isinstance(sequences, list):
-        return
-    for sequence in sequences:
-        if not isinstance(sequence, dict):
-            continue
-        canvases = sequence.get('canvases', [])
-        if not isinstance(canvases, list):
-            continue
-        for canvas in canvases:
-            if not isinstance(canvas, dict):
-                continue
-            yield from _service_ids(canvas.get('thumbnail'))
-            annotations = canvas.get('images', [])
-            if not isinstance(annotations, list):
-                continue
-            for annotation in annotations:
-                if not isinstance(annotation, dict):
-                    continue
-                yield from _service_ids(annotation.get('resource'))
 
 
 def _service_ids(container):

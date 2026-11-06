@@ -19,7 +19,7 @@ def normalize_public_base_url(value: str) -> str:
     _validate_url_authority(parsed.netloc, hostname, scheme)
     _validate_url_userinfo(parsed)
     _validate_url_port(parsed.netloc, port)
-    host = _normalize_hostname(hostname)
+    host = _normalize_hostname(hostname, bracketed=parsed.netloc.startswith('['))
     _validate_http_loopback(scheme, host)
     _validate_url_path(parsed.path)
     return _format_normalized_url(parsed, scheme, host, port)
@@ -126,17 +126,21 @@ def _has_empty_port(netloc: str) -> bool:
     return authority.endswith(':')
 
 
-def _normalize_hostname(hostname: str) -> str:
+def _normalize_hostname(hostname: str, *, bracketed: bool = False) -> str:
     host = hostname.lower()
     if not host.isascii() or host.endswith('.'):
         raise ValueError('Hostname must be an ASCII DNS name or IP literal.')
     try:
-        ip_address(host)
-        return host
+        address = ip_address(host)
     except ValueError:
+        if bracketed:
+            raise ValueError('Bracketed hostname must be a valid IPv6 address.') from None
         if len(host) > 253 or any(not _DNS_LABEL.fullmatch(label) for label in host.split('.')):
             raise ValueError('Hostname must be an ASCII DNS name or IP literal.') from None
         return host
+    if bracketed and address.version != 6:
+        raise ValueError('Bracketed hostname must be a valid IPv6 address.')
+    return host
 
 
 def _normalize_join_base(value: str) -> str:

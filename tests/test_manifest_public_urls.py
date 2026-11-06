@@ -18,6 +18,7 @@ from workbench_lite import cli
 from workbench_lite.check import run_check
 from workbench_lite.locks import WriterLocks
 from workbench_lite.manifest import generate_manifests
+from workbench_lite.public_urls import normalize_public_base_url
 from workbench_lite.runs import RunJournal
 
 
@@ -119,8 +120,6 @@ class ManifestPublicUrlTests(unittest.TestCase):
         )
 
     def test_public_base_url_normalizer_accepts_valid_forms(self):
-        from workbench_lite.public_urls import normalize_public_base_url
-
         accepted = [
             ('https://example.org', 'https://example.org'),
             ('https://example.org/archive', 'https://example.org/archive'),
@@ -133,6 +132,7 @@ class ManifestPublicUrlTests(unittest.TestCase):
             ('HTTP://[::1]:8080/manifests///', 'http://[::1]:8080/manifests'),
             ('https://192.0.2.10/iiif', 'https://192.0.2.10/iiif'),
             ('https://[2001:db8::1]/iiif', 'https://[2001:db8::1]/iiif'),
+            ('http://[::1]:8080/x', 'http://[::1]:8080/x'),
         ]
         with (
             patch('socket.getaddrinfo', side_effect=AssertionError('unexpected DNS lookup')),
@@ -143,8 +143,6 @@ class ManifestPublicUrlTests(unittest.TestCase):
                     self.assertEqual(normalize_public_base_url(value), expected)
 
     def test_public_base_url_normalizer_refuses_each_invalid_form(self):
-        from workbench_lite.public_urls import normalize_public_base_url
-
         refused = [
             '',
             'manifests/archive',
@@ -173,6 +171,8 @@ class ManifestPublicUrlTests(unittest.TestCase):
             'https://example.org/%GG',
             'https://exämple.org/archive',
             'https://K.example.org/archive',
+            'https://[v1.example]/archive',
+            'https://[not-an-ip]/x',
             'https://bad_host.example/archive',
             'http://127.0.0.2/x',
             'http://[2001:db8::1]/x',
