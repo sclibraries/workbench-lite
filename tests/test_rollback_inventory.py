@@ -6,6 +6,7 @@ import io
 from pathlib import Path
 import tempfile
 import unittest
+from urllib.parse import unquote
 from unittest.mock import patch
 
 from workbench_lite.models import UploadPlanEntry
@@ -201,6 +202,11 @@ class RollbackInventoryTests(unittest.TestCase):
         from test_outcomes import Storage, package
 
         config = package(self.root, include_public_bases=False)
+        with config.open('a', encoding='utf-8') as handle:
+            handle.write(
+                'cantaloupe_source_prefix: workbench-lite/\n'
+                'manifest_key_prefix: workbench-lite/sample/\n'
+            )
         output = self.root / 'generated'
         base_url = 'https://manifests.example.org/archive'
         common = ['--config', str(config), '--run-dir', str(self.root / 'runs')]
@@ -224,6 +230,9 @@ class RollbackInventoryTests(unittest.TestCase):
             )
         reference = json.loads((output / '.workbench-run.json').read_text())
         run_path = Path(reference['run_path'])
+        config_snapshot = json.loads((run_path / 'config.json').read_text())
+        self.assertEqual(config_snapshot['cantaloupe_source_prefix'], 'workbench-lite')
+        self.assertEqual(config_snapshot['manifest_key_prefix'], 'workbench-lite/sample')
         with (
             patch('workbench_lite.cli.create_s3_client', return_value=Storage()),
             contextlib.redirect_stdout(io.StringIO()),
@@ -235,8 +244,18 @@ class RollbackInventoryTests(unittest.TestCase):
         self.assertEqual(len(inventory['manifest_urls']), 1)
         manifest = output / inventory['manifest_urls'][0]['key']
         self.assertEqual(
-            inventory['manifest_urls'][0]['url'], json.loads(manifest.read_text())['@id']
+            json.loads(manifest.read_text())['@id'],
+            f'{base_url}/manifests/{manifest.name}',
         )
+        payload = json.loads(manifest.read_text())
+        service_id = payload['sequences'][0]['canvases'][0]['images'][0]['resource']['service'][
+            '@id'
+        ]
+        self.assertEqual(
+            'workbench-lite/' + unquote(service_id.rsplit('/', 1)[1]),
+            'workbench-lite/sample/derivatives/parent/pages/page/service.jpg',
+        )
+        self.assertEqual(inventory['manifest_urls'][0]['url'], payload['@id'])
 
 
 if __name__ == '__main__':

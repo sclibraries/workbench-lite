@@ -27,6 +27,8 @@ CONFIG_FIELDS = {
     's3_public_bucket',
     'manifest_base_url',
     'cantaloupe_base_url',
+    'cantaloupe_source_prefix',
+    'manifest_key_prefix',
     'additional_files',
     'allow_missing_files',
 }
@@ -696,7 +698,18 @@ class RunJournal:
         atomic_write(self.path / 'input.csv', csv_snapshot(csv_path))
         atomic_write(
             self.path / 'config.json',
-            json_bytes(sanitize({k: v for k, v in config.items() if k in CONFIG_FIELDS})),
+            json_bytes(
+                sanitize(
+                    {
+                        key: value
+                        for key, value in config.items()
+                        if key in CONFIG_FIELDS
+                        and (
+                            key not in {'cantaloupe_source_prefix', 'manifest_key_prefix'} or value
+                        )
+                    }
+                )
+            ),
         )
         metadata.update(
             inputs=fingerprints,

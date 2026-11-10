@@ -24,6 +24,8 @@ def generate_manifests(
     manifest_base_url: Optional[str] = None,
     journal=None,
     page_dimensions: Optional[Dict[tuple[str, str], tuple[int, int]]] = None,
+    cantaloupe_source_prefix: Optional[str] = None,
+    manifest_key_prefix: Optional[str] = None,
 ) -> GenerateResult:
     results = RecordedResults(journal, 'generate')
     generated_count = 0
@@ -56,6 +58,7 @@ def generate_manifests(
                 output_dir,
                 cantaloupe_base_url,
                 page_dimensions,
+                cantaloupe_source_prefix,
             )
             if page_canvas is None:
                 missing_reasons.append(
@@ -84,7 +87,9 @@ def generate_manifests(
         manifest_payload = _build_manifest_payload(
             obj,
             manifest_pages=manifest_pages,
-            manifest_id=_manifest_id(manifest_entry, manifest_key, manifest_base_url),
+            manifest_id=_manifest_id(
+                manifest_entry, manifest_key, manifest_base_url, manifest_key_prefix
+            ),
             sequence_id=None,
             pdf_entry=entries_by_key.get(('pdf', obj.object_id, '')),
         )
@@ -138,6 +143,7 @@ def _build_canvas_entry(
     output_dir: Path,
     cantaloupe_base_url: str,
     page_dimensions: Dict[tuple[str, str], tuple[int, int]],
+    cantaloupe_source_prefix: Optional[str],
 ) -> tuple[Optional[Dict[str, object]], Optional[str]]:
     service_entry = entries_by_key.get(('service_jpg', obj.object_id, page.page_id))
     master_entry = entries_by_key.get(('master_tiff', obj.object_id, page.page_id))
@@ -164,6 +170,7 @@ def _build_canvas_entry(
     service_id = build_cantaloupe_service_id(
         base_url=cantaloupe_base_url,
         image_key=service_key,
+        prefix=cantaloupe_source_prefix,
     )
     image_id = (
         f'{service_id}/full/!{MANIFEST_IMAGE_MAX_DIMENSION},'
@@ -264,11 +271,12 @@ def _manifest_id(
     manifest_entry: Optional[UploadPlanEntry],
     fallback_key: str,
     manifest_base_url: Optional[str],
+    manifest_key_prefix: Optional[str],
 ) -> str:
     manifest_path = manifest_entry.key if manifest_entry else fallback_key
 
     if manifest_base_url:
-        return join_manifest_url(manifest_base_url, manifest_path)
+        return join_manifest_url(manifest_base_url, manifest_path, manifest_key_prefix)
 
     return manifest_path
 
@@ -282,8 +290,8 @@ def _output_path_for_entry(entry_key: str, output_dir: Path) -> Path:
     return output_dir / normalized
 
 
-def build_cantaloupe_service_id(base_url: str, image_key: str) -> str:
-    return join_image_service_url(base_url, image_key)
+def build_cantaloupe_service_id(base_url: str, image_key: str, prefix: Optional[str] = None) -> str:
+    return join_image_service_url(base_url, image_key, prefix)
 
 
 def _normalize_segment(value: str) -> str:

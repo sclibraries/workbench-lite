@@ -127,11 +127,27 @@ class PreflightTests(unittest.TestCase):
             'batch_id: ..',
             's3_private_bucket: INVALID_BUCKET',
             'input_dir: .\ninput_dir: elsewhere',
+            'cantaloupe_source_prefix: 3',
+            "cantaloupe_source_prefix: '/absolute'",
+            'manifest_key_prefix: a/../b',
+            "manifest_key_prefix: '///'",
+            "cantaloupe_source_prefix: 'a\\b'",
+            'manifest_key_prefix: "a\\u0000b"',
+            'cantaloupe_source_prefix: "a\\u0001b"',
         ]:
             with self.subTest(setting=setting):
                 self.config.write_text('input_csv: input.csv\n' + setting + '\n')
                 with self.assertRaises(ConfigError):
                     load_config(self.config)
+
+        self.config.write_text(
+            'input_csv: input.csv\n'
+            'cantaloupe_source_prefix: images/\n'
+            'manifest_key_prefix: manifests/\n'
+        )
+        config = load_config(self.config)
+        self.assertEqual(config['cantaloupe_source_prefix'], 'images')
+        self.assertEqual(config['manifest_key_prefix'], 'manifests')
 
     def test_output_escape_and_low_disk_are_blocking(self):
         from workbench_lite.preflight import output_readiness

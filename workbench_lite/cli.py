@@ -852,7 +852,13 @@ def _run_validated_push(args, check_report):
     id_claims = build_id_claims(check_report.objects, config, args.config)
     input_dir = _resolve_input_dir(args.config, config)
     dry_run = not args.execute
-    local = _push_local_readiness(args, check_report.upload_plan, input_dir)
+    local = _push_local_readiness(
+        args,
+        check_report.upload_plan,
+        input_dir,
+        cantaloupe_source_prefix=config.get('cantaloupe_source_prefix'),
+        manifest_key_prefix=config.get('manifest_key_prefix'),
+    )
     if local['errors']:
         _print_preflight(args)
         return 3 if is_public_url_failure(local['errors']) else 1
@@ -905,11 +911,20 @@ def _validate_generated_push(args, parser, upload_plan):
         parser.error('push --execute requires --generated-dir for planned generated artifacts')
 
 
-def _push_local_readiness(args, upload_plan, input_dir):
+def _push_local_readiness(
+    args, upload_plan, input_dir, cantaloupe_source_prefix=None, manifest_key_prefix=None
+):
     new_audit = (
         args.generated_dir is not None and not (args.generated_dir / '.workbench-run.json').exists()
     )
-    local = output_readiness(upload_plan, input_dir, args.generated_dir, new_audit=new_audit)
+    local = output_readiness(
+        upload_plan,
+        input_dir,
+        args.generated_dir,
+        new_audit=new_audit,
+        cantaloupe_source_prefix=cantaloupe_source_prefix,
+        manifest_key_prefix=manifest_key_prefix,
+    )
     if is_public_url_failure(local['errors']):
         local['errors'].extend(
             f'Missing generated file: {key}' for key in local['missing_generated']
@@ -1056,7 +1071,16 @@ def _run_generate(args):
         return 3
     input_dir = _resolve_input_dir(args.config, config)
     output_dir = args.output_dir or (input_dir / 'generated')
-    local = output_readiness(check_report.upload_plan, input_dir, output_dir, generating=True)
+    local = output_readiness(
+        check_report.upload_plan,
+        input_dir,
+        output_dir,
+        generating=True,
+        cantaloupe_source_prefix=(
+            config.get('cantaloupe_source_prefix') if args.manifests else None
+        ),
+        manifest_key_prefix=(config.get('manifest_key_prefix') if args.manifests else None),
+    )
     args.preflight = {'local': local}
     args.journal.append('context', stage='generate', preflight=args.preflight)
     if local['errors']:
@@ -1073,7 +1097,15 @@ def _run_generate(args):
         quality=args.quality,
         journal=args.journal,
     )
-    report = _add_requested_manifests(args, manifest_bases, check_report, output_dir, report)
+    report = _add_requested_manifests(
+        args,
+        manifest_bases,
+        check_report,
+        output_dir,
+        report,
+        cantaloupe_source_prefix=config.get('cantaloupe_source_prefix'),
+        manifest_key_prefix=config.get('manifest_key_prefix'),
+    )
     report = _add_requested_thumbnails(
         args, check_report.upload_plan, input_dir, output_dir, report
     )
@@ -1099,7 +1131,15 @@ def _resolve_generation_bases(args, config):
         raise ValueError(f'Invalid manifest base URL: {exc}') from exc
 
 
-def _add_requested_manifests(args, bases, check_report, output_dir, report):
+def _add_requested_manifests(
+    args,
+    bases,
+    check_report,
+    output_dir,
+    report,
+    cantaloupe_source_prefix=None,
+    manifest_key_prefix=None,
+):
     if not args.manifests:
         return report
     manifest_base_url, cantaloupe_base_url = bases
@@ -1111,6 +1151,8 @@ def _add_requested_manifests(args, bases, check_report, output_dir, report):
         manifest_base_url=manifest_base_url,
         journal=args.journal,
         page_dimensions=report.page_dimensions,
+        cantaloupe_source_prefix=cantaloupe_source_prefix,
+        manifest_key_prefix=manifest_key_prefix,
     )
     return _combine_generate_reports(report, manifest_report)
 

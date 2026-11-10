@@ -41,6 +41,8 @@ additional_files:
   - hocr: 3507
 manifest_base_url: https://manifests.example.org/manifests
 cantaloupe_base_url: https://images.example.org/iiif/2
+cantaloupe_source_prefix: workbench-lite/
+manifest_key_prefix: workbench-lite/
 s3_private_bucket: your-approved-private-bucket
 s3_public_bucket: your-approved-public-bucket
 s3_prefix: workbench-lite
@@ -55,6 +57,8 @@ batch_id: example-batch
 | `allow_missing_files` | Optional boolean for warning-only missing-file reports. It does not permit uploads with missing sources. |
 | `manifest_base_url` | Required for `generate --manifests`; public base for manifest identifiers. |
 | `cantaloupe_base_url` | Required for `generate --manifests`; public base for IIIF image services. |
+| `manifest_key_prefix` | Optional relative S3 key prefix removed from manifest identifiers; omit or leave empty to keep the full key. |
+| `cantaloupe_source_prefix` | Optional relative S3 key prefix removed from image service identifiers; omit or leave empty to keep the full key. |
 | `s3_private_bucket` | Bucket for private masters and audit files. |
 | `s3_public_bucket` | Bucket for delivery assets and manifests. |
 | `s3_prefix` | Prefix shared by package destinations; defaults to `workbench-lite`. |
@@ -73,6 +77,11 @@ literals (IPv6 literals use brackets); ports, when present, must be from 1 throu
 65535. Paths cannot contain malformed percent escapes. A path prefix is kept and
 trailing slashes are removed; scheme and hostname are normalized to lowercase. DNS
 names cannot have a trailing dot. Validation makes no DNS or HTTP requests.
+The two optional key prefixes must be strings without a leading slash, `..` segment,
+backslash or control character, and cannot consist only of slashes. One trailing slash
+is removed. Each planned key must begin with its configured prefix followed by `/` and
+at least one key character. Invalid prefixes are refused before generation output or
+push storage setup.
 `check` and `generate` without `--manifests` do not require either setting.
 
 ## S3 layout and ID reservations

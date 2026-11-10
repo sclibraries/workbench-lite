@@ -8,7 +8,7 @@ from pathlib import Path
 import tempfile
 import unittest
 from unittest.mock import Mock, patch
-from urllib.parse import quote
+from urllib.parse import quote, unquote
 
 import yaml
 
@@ -104,6 +104,15 @@ class ManifestPublicUrlTests(unittest.TestCase):
         path.write_text(json.dumps(payload), encoding='utf-8')
         return path
 
+    def unstripped_identifier(self, config, kind):
+        role, base, safe = (
+            ('service_jpg', IMAGE_BASE, '')
+            if kind.startswith('service-')
+            else ('manifest', MANIFEST_BASE, '/')
+        )
+        key = next(entry.key for entry in run_check(config).upload_plan if entry.role == role)
+        return f'{base}/{quote(key, safe=safe)}'
+
     def push(self, config, output, run_name, mode, *, client=None, extra=()):
         return self.invoke(
             [
@@ -195,6 +204,7 @@ class ManifestPublicUrlTests(unittest.TestCase):
         self,
     ):
         self._assert_reserved_key_urls(self._build_reserved_key_manifest())
+        self._assert_master_tiff_fallback_strips_source_prefix()
 
     def _build_reserved_key_manifest(self):
         config = self.package('encoded')
@@ -205,8 +215,8 @@ class ManifestPublicUrlTests(unittest.TestCase):
             entry for entry in report.upload_plan if entry.role == 'service_jpg'
         )
         original_manifest = next(entry for entry in report.upload_plan if entry.role == 'manifest')
-        service_key = 'sample/é/literal%2F with space?hash#/service.jpg'
-        manifest_key = 'sample/é/literal%2F with space?hash#/manifest.json'
+        service_key = 'sample/é/derivatives/literal%2F with space?hash#/service.jpg'
+        manifest_key = 'sample/é/manifests/literal%2F with space?hash#/manifest.json'
         service_path = output / service_key
         service_path.parent.mkdir(parents=True, exist_ok=True)
         service_path.write_bytes((output / original_service.key).read_bytes())
@@ -227,6 +237,8 @@ class ManifestPublicUrlTests(unittest.TestCase):
             output,
             cantaloupe_base_url='HTTPS://IMAGES.EXAMPLE.ORG/iiif/2///',
             manifest_base_url='HTTPS://MANIFESTS.EXAMPLE.ORG/archive///',
+            cantaloupe_source_prefix='sample/é/derivatives',
+            manifest_key_prefix='sample/é/manifests',
             page_dimensions=service_report.page_dimensions,
         )
         payload = json.loads(Path(generated.results[0].output_path).read_text())
@@ -239,17 +251,90 @@ class ManifestPublicUrlTests(unittest.TestCase):
 
         self.assertEqual(
             payload['@id'],
-            f'https://manifests.example.org/archive/{quote(manifest_key, safe="/")}',
+            'https://manifests.example.org/archive/'
+            'literal%252F%20with%20space%3Fhash%23/manifest.json',
         )
         self.assertEqual(
             annotation['resource']['service']['@id'],
-            f'https://images.example.org/iiif/2/{quote(service_key, safe="")}',
+            'https://images.example.org/iiif/2/literal%252F%20with%20space%3Fhash%23%2Fservice.jpg',
         )
         self.assertIn('%252F', payload['@id'])
+        self.assertEqual(
+            'sample/é/manifests/' + unquote(payload['@id'].split('/archive/', 1)[1]),
+            manifest_key,
+        )
+        self.assertEqual(
+            'sample/é/derivatives/'
+            + unquote(annotation['resource']['service']['@id'].split('/iiif/2/', 1)[1]),
+            service_key,
+        )
         self.assertEqual(manifest_entry.key, manifest_key)
         self.assertEqual(service_entry.key, service_key)
         self.assertEqual(canvas['@id'], 'page/page-1')
         self.assertEqual(annotation['on'], canvas['@id'])
+        self.assertEqual((canvas['width'], canvas['height']), (12, 10))
+        service_id = annotation['resource']['service']['@id']
+        self.assertEqual(
+            annotation['resource']['@id'],
+            f'{service_id}/full/!2000,2000/0/default.jpg',
+        )
+        self.assertEqual(
+            canvas['thumbnail']['@id'],
+            f'{service_id}/full/!160,160/0/default.jpg',
+        )
+
+    def _assert_master_tiff_fallback_strips_source_prefix(self):
+        config = self.package('master-fallback')
+        report = run_check(config)
+        output = self.root / 'master-fallback-generated'
+        service_report = self._generate_service_image(report, output, config)
+        plan = [entry for entry in report.upload_plan if entry.role != 'service_jpg']
+        generated = generate_manifests(
+            report.objects,
+            plan,
+            output,
+            cantaloupe_base_url=IMAGE_BASE,
+            manifest_base_url=MANIFEST_BASE,
+            cantaloupe_source_prefix='run',
+            manifest_key_prefix='run',
+            page_dimensions=service_report.page_dimensions,
+        )
+        payload = json.loads(Path(generated.results[0].output_path).read_text())
+        master_entry = next(entry for entry in plan if entry.role == 'master_tiff')
+        encoded_identifier = payload['sequences'][0]['canvases'][0]['images'][0]['resource'][
+            'service'
+        ]['@id'].split('/iiif/2/', 1)[1]
+
+        self.assertEqual(
+            payload['sequences'][0]['canvases'][0]['images'][0]['resource']['service']['@id'],
+            f'{IMAGE_BASE}/{quote(master_entry.key.removeprefix("run/"), safe="")}',
+        )
+        self.assertEqual('run/' + unquote(encoded_identifier), master_entry.key)
+        from workbench_lite.preflight import validate_content
+
+        manifest_entry = next(entry for entry in plan if entry.role == 'manifest')
+        self.assertIsNone(
+            validate_content(
+                generated.results[0].output_path,
+                'manifest',
+                planned_key=manifest_entry.key,
+                manifest_key_prefix='run',
+                cantaloupe_source_prefix='run',
+                planned_service_keys=[master_entry.key],
+            )
+        )
+
+    def test_key_prefix_must_match_once_at_a_slash_boundary(self):
+        from workbench_lite.public_urls import strip_key_prefix
+
+        self.assertEqual(strip_key_prefix('source-root/page.tif', 'source-root'), 'page.tif')
+        self.assertEqual(
+            strip_key_prefix('source-root/source-root/page.tif', 'source-root'),
+            'source-root/page.tif',
+        )
+        for key in ('source-root-extra/page.tif', 'source-root/'):
+            with self.subTest(key=key), self.assertRaises(ValueError):
+                strip_key_prefix(key, 'source-root')
 
     def test_library_generation_keeps_relative_base_override_support(self):
         config = self.package('relative-library')
@@ -291,6 +376,9 @@ class ManifestPublicUrlTests(unittest.TestCase):
             ),
             ('empty-manifest-config', {'manifest_base_url': ''}, []),
             ('empty-image-config', {'cantaloupe_base_url': ''}, []),
+            ('unsafe-manifest-prefix', {'manifest_key_prefix': '/absolute'}, []),
+            ('unmatched-manifest-prefix', {'manifest_key_prefix': 'other-root'}, []),
+            ('unmatched-image-prefix', {'cantaloupe_source_prefix': 'other-root'}, []),
         ]
         for name, settings, flags in cases:
             with self.subTest(name=name):
@@ -356,6 +444,7 @@ class ManifestPublicUrlTests(unittest.TestCase):
 
     def test_config_bases_override_flags(self):
         config = self.package('precedence')
+        self._update_config(config, cantaloupe_source_prefix='', manifest_key_prefix='')
         output = self.root / 'precedence-generated'
         result = self.invoke(
             [
@@ -376,6 +465,17 @@ class ManifestPublicUrlTests(unittest.TestCase):
             entry for entry in run_check(config).upload_plan if entry.role == 'manifest'
         )
         self.assertEqual(payload['@id'], f'{MANIFEST_BASE}/{manifest_entry.key}')
+        service_entry = next(
+            entry for entry in run_check(config).upload_plan if entry.role == 'service_jpg'
+        )
+        service_id = payload['sequences'][0]['canvases'][0]['images'][0]['resource']['service'][
+            '@id'
+        ]
+        self.assertEqual(service_id, f'{IMAGE_BASE}/{quote(service_entry.key, safe="")}')
+        reference = json.loads((output / '.workbench-run.json').read_text())
+        config_snapshot = json.loads((Path(reference['run_path']) / 'config.json').read_text())
+        self.assertNotIn('cantaloupe_source_prefix', config_snapshot)
+        self.assertNotIn('manifest_key_prefix', config_snapshot)
 
     def test_generate_without_manifests_and_check_do_not_require_bases(self):
         config = self.package('no-bases', manifest_base=None, image_base=None)
@@ -406,15 +506,26 @@ class ManifestPublicUrlTests(unittest.TestCase):
         invalid_ids = [
             ('manifest-relative', 'relative/manifest.json'),
             ('manifest-invalid', 'ftp://manifests.example.org/manifest.json'),
+            ('manifest-unstripped', None),
+            ('manifest-key-mismatch', 'https://other.example.org/a/different.json'),
             ('service-relative', '/iiif/2/relative-image'),
             ('service-invalid', 'ftp://images.example.org/iiif/2/image'),
+            ('service-unstripped', None),
+            ('service-key-mismatch', 'https://other.example.org/iiif/2/other%2Fimage.jpg'),
         ]
         for kind, value in invalid_ids:
             with self.subTest(kind=kind):
                 config = self.package(f'execute-{kind}')
+                self._update_config(
+                    config,
+                    cantaloupe_source_prefix='run',
+                    manifest_key_prefix='run',
+                )
                 output = self.root / f'execute-{kind}-generated'
                 generated = self.generate(config, output, f'generate-{kind}')
                 self.assertEqual(generated['exit'], 0, generated['stdout'] + generated['stderr'])
+                if value is None:
+                    value = self.unstripped_identifier(config, kind)
                 manifest_path = self.mutate_manifest(output, kind, value)
                 storage = Storage()
                 result = self.push(config, output, f'execute-{kind}', '--execute', client=storage)
@@ -423,6 +534,21 @@ class ManifestPublicUrlTests(unittest.TestCase):
                 self.assertEqual(result['exit'], 3)
                 self.assertEqual(storage.claim_calls, [])
                 self.assertEqual(storage.calls, [])
+
+        config = self.package('execute-invalid-prefix')
+        self._update_config(config, manifest_key_prefix='../outside')
+        storage = Storage()
+        result = self.push(
+            config,
+            self.root / 'execute-invalid-prefix-generated',
+            'execute-invalid-prefix',
+            '--execute',
+            client=storage,
+        )
+        self.assertEqual(result['exit'], 3)
+        self.assertEqual(result['factory'].call_count, 0)
+        self.assertEqual(storage.claim_calls, [])
+        self.assertEqual(storage.calls, [])
 
     def test_push_execute_checks_legacy_generated_folder_without_generation_record(self):
         config = self.package('legacy')
@@ -480,10 +606,18 @@ class ManifestPublicUrlTests(unittest.TestCase):
 
     def _prepare_interrupted_resume(self):
         config = self.package('resume')
+        self._update_config(
+            config,
+            cantaloupe_source_prefix='run',
+            manifest_key_prefix='run',
+        )
         output = self.root / 'resume-generated'
         generated = self.generate(config, output, 'generate-resume')
         self.assertEqual(generated['exit'], 0, generated['stdout'] + generated['stderr'])
-        manifest_path = self.mutate_manifest(output, 'manifest-relative', 'relative/manifest.json')
+        report = run_check(config)
+        manifest_entry = next(entry for entry in report.upload_plan if entry.role == 'manifest')
+        unstripped_id = f'{MANIFEST_BASE}/{quote(manifest_entry.key, safe="/")}'
+        manifest_path = self.mutate_manifest(output, 'manifest-relative', unstripped_id)
         reference = json.loads((output / '.workbench-run.json').read_text())
         run_path = Path(reference['run_path'])
         report = run_check(config, run_id=reference['run_id'])
@@ -515,20 +649,30 @@ class ManifestPublicUrlTests(unittest.TestCase):
         invalid_ids = [
             ('manifest-relative', 'relative/manifest.json'),
             ('manifest-invalid', 'ftp://manifests.example.org/manifest.json'),
+            ('manifest-unstripped', None),
+            ('manifest-key-mismatch', 'https://other.example.org/a/different.json'),
             ('service-relative', '/iiif/2/relative-image'),
             ('service-invalid', 'ftp://images.example.org/iiif/2/image'),
+            ('service-unstripped', None),
+            ('service-key-mismatch', 'https://other.example.org/iiif/2/other%2Fimage.jpg'),
         ]
         for index, (kind, value) in enumerate(invalid_ids):
             for offline in (False, True):
                 with self.subTest(kind=kind, offline=offline):
                     name = f'dry-{index}-{offline}'
                     config = self.package(name)
+                    self._update_config(
+                        config,
+                        cantaloupe_source_prefix='run',
+                        manifest_key_prefix='run',
+                    )
                     output = self.root / f'{name}-generated'
                     generated = self.generate(config, output, f'{name}-generate')
                     self.assertEqual(
                         generated['exit'], 0, generated['stdout'] + generated['stderr']
                     )
-                    manifest_path = self.mutate_manifest(output, kind, value)
+                    actual_value = value or self.unstripped_identifier(config, kind)
+                    manifest_path = self.mutate_manifest(output, kind, actual_value)
                     storage = Storage()
                     mode = '--dry-run'
                     arguments = ['push', *self.common(config, name), mode]
@@ -690,6 +834,11 @@ class ManifestPublicUrlTests(unittest.TestCase):
 
     def test_push_accepts_manifest_urls_independent_of_current_config(self):
         config = self.package('alternate-base')
+        self._update_config(
+            config,
+            cantaloupe_source_prefix='run',
+            manifest_key_prefix='run',
+        )
         output = self.root / 'alternate-base-generated'
         generated = self.generate(config, output, 'alternate-base-generate')
         self.assertEqual(generated['exit'], 0, generated['stdout'] + generated['stderr'])
@@ -699,11 +848,11 @@ class ManifestPublicUrlTests(unittest.TestCase):
         path = self.generated_manifest(output)
         payload = json.loads(path.read_text(encoding='utf-8'))
         payload['@id'] = 'https://alternate.example.org/public/' + quote(
-            manifest_entry.key, safe='/'
+            manifest_entry.key.removeprefix('run/'), safe='/'
         )
         service = payload['sequences'][0]['canvases'][0]['images'][0]['resource']['service']
         service['@id'] = 'https://images-alternate.example.org/iiif/v2/' + quote(
-            service_entry.key, safe=''
+            service_entry.key.removeprefix('run/'), safe=''
         )
         path.write_text(json.dumps(payload), encoding='utf-8')
         (output / '.workbench-run.json').unlink()
@@ -795,6 +944,11 @@ class ManifestPublicUrlTests(unittest.TestCase):
             manifest_base='HTTPS://MANIFESTS.EXAMPLE.ORG/archive///',
             image_base='HTTPS://IMAGES.EXAMPLE.ORG/iiif/2///',
         )
+        self._update_config(
+            config,
+            cantaloupe_source_prefix='run/',
+            manifest_key_prefix='run/',
+        )
         output = self.root / 'inventory-uppercase-generated'
         generated = self.generate(config, output, 'inventory-uppercase-generate')
         self.assertEqual(generated['exit'], 0, generated['stdout'] + generated['stderr'])
@@ -816,6 +970,14 @@ class ManifestPublicUrlTests(unittest.TestCase):
 
         self.assertEqual(len(inventory['manifest_urls']), 1)
         self.assertEqual(inventory['manifest_urls'][0]['url'], manifest_payload['@id'])
+        legacy_run = self._inventory_run(snapshot_base='https://manifests.example.org/archive')
+        legacy_config = json.loads((legacy_run.path / 'config.json').read_text())
+        legacy_inventory = build_inventory(legacy_run.path)
+        self.assertNotIn('manifest_key_prefix', legacy_config)
+        self.assertEqual(
+            legacy_inventory['manifest_urls'][0]['url'],
+            'https://manifests.example.org/archive/workbench-lite/package/manifests/package.json',
+        )
 
     def test_rollback_inventory_omits_a_recorded_base_that_fails_the_url_rule(self):
         inventory = self._inventory_with_base('https://manifests.example.org/archive?query=1')

@@ -1,6 +1,7 @@
 from pathlib import Path
 import re
 from typing import Dict
+import unicodedata
 
 
 class ConfigError(ValueError):
@@ -46,6 +47,7 @@ def _validate_config(config: Dict[str, object]) -> Dict[str, object]:
     _validate_string_settings(config)
     _validate_boolean_settings(config)
     _validate_key_segments(config)
+    _validate_url_key_prefixes(config)
     _validate_bucket_names(config)
     _validate_additional_files(config)
     return config
@@ -62,6 +64,8 @@ def _validate_string_settings(config):
         's3_public_bucket',
         's3_prefix',
         'batch_id',
+        'cantaloupe_source_prefix',
+        'manifest_key_prefix',
     ):
         if name in config and not isinstance(config[name], str):
             raise ConfigError(f'Configuration {name} must be a string.')
@@ -83,6 +87,22 @@ def _validate_key_segments(config):
                 or '\x00' in value
             ):
                 raise ConfigError(f'Configuration {name} contains an unsafe key segment.')
+
+
+def _validate_url_key_prefixes(config):
+    for name in ('cantaloupe_source_prefix', 'manifest_key_prefix'):
+        value = config.get(name)
+        if value is None or value == '':
+            continue
+        if (
+            value.startswith('/')
+            or any(part == '..' for part in value.split('/'))
+            or '\\' in value
+            or any(unicodedata.category(character) == 'Cc' for character in value)
+            or not value.strip('/')
+        ):
+            raise ConfigError(f'Configuration {name} contains an unsafe key prefix.')
+        config[name] = value.removesuffix('/')
 
 
 def _validate_bucket_names(config):

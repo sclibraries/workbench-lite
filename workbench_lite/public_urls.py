@@ -82,24 +82,43 @@ def _format_normalized_url(parsed, scheme, host, port):
     return urlunsplit((scheme, netloc, parsed.path.rstrip('/'), '', ''))
 
 
-def join_manifest_url(base_url: str, planned_key: str) -> str:
+def join_manifest_url(base_url: str, planned_key: str, prefix: str | None = None) -> str:
     """Join a base with the complete manifest key, preserving key path separators."""
     base = _normalize_join_base(base_url)
-    return f'{base}/{quote(planned_key.lstrip("/"), safe="/")}'
+    key = strip_key_prefix(planned_key, prefix)
+    if not prefix:
+        key = key.lstrip('/')
+    return f'{base}/{quote(key, safe="/")}'
 
 
-def join_image_service_url(base_url: str, image_key: str) -> str:
+def join_image_service_url(base_url: str, image_key: str, prefix: str | None = None) -> str:
     """Join a base with an image key encoded as one path segment."""
     base = _normalize_join_base(base_url)
-    return f'{base}/{quote(image_key, safe="")}'
+    return f'{base}/{quote(strip_key_prefix(image_key, prefix), safe="")}'
 
 
-def manifest_url_base(value: str, planned_key: str) -> str:
+def strip_key_prefix(key: str, prefix: str | None) -> str:
+    """Remove one configured prefix at a path boundary."""
+    if not prefix:
+        return key
+    boundary = prefix + '/'
+    if not key.startswith(boundary):
+        raise ValueError('Key is outside its configured prefix.')
+    remainder = key[len(boundary) :]
+    if not remainder:
+        raise ValueError('Configured prefix leaves an empty key.')
+    return remainder
+
+
+def manifest_url_base(value: str, planned_key: str, prefix: str | None = None) -> str:
     """Return the valid base before a manifest URL's encoded planned key."""
-    encoded_key = quote(planned_key.lstrip('/'), safe='/')
+    key = strip_key_prefix(planned_key, prefix)
+    encoded_key = quote(key.lstrip('/'), safe='/')
     suffix = '/' + encoded_key
     if not isinstance(value, str) or not encoded_key or not value.endswith(suffix):
         raise ValueError('Manifest @id does not end in its encoded planned key.')
+    if prefix and urlsplit(value).path.endswith('/' + quote(planned_key.lstrip('/'), safe='/')):
+        raise ValueError('Manifest @id includes its configured key prefix.')
     base = value[: -len(suffix)]
     if not base or base.endswith('/'):
         raise ValueError('Manifest @id must have one separator before its planned key.')
@@ -107,7 +126,7 @@ def manifest_url_base(value: str, planned_key: str) -> str:
     return base
 
 
-def image_service_url_base(value: str) -> str:
+def image_service_url_base(value: str, expected_key: str | None = None) -> str:
     """Return the valid base before a canonically encoded image-key segment."""
     if not isinstance(value, str) or '/' not in value:
         raise ValueError('Image service @id must have an encoded path segment.')
@@ -117,6 +136,8 @@ def image_service_url_base(value: str) -> str:
     decoded_key = unquote(encoded_key)
     if '/' not in decoded_key or quote(decoded_key, safe='') != encoded_key:
         raise ValueError('Image service @id has a non-canonical encoded path segment.')
+    if expected_key is not None and decoded_key != expected_key:
+        raise ValueError('Image service @id does not match its planned key.')
     normalize_public_base_url(base)
     return base
 

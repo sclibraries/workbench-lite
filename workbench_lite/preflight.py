@@ -9,7 +9,7 @@ import shutil
 from .image_policy import Image, pixel_limit_error
 
 from .diagnostics import operation_error
-from .public_urls import image_service_url_base, manifest_url_base
+from .public_urls import image_service_url_base, manifest_url_base, strip_key_prefix
 
 
 PUBLIC_URL_ERROR_MARKER = 'Public URL validation failed:'
@@ -25,6 +25,9 @@ class _OutputReadiness:
     root: Path | None
     generating: bool
     new_audit: bool
+    cantaloupe_source_prefix: str | None
+    manifest_key_prefix: str | None
+    service_keys: dict
     errors: list
     planned: list
     missing: list
@@ -44,18 +47,35 @@ def safe_source(value, input_dir):
     return candidate.resolve().is_relative_to(root)
 
 
-def validate_content(path, role, *, planned_key=None):
+def validate_content(
+    path,
+    role,
+    *,
+    planned_key=None,
+    manifest_key_prefix=None,
+    cantaloupe_source_prefix=None,
+    planned_service_keys=None,
+):
     """Return a safe diagnostic; PDF checking is framing, not full parsing."""
     path = Path(path)
     try:
-        return _validate_role_content(path, role, planned_key)
+        return _validate_role_content(
+            path,
+            role,
+            planned_key,
+            manifest_key_prefix,
+            cantaloupe_source_prefix,
+            planned_service_keys or [],
+        )
     except Image.DecompressionBombError:
         return pixel_limit_error()
     except (OSError, ValueError) as exc:
         return 'Cannot read/decode required file: ' + operation_error(exc)
 
 
-def _validate_role_content(path, role, planned_key):
+def _validate_role_content(
+    path, role, planned_key, manifest_key_prefix, cantaloupe_source_prefix, planned_service_keys
+):
     if role in {'master_tiff', 'service_jpg', 'thumbnail'}:
         return _validate_image_content(path, role)
     if role == 'pdf':
@@ -63,7 +83,13 @@ def _validate_role_content(path, role, planned_key):
     if role == 'hocr':
         return _validate_text_content(path)
     if role == 'manifest':
-        return _validate_manifest_content(path, planned_key)
+        return _validate_manifest_content(
+            path,
+            planned_key,
+            manifest_key_prefix,
+            cantaloupe_source_prefix,
+            planned_service_keys,
+        )
     if role == 'audit':
         return _validate_json_content(path)
     return _validate_readable_content(path)
@@ -100,7 +126,9 @@ def _validate_json_content(path):
     return error
 
 
-def _validate_manifest_content(path, planned_key):
+def _validate_manifest_content(
+    path, planned_key, manifest_key_prefix, cantaloupe_source_prefix, planned_service_keys
+):
     manifest, error = _read_json_object(path)
     if error:
         return error
@@ -108,21 +136,15 @@ def _validate_manifest_content(path, planned_key):
         return None
     url_errors = []
     try:
-        manifest_url_base(manifest.get('@id'), planned_key)
+        manifest_url_base(manifest.get('@id'), planned_key, manifest_key_prefix)
     except ValueError:
         url_errors.append(f'{PUBLIC_URL_ERROR_MARKER} manifest @id does not join its planned key.')
     container_errors = []
-    for kind, value in _manifest_content_items(manifest):
+    for kind, value, image_key in _manifest_content_items(manifest, planned_service_keys):
         if kind == 'error':
             _append_container_error(container_errors, value)
             continue
-        for service_id in _service_ids(value):
-            try:
-                image_service_url_base(service_id)
-            except ValueError:
-                url_errors.append(
-                    f'{PUBLIC_URL_ERROR_MARKER} image service @id is not one encoded key segment.'
-                )
+        url_errors.extend(_image_service_url_errors(value, image_key, cantaloupe_source_prefix))
     diagnostics = url_errors + container_errors
     if not diagnostics:
         return None
@@ -132,6 +154,21 @@ def _validate_manifest_content(path, planned_key):
     return message
 
 
+def _image_service_url_errors(value, image_key, prefix):
+    errors = []
+    for service_id in _service_ids(value):
+        try:
+            if image_key is None:
+                raise ValueError('Image service has no planned key.')
+            key = strip_key_prefix(image_key, prefix)
+            image_service_url_base(service_id, expected_key=key)
+        except ValueError:
+            errors.append(
+                f'{PUBLIC_URL_ERROR_MARKER} image service @id is not one encoded key segment.'
+            )
+    return errors
+
+
 def _read_json_object(path):
     value = json.loads(path.read_text(encoding='utf-8'))
     if not isinstance(value, dict):
@@ -139,32 +176,39 @@ def _read_json_object(path):
     return value, None
 
 
-def _manifest_content_items(manifest):
-    yield 'resource', manifest.get('thumbnail')
+def _manifest_content_items(manifest, planned_service_keys):
+    yield 'resource', manifest.get('thumbnail'), None
     sequences = manifest.get('sequences', [])
     if not isinstance(sequences, list):
-        yield 'error', 'Manifest sequences must be a list.'
+        yield 'error', 'Manifest sequences must be a list.', None
         return
+    canvas_index = 0
     for sequence in sequences:
         if not isinstance(sequence, dict):
-            yield 'error', 'Manifest sequences must contain objects.'
+            yield 'error', 'Manifest sequences must contain objects.', None
             continue
         canvases = sequence.get('canvases', [])
         if not isinstance(canvases, list):
-            yield 'error', 'Manifest canvases must be a list.'
+            yield 'error', 'Manifest canvases must be a list.', None
             continue
         for canvas in canvases:
             if not isinstance(canvas, dict):
-                yield 'error', 'Manifest canvases must contain objects.'
+                yield 'error', 'Manifest canvases must contain objects.', None
                 continue
-            yield 'resource', canvas.get('thumbnail')
+            image_key = (
+                planned_service_keys[canvas_index]
+                if canvas_index < len(planned_service_keys)
+                else None
+            )
+            canvas_index += 1
+            yield 'resource', canvas.get('thumbnail'), image_key
             annotations = canvas.get('images', [])
             if not isinstance(annotations, list):
-                yield 'error', 'Manifest images must be a list.'
+                yield 'error', 'Manifest images must be a list.', None
                 continue
             for annotation in annotations:
                 if isinstance(annotation, dict):
-                    yield 'resource', annotation.get('resource')
+                    yield 'resource', annotation.get('resource'), image_key
 
 
 def _append_container_error(errors, message):
@@ -194,16 +238,30 @@ def _validate_readable_content(path):
     return None
 
 
-def output_readiness(entries, input_dir, output_dir, *, generating=False, new_audit=False):
+def output_readiness(
+    entries,
+    input_dir,
+    output_dir,
+    *,
+    generating=False,
+    new_audit=False,
+    cantaloupe_source_prefix=None,
+    manifest_key_prefix=None,
+):
     readiness = _OutputReadiness(
         input_dir=input_dir,
         root=Path(output_dir).resolve() if output_dir is not None else None,
         generating=generating,
         new_audit=new_audit,
+        cantaloupe_source_prefix=cantaloupe_source_prefix,
+        manifest_key_prefix=manifest_key_prefix,
+        service_keys=_planned_service_keys(entries),
         errors=[],
         planned=[],
         missing=[],
     )
+    if generating:
+        _check_generation_prefixes(entries, readiness)
     required_bytes = 0
     for entry in entries:
         required_bytes += _check_generated_entry(entry, readiness)
@@ -217,6 +275,18 @@ def output_readiness(entries, input_dir, output_dir, *, generating=False, new_au
         'estimate_basis': 'source RGB upper estimate plus 64 KiB per generated entry; '
         'no disk reservation',
     }
+
+
+def _check_generation_prefixes(entries, readiness):
+    try:
+        for entry in entries:
+            if entry.role == 'manifest':
+                strip_key_prefix(entry.key, readiness.manifest_key_prefix)
+        for keys in readiness.service_keys.values():
+            for key in keys:
+                strip_key_prefix(key, readiness.cantaloupe_source_prefix)
+    except ValueError as exc:
+        readiness.errors.append(PublicUrlFailure(f'{PUBLIC_URL_ERROR_MARKER} {exc}'))
 
 
 def _check_generated_entry(entry, readiness):
@@ -239,8 +309,19 @@ def _check_generated_entry(entry, readiness):
         return estimated + _source_image_estimate(
             entry, readiness.input_dir, readiness.generating, readiness.errors
         )
-    _check_existing_generated_entry(entry, target, readiness.errors, readiness.missing)
+    _check_existing_generated_entry(entry, target, readiness)
     return 0
+
+
+def _planned_service_keys(entries):
+    keys_by_object = {}
+    for entry in entries:
+        if entry.role not in {'master_tiff', 'service_jpg'}:
+            continue
+        pages = keys_by_object.setdefault(entry.object_id, {})
+        if entry.page_id not in pages or entry.role == 'service_jpg':
+            pages[entry.page_id] = entry.key
+    return {object_id: list(pages.values()) for object_id, pages in keys_by_object.items()}
 
 
 def _generated_target(entry, root, errors):
@@ -293,17 +374,24 @@ def _source_image_estimate(entry, input_dir, generating, errors):
         return 0
 
 
-def _check_existing_generated_entry(entry, target, errors, missing):
+def _check_existing_generated_entry(entry, target, readiness):
     if not target.is_file():
-        missing.append(entry.key)
+        readiness.missing.append(entry.key)
         return
-    error = validate_content(target, entry.role, planned_key=entry.key)
+    error = validate_content(
+        target,
+        entry.role,
+        planned_key=entry.key,
+        manifest_key_prefix=readiness.manifest_key_prefix,
+        cantaloupe_source_prefix=readiness.cantaloupe_source_prefix,
+        planned_service_keys=readiness.service_keys.get(entry.object_id, []),
+    )
     if error:
         diagnostic = f'{entry.object_id}/{entry.page_id}: {entry.key}: {error}'
         if isinstance(error, PublicUrlFailure):
-            errors.append(PublicUrlFailure(diagnostic))
+            readiness.errors.append(PublicUrlFailure(diagnostic))
         else:
-            errors.append(diagnostic)
+            readiness.errors.append(diagnostic)
 
 
 def _check_output_capacity(root, required_bytes, errors):

@@ -377,6 +377,7 @@ def _read_config_snapshot(path, metadata):
 
 def _manifest_urls(new_keys, config_snapshot, events):
     base = config_snapshot.get('manifest_base_url')
+    prefix = config_snapshot.get('manifest_key_prefix')
     if base is None:
         base = _generate_options(events).get('manifest_base_url')
     try:
@@ -387,7 +388,7 @@ def _manifest_urls(new_keys, config_snapshot, events):
         {
             'bucket': item['bucket'],
             'key': item['key'],
-            'url': join_manifest_url(base, item['key']),
+            'url': join_manifest_url(base, item['key'], prefix),
         }
         for item in new_keys
         if item['role'] == 'manifest'

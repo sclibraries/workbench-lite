@@ -16,8 +16,10 @@ holds, local derivatives, and manifest URLs when a base was recorded with the ru
 Both `manifest_base_url` and `cantaloupe_base_url` are required for
 `generate --manifests`; the full URL rule is in [README Configuration](../README.md#configuration).
 The inventory validates and normalizes that base with the same public URL rule as
-generation, then joins the full planned manifest key; for new runs, each inventory
-URL equals the manifest `@id`. URLs are listed only for confirmed uploads.
+generation, removes the recorded `manifest_key_prefix` at a key boundary when present,
+then joins the remaining planned manifest key. For new runs, each inventory URL equals
+the manifest `@id`; older snapshots without a prefix keep using the full key. URLs are
+listed only for confirmed uploads.
 It also reports `claim_counts` and `retained_claims`; claims are durable registry
 records, not upload-plan entries or rollback candidates.
 Older generated folders may have no recorded generate stage. For those
