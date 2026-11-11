@@ -624,6 +624,7 @@ def _print_rollback_report(report, output_format):
     _print_safe(f'Rollback {report["mode"]}: {report["source_run_id"]}')
     if report.get('rollback_run_id'):
         _print_safe(f'Rollback run: {report["rollback_run_id"]}')
+    _print_publication_guard(report)
     for item in report['results']:
         checksum = item.get('checksum') or 'unavailable'
         _print_safe(
@@ -640,6 +641,19 @@ def _print_rollback_report(report, output_format):
     for note in report['notes']:
         _print_safe(f'  - {note}')
     _print_safe(f'State: {report["state"]}; exit: {report["exit_code"]}')
+
+
+def _print_publication_guard(report):
+    log_error = report.get('publication_log_error')
+    if log_error:
+        _print_safe(f'Publication log problem: {log_error}')
+    for item in report.get('publication_blockers') or []:
+        _print_safe(f'Published file blocks rollback: {item["root"]}/{item["path"]}')
+    if log_error or report.get('publication_blockers'):
+        if report['mode'] == 'preview':
+            _print_safe('Rollback execute would be refused until publication blockers are cleared.')
+        else:
+            _print_safe(report.get('message', 'Rollback execute refused by publication guard.'))
 
 
 def _open_run(args):

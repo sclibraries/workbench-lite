@@ -10,7 +10,7 @@ from uuid import uuid4
 from .config import manifest_publish_dir
 from .locks import WriterLocks
 from .public_urls import join_manifest_url, strip_key_prefix
-from .runs import _push_stage_results, digest, inspect_run, now, read_events
+from .runs import push_stage_results, inspect_run, now, read_events
 
 
 class PublishError(ValueError):
@@ -54,7 +54,7 @@ def _collect_sources(run, generated_dir, config):
     prefix = run_config.get('manifest_key_prefix') or None
     if prefix is not None and not isinstance(prefix, str):
         raise PublishError('The run has an invalid recorded manifest key prefix.')
-    fingerprints = _receipted_fingerprints(_push_stage_results(events))
+    fingerprints = _receipted_fingerprints(push_stage_results(events))
     base = config.get('manifest_base_url')
     if not isinstance(base, str) or not base:
         raise PublishError('Configuration manifest_base_url is required for publication.')
@@ -88,15 +88,15 @@ def _manifest_source(entry, generated_dir, base, prefix, fingerprints):
     key = entry.get('key')
     if fingerprint is None or not isinstance(key, str):
         raise PublishError('A manifest has no verified push fingerprint.')
-    relative = _safe_relative_key(key)
+    source_relative = _safe_relative_key(key)
     url = join_manifest_url(base, key, prefix)
     legacy_url = join_manifest_url(base, key) if prefix else None
-    source = generated_dir / relative
+    source = generated_dir / source_relative
     _verify_source(source, fingerprint, url, legacy_url)
     return {
         'source': source,
         'key': key,
-        'relative': relative,
+        'source_relative': source_relative,
         'prefix': prefix,
         'url': url,
         'legacy_url': legacy_url,
@@ -157,17 +157,19 @@ def _plan_destinations(sources):
     planned = []
     for source in sources:
         try:
-            relative = Path(strip_key_prefix(source['key'], source['prefix']))
+            destination_relative = Path(strip_key_prefix(source['key'], source['prefix']))
         except (KeyError, ValueError) as exc:
             raise PublishError('Manifest key is outside its recorded prefix.') from exc
-        planned.append({**source, 'relative': relative})
+        planned.append({**source, 'destination_relative': destination_relative})
     return planned
 
 
 def _preflight(planned, root):
     ready = []
     for item in planned:
-        status = _destination_status(root, item['relative'], item['sha256'], item['size_bytes'])
+        status = _destination_status(
+            root, item['destination_relative'], item['sha256'], item['size_bytes']
+        )
         ready.append({**item, 'status': status})
     return ready
 
@@ -179,14 +181,30 @@ def _destination_status(root, relative, checksum, size):
     if parent_fd is None:
         return 'created'
     try:
-        info = os.stat(relative.name, dir_fd=parent_fd, follow_symlinks=False)
-    except FileNotFoundError:
-        return 'created'
+        try:
+            fd = os.open(
+                relative.name,
+                os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
+                dir_fd=parent_fd,
+            )
+        except FileNotFoundError:
+            return 'created'
+        except OSError as exc:
+            raise PublishError(
+                f'Manifest destination is not a regular file: {relative.as_posix()}'
+            ) from exc
+        with os.fdopen(fd, 'rb') as handle:
+            info = os.fstat(handle.fileno())
+            if not stat.S_ISREG(info.st_mode):
+                raise PublishError(
+                    f'Manifest destination is not a regular file: {relative.as_posix()}'
+                )
+            data = handle.read()
     finally:
         os.close(parent_fd)
-    if not stat.S_ISREG(info.st_mode):
+    if len(data) != size or not stat.S_ISREG(info.st_mode):
         raise PublishError(f'Manifest destination is not a regular file: {relative.as_posix()}')
-    if info.st_size == size and digest(root / relative) == checksum:
+    if info.st_size == size and hashlib.sha256(data).hexdigest() == checksum:
         return 'unchanged'
     raise PublishError(
         f'Manifest destination already exists with different bytes: {relative.as_posix()}'
@@ -231,6 +249,83 @@ def _open_directory(parent_fd, name, create, flags):
     return os.open(name, flags, dir_fd=parent_fd), created
 
 
+def publication_dependencies(run):
+    records, error = _read_publication_log(Path(run) / 'publication.jsonl')
+    if error or records is None:
+        return [], error
+    blockers, seen, roots = [], set(), set()
+    for root_text, relative in records:
+        root = Path(root_text)
+        if root_text not in roots:
+            try:
+                fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+            except OSError:
+                return [], 'A recorded publication root is not an existing directory.'
+            os.close(fd)
+            roots.add(root_text)
+        try:
+            parent_fd = _open_parent(root, relative, create=False)
+            if parent_fd is None:
+                continue
+            try:
+                os.stat(relative.name, dir_fd=parent_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                continue
+            finally:
+                os.close(parent_fd)
+        except OSError:
+            return [], 'A recorded publication path cannot be checked safely.'
+        identity = root_text, relative.as_posix()
+        if identity not in seen:
+            blockers.append({'root': root_text, 'path': identity[1]})
+            seen.add(identity)
+    return blockers, None
+
+
+def _read_publication_log(path):
+    try:
+        content = path.read_bytes()
+    except FileNotFoundError:
+        return None, None
+    except OSError:
+        return None, 'Publication log is unreadable.'
+    if not content or not content.endswith(b'\n'):
+        return None, 'Publication log is empty or truncated.'
+    records = []
+    for line in content.splitlines(keepends=True):
+        try:
+            event = json.loads(line)
+            root, relative = _publication_record(event)
+        except (UnicodeDecodeError, ValueError, TypeError, OSError, RuntimeError):
+            return None, 'Publication log is malformed.'
+        if root is None:
+            return None, 'A publication record has no root.'
+        if relative is None:
+            return None, 'A publication record has an invalid root or path.'
+        records.append((root, relative))
+    return records, None
+
+
+def _publication_record(event):
+    if not isinstance(event, dict) or event.get('kind') not in {'intent', 'result'}:
+        return None, None
+    root, path = event.get('root'), event.get('path')
+    if not isinstance(root, str) or not root:
+        return None, None
+    if not isinstance(path, str) or not path or '\\' in path or '\x00' in path:
+        return root, None
+    root_path, relative = Path(root), Path(path)
+    if (
+        not root_path.is_absolute()
+        or '..' in root_path.parts
+        or str(root_path.resolve()) != root
+        or relative.is_absolute()
+        or any(part in {'', '.', '..'} for part in path.split('/'))
+    ):
+        return root, None
+    return root, relative
+
+
 def _copy_each(run, preflight, root):
     results = []
     for index, item in enumerate(preflight):
@@ -238,12 +333,12 @@ def _copy_each(run, preflight, root):
         state = {'linked': False}
         status = 'not_written'
         try:
-            _append_event(run, _event('intent', operation, item))
+            _append_event(run, _event('intent', operation, item, root))
             if item['status'] == 'created':
                 status = _copy_item(item, root, state)
             else:
                 status = _check_unchanged(item, root)
-            _append_event(run, _event('result', operation, item, status=status))
+            _append_event(run, _event('result', operation, item, root, status=status))
             results.append(_result(item, status))
         except (OSError, PublishError) as exc:
             status = 'uncertain' if state['linked'] else status
@@ -254,14 +349,15 @@ def _copy_each(run, preflight, root):
 
 
 def _check_unchanged(item, root):
-    status = _destination_status(root, item['relative'], item['sha256'], item['size_bytes'])
+    relative = item['destination_relative']
+    status = _destination_status(root, relative, item['sha256'], item['size_bytes'])
     if status != 'unchanged':
-        raise PublishError(f'Manifest destination changed after preflight: {item["relative"]}')
+        raise PublishError(f'Manifest destination changed after preflight: {relative}')
     return status
 
 
 def _copy_item(item, root, state):
-    directory_fd = _open_parent(root, item['relative'], create=True)
+    directory_fd = _open_parent(root, item['destination_relative'], create=True)
     temporary = None
     try:
         temporary = _stage_file(item, directory_fd)
@@ -281,7 +377,7 @@ def _stage_file(item, directory_fd):
     fingerprint = item['sha256'], item['size_bytes']
     data = _read_verified_source(item['source'], fingerprint)
     _verify_manifest_bytes(data, fingerprint, item['url'], item.get('legacy_url'))
-    name = f'.{item["relative"].name}.{uuid4().hex}.tmp'
+    name = f'.{item["destination_relative"].name}.{uuid4().hex}.tmp'
     created = False
     try:
         fd = os.open(
@@ -311,24 +407,25 @@ def _stage_file(item, directory_fd):
 
 
 def _link_staged(item, root, directory_fd, temporary, state):
-    current_fd = _open_parent(root, item['relative'], create=False)
+    relative = item['destination_relative']
+    current_fd = _open_parent(root, relative, create=False)
     try:
         if current_fd is None or _directory_identity(current_fd) != _directory_identity(
             directory_fd
         ):
             raise PublishError('Manifest destination directory changed after preflight.')
         try:
-            os.stat(item['relative'].name, dir_fd=directory_fd, follow_symlinks=False)
+            os.stat(relative.name, dir_fd=directory_fd, follow_symlinks=False)
         except FileNotFoundError:
             pass
         else:
-            raise PublishError(f'Manifest destination appeared after preflight: {item["relative"]}')
+            raise PublishError(f'Manifest destination appeared after preflight: {relative}')
     finally:
         if current_fd is not None:
             os.close(current_fd)
     os.link(
         temporary,
-        item['relative'].name,
+        relative.name,
         src_dir_fd=directory_fd,
         dst_dir_fd=directory_fd,
         follow_symlinks=False,
@@ -342,11 +439,12 @@ def _directory_identity(fd):
     return info.st_dev, info.st_ino
 
 
-def _event(kind, operation, item, status=None):
+def _event(kind, operation, item, root, status=None):
     event = {
         'kind': kind,
         'operation_id': operation,
-        'path': item['relative'].as_posix(),
+        'root': str(root),
+        'path': item['destination_relative'].as_posix(),
         'sha256': item['sha256'],
         'size_bytes': item['size_bytes'],
         'timestamp': now(),
@@ -400,7 +498,7 @@ def _fsync_directory(path):
 
 def _result(item, status):
     return {
-        'path': item['relative'].as_posix(),
+        'path': item['destination_relative'].as_posix(),
         'status': status,
         'sha256': item['sha256'],
         'size_bytes': item['size_bytes'],

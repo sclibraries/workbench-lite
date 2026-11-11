@@ -14,6 +14,7 @@ from .config import ConfigError, load_config
 from .diagnostics import operation_error
 from .id_claims import reduce_claim_evidence
 from .locks import lock_destination
+from .publish import publication_dependencies
 from .rollback_inventory import build_inventory
 from .runs import (
     JournalError,
@@ -331,6 +332,8 @@ def _report_base(source_path, inventory, mode, rollback_run_id=None):
         'conflict_count': 0,
         'failed_count': 0,
         'results': [],
+        'publication_blockers': [],
+        'publication_log_error': None,
         'exclusions': _exclusions(inventory),
         'notes': [
             'Delete recoverability depends on bucket versioning, which has not been confirmed '
@@ -774,13 +777,26 @@ def run_rollback(run_path, client, *, execute=False, confirm=None, config_path=N
     )
     claim_evidence = reduce_claim_evidence(source_events)
     _validate_rollback_confirmation(inventory, execute, confirm, claim_evidence)
+    locks.acquire('run:' + str(source_path))
     _lock_rollback_targets(locks, source_path, client, inventory)
+    blockers, log_error = publication_dependencies(source_path)
+    report = _report_base(source_path, inventory, 'execute' if execute else 'preview')
+    report['publication_blockers'] = blockers
+    report['publication_log_error'] = log_error
+    if execute and (blockers or log_error):
+        return _refused_publication_rollback(report)
     candidate_keys = {(item['bucket'], item['key']) for item in inventory.get('new_keys') or []}
     used_by = _later_reuse(source_path, source_events, source_config, candidate_keys)
-    report = _report_base(source_path, inventory, 'execute' if execute else 'preview')
     if execute:
         return _execute_rollback(source_path, inventory, client, report, used_by)
     return _preview_rollback(inventory, client, report, used_by)
+
+
+def _refused_publication_rollback(report):
+    report['message'] = 'Rollback refused: published files or publication evidence remain.'
+    report['state'] = 'refused'
+    report['exit_code'] = 3
+    return report
 
 
 def _validate_rollback_confirmation(inventory, execute, confirm, claim_evidence):

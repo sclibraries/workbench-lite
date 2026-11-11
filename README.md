@@ -86,6 +86,9 @@ at least one key character. Invalid prefixes are refused before generation outpu
 push storage setup.
 `check` and `generate` without `--manifests` do not require either setting.
 
+`s3_public_prefix` follows the `s3_prefix` validation rules. It selects the root for public
+content; when absent, public keys keep using `s3_prefix` and retain their existing names.
+
 ## Publishing manifests
 
 Set `manifest_publish_dir` to an absolute, existing local directory served at the configured
@@ -100,13 +103,15 @@ workbench-lite publish-manifests /path/to/RUN_ID \
 ```
 
 The command copies only receipted manifests, verifies their fingerprints and existing `@id`s,
-and creates new local names without replacing files. It appends intent and result records to
-`publication.jsonl` inside the run; the push journal remains unchanged. Matching files from an
-earlier attempt are reported as unchanged on rerun. Rollback does not yet account for published
-manifests, so do not roll back a published run until that protection is available.
+and creates new local names without replacing files. It appends intent and result records,
+including each resolved root and relative path, to `publication.jsonl` inside the run; the push
+journal remains unchanged. Matching files from an earlier attempt are reported as unchanged on
+rerun.
 
-`s3_public_prefix` follows the `s3_prefix` validation rules. It selects the root for public
-content; when absent, public keys keep using `s3_prefix` and retain their existing names.
+Rollback checks every recorded root and path before deleting S3 objects. It refuses while any
+recorded name exists or the publication log cannot be trusted. Review the listed paths, check
+whether a later run of the same batch shares each file, remove the files by hand, then rerun
+rollback. Workbench-lite never removes local published files.
 
 ## S3 layout and ID reservations
 

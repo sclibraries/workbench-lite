@@ -133,6 +133,7 @@ class PublishTests(unittest.TestCase):
         self.assertEqual((self.run / 'events.jsonl').read_bytes(), journal)
         events = [json.loads(line) for line in log.read_text(encoding='utf-8').splitlines()]
         self.assertEqual([event['kind'] for event in events], ['intent', 'result'] * 2)
+        self.assertEqual({event['root'] for event in events}, {str(self.publish_dir.resolve())})
         results = [event for event in events if event['kind'] == 'result']
         self.assertEqual([event['status'] for event in results], ['created', 'created'])
         self.assertEqual(results[0]['path'], 'manifests/parent.json')
@@ -356,7 +357,9 @@ class PublishTests(unittest.TestCase):
                 )
                 self.assertEqual(report['exit_code'], 1)
                 self.assertEqual(report['results'][0]['status'], expected)
-                self.assertEqual((root / item['relative']).exists(), expected == 'uncertain')
+                self.assertEqual(
+                    (root / item['destination_relative']).exists(), expected == 'uncertain'
+                )
                 self.assertFalse(outside_written)
                 self.assertFalse(list(root.rglob('*.tmp')))
                 retry = _copy_each(run, _preflight([item], root), root)
@@ -400,7 +403,7 @@ class PublishTests(unittest.TestCase):
         relative = Path('nested/example.json') if fault == 'parent-swap' else Path('example.json')
         item = {
             'source': source,
-            'relative': relative,
+            'destination_relative': relative,
             'url': 'https://manifests.example.org/example.json',
             'sha256': hashlib.sha256(data).hexdigest(),
             'size_bytes': len(data),

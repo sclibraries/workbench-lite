@@ -11,7 +11,7 @@ report. Publication and recovery limits are described in the linked guides.
 | 0 | Command completed without required failures |
 | 1 | Processing aborted, required upload artifact missing, upload or claim storage/final verification failed, publication copy/evidence failed, or evidence/rollback inventory could not be written |
 | 2 | Invalid arguments, including execute with dummy files or without a required generated directory; publish confirmation flags must match the run directory name |
-| 3 | Input/configuration validation errors, invalid manifests or public manifest URLs, a package ID claim conflict, or a held run/source/destination for manifest publication |
+| 3 | Input/configuration validation errors, invalid manifests or public manifest URLs, a package ID claim conflict, a held run/source/destination for manifest publication, or rollback refused by remaining published files or unsafe publication evidence |
 | 4 | Generation or URL verification completed independent work with failures |
 | 130 / 143 | SIGINT / SIGTERM; an interruption event is recorded when storage permits |
 

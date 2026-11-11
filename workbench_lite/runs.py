@@ -230,7 +230,7 @@ def _valid_publication_receipt(path, events, receipt):
         if not _verified_claims_match_plan(path, receipt):
             return False
         plan = json.loads(plan_path.read_text())['entries']
-        results = _push_stage_results(events)
+        results = push_stage_results(events)
         expected = {(entry['bucket'], entry['key']) for entry in plan}
         destinations = _destination_statuses(results, expected)
         if destinations is None:
@@ -283,7 +283,7 @@ def _verified_claims_match_plan(path, receipt):
     return len(observed) == len(claims) and observed == expected_rows
 
 
-def _push_stage_results(events):
+def push_stage_results(events):
     start = max(
         index
         for index, event in enumerate(events)

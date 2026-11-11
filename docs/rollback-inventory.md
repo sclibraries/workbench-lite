@@ -116,6 +116,20 @@ local run journals and leaves keys reused by a later run as conflicts. Journals 
 other machines cannot be seen, so that dependency scan is local to the configured
 run root.
 
+Before deleting S3 objects, rollback checks the source run's `publication.jsonl`.
+Every intent or result record contributes its recorded `root` and relative `path`.
+Any existing name there—including a regular file, directory, or symlink—blocks
+execute and appears in the preview report. A missing log or names that are all absent
+does not block rollback. An unreadable, malformed or truncated log, a record without
+`root`, or a root that is not an existing directory blocks rollback as unsafe evidence.
+The guard uses only roots recorded in the log, not the current configuration.
+
+Review each listed path and check whether a later run of the same batch shares the
+file before removing it manually. After the published files are gone, rerun rollback.
+No command removes local published files. Rollback acquires the run lock before its
+rollback-source and destination locks, then checks publication evidence before it
+creates or appends a rollback journal or writes a source hold.
+
 Immediately before each delete, the command reads the current S3 `FULL_OBJECT`
 SHA-256 and size. Both must match the confirmed write evidence. A mismatch is a
 conflict and the object stays. If the object is absent, the result is

@@ -255,6 +255,176 @@ class RollbackCommandTests(unittest.TestCase):
             payload = None
         return code, payload, output.getvalue(), error.getvalue()
 
+    def _record_published_file(self, case=None):
+        root = self.root / f'web-{case or "published"}'
+        target = root / 'manifests' / 'package.json'
+        target.parent.mkdir(parents=True)
+        target.write_text('{"@id":"https://manifests.example.org/package.json"}')
+        records = []
+        for kind in ('intent', 'result'):
+            record = {
+                'kind': kind,
+                'operation_id': 'synthetic-publication',
+                'root': str(root.resolve()),
+                'path': 'manifests/package.json',
+                'sha256': hashlib.sha256(target.read_bytes()).hexdigest(),
+                'size_bytes': target.stat().st_size,
+                'timestamp': '2026-01-01T00:00:00+00:00',
+            }
+            if case == 'missing-root' and kind == 'intent':
+                record.pop('root')
+            records.append(json.dumps(record))
+        log = self.run.path / 'publication.jsonl'
+        if case == 'damaged-log':
+            log.write_text(records[0])
+        elif case == 'unreadable-log':
+            log.mkdir()
+        else:
+            log.write_text('\n'.join(records) + '\n')
+        if case == 'missing-root-directory':
+            root.rename(root.with_name(root.name + '-moved'))
+        elif case == 'symlink':
+            target.unlink()
+            target.symlink_to(root / 'missing-target')
+        elif case == 'directory':
+            target.unlink()
+            target.mkdir()
+        return root, target, log
+
+    def _create_published_rollback_fixture(self):
+        from test_publish import PublishTests
+
+        publisher = PublishTests()
+        with patch.dict(
+            'os.environ',
+            {'AWS_ENDPOINT_URL': ENDPOINT, 'AWS_DEFAULT_REGION': 'us-east-1'},
+        ):
+            publisher.setUp()
+            self.addCleanup(publisher.doCleanups)
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(publisher.publish('--execute', '--confirm', publisher.run.name), 0)
+        client = MemoryS3()
+        client.objects.clear()
+        plan = json.loads((publisher.run / 'upload-plan.json').read_text())['entries']
+        for entry in plan:
+            body = publisher.storage.written.get(entry['key'])
+            if body is not None:
+                client.objects[(entry['bucket'], entry['key'])] = {
+                    'checksum': hashlib.sha256(body).hexdigest(),
+                    'size_bytes': len(body),
+                    'checksum_type': 'FULL_OBJECT',
+                    'etag': '"published-run-etag"',
+                }
+        return publisher, client
+
+    def _remove_published_files(self, root, blockers):
+        for item in blockers:
+            (root / item['path']).unlink()
+
+    def test_published_file_blocks_rollback_until_manually_removed(self):
+        publisher, client = self._create_published_rollback_fixture()
+        root = publisher.publish_dir.resolve()
+        options = {'source': publisher.run, 'config': publisher.config}
+        preview_code, preview, _, _ = self.run_cli(client, **options)
+        self.assertEqual(preview_code, 0)
+        self.assertEqual({item['root'] for item in preview['publication_blockers']}, {str(root)})
+        self.assertEqual(len(preview['publication_blockers']), 2)
+        self.assertIsNone(preview['publication_log_error'])
+        text_code, _, preview_text, _ = self.run_cli(client, '--format', 'text', **options)
+        self.assertEqual(text_code, 0)
+        self.assertIn(str(root / 'manifests' / 'parent.json'), preview_text)
+        self.assertIn('execute would be refused', preview_text)
+        blocked_code, blocked, _, _ = self.run_cli(
+            client, '--execute', '--confirm', publisher.run.name, **options
+        )
+        self.assertEqual(blocked_code, 3)
+        self.assertEqual(blocked['publication_blockers'], preview['publication_blockers'])
+        self.assertEqual(client.deletes, [])
+        self.assertFalse((publisher.run / 'rollback-hold.json').exists())
+        self.assertFalse((publisher.run / 'rollback.jsonl').exists())
+        self._remove_published_files(root, blocked['publication_blockers'])
+        allowed_code, allowed, _, _ = self.run_cli(
+            client, '--execute', '--confirm', publisher.run.name, **options
+        )
+        self.assertEqual(allowed_code, 0)
+        self.assertEqual(allowed['publication_blockers'], [])
+        self.assertEqual(allowed['publication_log_error'], None)
+        self.assertTrue(client.deletes)
+
+    def test_publication_refusal_leaves_existing_rollback_evidence_untouched(self):
+        client = MemoryS3()
+        self.assertEqual(self.run_cli(client, '--execute', '--confirm', self.run.run_id)[0], 0)
+        rollback_journal = next(
+            path for path in self.runs.iterdir() if (path / 'rollback-source.json').exists()
+        )
+        journal_before = (rollback_journal / 'events.jsonl').read_bytes()
+        hold_before = (self.run.path / 'rollback-hold.json').read_bytes()
+        root, target, _ = self._record_published_file()
+        target.unlink()
+        target.write_text('{"@id":"https://manifests.example.org/package.json"}')
+        client.objects[(BUCKET, KEY)] = {
+            'checksum': CHECKSUM,
+            'size_bytes': len(BODY),
+            'checksum_type': 'FULL_OBJECT',
+            'etag': '"probe-etag"',
+        }
+        deletes_before = list(client.deletes)
+        held_code, held, _, _ = self.run_cli(client, '--execute', '--confirm', self.run.run_id)
+        self.assertEqual(held_code, 3)
+        self.assertEqual(
+            held['publication_blockers'],
+            [{'root': str(root.resolve()), 'path': 'manifests/package.json'}],
+        )
+        self.assertEqual(client.deletes, deletes_before)
+        self.assertEqual((rollback_journal / 'events.jsonl').read_bytes(), journal_before)
+        self.assertEqual((self.run.path / 'rollback-hold.json').read_bytes(), hold_before)
+
+    def test_publication_evidence_and_name_blockers_are_parameterized(self):
+        for case in (
+            'damaged-log',
+            'unreadable-log',
+            'missing-root',
+            'missing-root-directory',
+            'file',
+            'symlink',
+            'directory',
+        ):
+            with self.subTest(case=case):
+                self._assert_publication_case_blocked(case)
+
+    def _assert_publication_case_blocked(self, case):
+        root, _, log = self._record_published_file(case)
+        client = MemoryS3()
+        code, report, _, _ = self.run_cli(client, '--execute', '--confirm', self.run.run_id)
+        self.assertEqual(code, 3)
+        self.assertEqual(client.inspections, [])
+        self.assertEqual(client.deletes, [])
+        if case in {'damaged-log', 'unreadable-log', 'missing-root', 'missing-root-directory'}:
+            self.assertTrue(report['publication_log_error'])
+            self.assertEqual(report['publication_blockers'], [])
+        else:
+            self.assertIsNone(report['publication_log_error'])
+            self.assertEqual(
+                report['publication_blockers'],
+                [{'root': str(root.resolve()), 'path': 'manifests/package.json'}],
+            )
+        self._clean_publication_case(case, root, log)
+
+    def _clean_publication_case(self, case, root, log):
+        if case == 'unreadable-log':
+            log.rmdir()
+        else:
+            log.unlink()
+        if case == 'missing-root-directory':
+            root.with_name(root.name + '-moved').rename(root)
+        target = root / 'manifests' / 'package.json'
+        if case == 'directory':
+            target.rmdir()
+        else:
+            target.unlink(missing_ok=True)
+        (root / 'manifests').rmdir()
+        root.rmdir()
+
     def make_preview_run(self):
         run = RunJournal.create(self.runs)
         config = self.root / 'preview.yml'
@@ -558,6 +728,20 @@ class RollbackCommandTests(unittest.TestCase):
         self.assertTrue({UNCHANGED_KEY, HELD_KEY, CONFLICT_KEY}.issubset(excluded_keys))
         self.assertEqual(client.deletes, [])
         self.assertIn((BUCKET, KEY), client.inspections)
+
+    def test_rollback_contends_with_the_shared_run_lock(self):
+        lock_root = self.root / 'locks'
+        lock_root.mkdir(mode=0o700)
+        client = MemoryS3()
+        with WriterLocks(lock_root) as held:
+            held.acquire('run:' + str(self.run.path.resolve()))
+            code, report, output, _ = self.run_cli(client)
+
+        self.assertEqual(code, 1)
+        self.assertIn('Writer lock is held', report['errors'][0])
+        self.assertIn('Writer lock is held', output)
+        self.assertEqual(client.inspections, [])
+        self.assertEqual(client.deletes, [])
 
     def test_execute_deletes_matching_new_key_and_permanently_holds_source(self):
         client = MemoryS3()

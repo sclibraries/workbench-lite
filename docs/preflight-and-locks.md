@@ -76,6 +76,12 @@ Acquisition order is generated-output directory, attached run, then sorted desti
 
 Destination locks include endpoint, bucket and prefix. A conservative bucket-name guard additionally serializes different prefixes, overlapping prefixes and endpoint aliases—even independent test endpoints with the same bucket name. This trades concurrency for predictable exclusion on the supported single host. The run/output locks separately prevent two destinations from appending to one journal.
 
+Rollback validates its source and confirmation, then acquires `run:` for the resolved source
+path, `rollback-source:` for that path, and sorted destination locks, in that order. Under those
+locks it checks the run's publication log before creating or appending a rollback journal or
+writing a source hold. This excludes publication of the same run while rollback is being checked
+or executed.
+
 Acquisition uses atomic directory creation. A competing process is rejected immediately. `owner.json` records hostname, UID, PID, creation time, a random ownership token and hashed lock identity. No input metadata or credential-bearing destination is written there. A partial acquisition releases only locks this invocation owns.
 
 ## Stale-lock recovery
