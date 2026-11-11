@@ -31,6 +31,7 @@ from .preflight import is_public_url_failure, output_readiness, storage_readines
 from .public_urls import normalize_public_base_url
 from .rollback_inventory import build_inventory, write_inventory
 from .rollback import run_rollback
+from .publish import PublishError, publish_manifests
 from .storage_plan import DEFAULT_PRIVATE_BUCKET, DEFAULT_PUBLIC_BUCKET
 from .id_claims import build_id_claims, reconcile_claim
 
@@ -55,6 +56,7 @@ def _build_parser():
         _add_verify_parser(subparsers),
     ]
     _add_run_management_parsers(subparsers)
+    _add_publish_parser(subparsers)
     for command_parser in package_parsers:
         command_parser.add_argument('--run-dir', type=Path, default=Path('workbench-lite-runs'))
     return parser
@@ -185,6 +187,18 @@ def _add_run_management_parsers(subparsers):
     rollback_parser.add_argument('--format', choices=['text', 'json'], default='text')
 
 
+def _add_publish_parser(subparsers):
+    parser = subparsers.add_parser(
+        'publish-manifests', help='Preview or publish receipted manifests to a local directory'
+    )
+    parser.add_argument('path', type=Path, help='Completed push run directory')
+    parser.add_argument('--config', required=True, type=Path)
+    parser.add_argument('--generated-dir', required=True, type=Path)
+    parser.add_argument('--execute', action='store_true')
+    parser.add_argument('--confirm', help='Run ID required with --execute')
+    parser.add_argument('--format', choices=['text', 'json'], default='text')
+
+
 def _validate_cli_args(args, parser):
     if args.command == 'push':
         if args.offline and args.execute:
@@ -199,9 +213,20 @@ def _validate_cli_args(args, parser):
             parser.error('push accepts only one of --dry-run or --execute')
         if not args.dry_run and not args.execute:
             parser.error('push currently requires --dry-run or --execute')
+    if args.command == 'publish-manifests':
+        _validate_publish_args(args, parser)
+
+
+def _validate_publish_args(args, parser):
+    if args.execute and args.confirm != args.path.name:
+        parser.error('--execute requires --confirm matching the run directory name.')
+    if args.confirm and not args.execute:
+        parser.error('--confirm is valid only with --execute.')
 
 
 def _run_early_command(args, lock_factory):
+    if args.command == 'publish-manifests':
+        return _run_publish_command(args, lock_factory)
     if args.command == 'inspect-run':
         return _run_inspect_command(args)
     if args.command == 'reconcile':
@@ -212,6 +237,31 @@ def _run_early_command(args, lock_factory):
         return _run_rollback_command(args, lock_factory)
 
     return None
+
+
+def _run_publish_command(args, lock_factory):
+    try:
+        config = load_config(args.config)
+        report = publish_manifests(
+            args.path,
+            args.generated_dir,
+            config,
+            execute=args.execute,
+            lock_factory=lock_factory,
+        )
+    except (ConfigError, PublishError, OSError, ValueError) as exc:
+        _print_error(args, str(exc), validation=True)
+        return 3
+    except LockError as exc:
+        _print_error(args, str(exc))
+        return 1
+    if args.format == 'json':
+        print(json.dumps(sanitize(report), indent=2))
+    else:
+        _print_safe(report['message'])
+        for item in report['results']:
+            _print_safe(f'  {item["status"]}: {item["path"]} [{item["sha256"]}]')
+    return report['exit_code']
 
 
 def _run_inspect_command(args):

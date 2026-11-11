@@ -9,9 +9,9 @@ report. Publication and recovery limits are described in the linked guides.
 | Code | Meaning |
 | --- | --- |
 | 0 | Command completed without required failures |
-| 1 | Processing aborted, required upload artifact missing, upload or claim storage/final verification failed, or evidence/rollback inventory could not be written |
-| 2 | Invalid arguments, including execute with dummy files or without a required generated directory |
-| 3 | Input/configuration validation errors, invalid manifests or public manifest URLs, or a package ID claim conflict |
+| 1 | Processing aborted, required upload artifact missing, upload or claim storage/final verification failed, publication copy/evidence failed, or evidence/rollback inventory could not be written |
+| 2 | Invalid arguments, including execute with dummy files or without a required generated directory; publish confirmation flags must match the run directory name |
+| 3 | Input/configuration validation errors, invalid manifests or public manifest URLs, a package ID claim conflict, or a held run/source/destination for manifest publication |
 | 4 | Generation or URL verification completed independent work with failures |
 | 130 / 143 | SIGINT / SIGTERM; an interruption event is recorded when storage permits |
 
@@ -34,6 +34,15 @@ from YAML or their flags. A YAML value takes precedence, including an empty valu
 supplies a missing setting. Both bases are checked before anything in the generated directory
 is changed, and both must satisfy the public URL rule in [README Configuration](../README.md#configuration).
 `check` and `generate` without `--manifests` do not need either setting.
+
+`publish-manifests RUN_PATH --config YAML --generated-dir DIR` previews by default and creates no
+publication log. `--execute` requires `--confirm` equal to the run directory name; a missing or
+mismatched confirmation exits 2 before run evidence is read. A successful publish writes separate
+intent/result records to `publication.jsonl`, leaving `events.jsonl` unchanged. A held receipt,
+changed or unavailable generated manifest, mismatched `@id`, or conflicting local destination exits
+3 before publication writes. A copy or evidence failure stops the batch with exit 1 and reports
+created, unchanged, not-written and uncertain destinations. Rollback does not yet account for this
+log; do not roll back a published run until publication-state protection is available.
 
 Before local readiness completes, push validates every planned manifest's `@id` against its
 encoded planned S3 key and validates each image service `@id` as one encoded image-key segment

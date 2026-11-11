@@ -1,5 +1,6 @@
 from pathlib import Path
 import re
+import stat
 from typing import Dict
 import unicodedata
 
@@ -41,6 +42,21 @@ def load_config(config_path: Path) -> Dict[str, object]:
     if not isinstance(loaded, dict):
         raise ConfigError('Workbench-lite config must be a YAML mapping.')
     return _validate_config(loaded)
+
+
+def manifest_publish_dir(config: Dict[str, object]) -> Path:
+    value = config.get('manifest_publish_dir')
+    if not isinstance(value, str) or not Path(value).is_absolute():
+        raise ConfigError('Configuration manifest_publish_dir must be an absolute directory.')
+    try:
+        path = Path(value).resolve(strict=True)
+        if not stat.S_ISDIR(path.stat().st_mode):
+            raise ConfigError('Configuration manifest_publish_dir must be an existing directory.')
+    except OSError as exc:
+        raise ConfigError(
+            'Configuration manifest_publish_dir must be an existing directory.'
+        ) from exc
+    return path
 
 
 def _validate_config(config: Dict[str, object]) -> Dict[str, object]:

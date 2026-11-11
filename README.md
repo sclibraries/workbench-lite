@@ -59,6 +59,7 @@ batch_id: example-batch
 | `manifest_base_url` | Required for `generate --manifests`; public base for manifest identifiers. |
 | `cantaloupe_base_url` | Required for `generate --manifests`; public base for IIIF image services. |
 | `manifest_key_prefix` | Optional relative S3 key prefix removed from manifest identifiers; omit or leave empty to keep the full key. |
+| `manifest_publish_dir` | Existing absolute local directory served at `manifest_base_url`; read only by `publish-manifests`. |
 | `cantaloupe_source_prefix` | Optional relative S3 key prefix removed from image service identifiers; omit or leave empty to keep the full key. |
 | `s3_private_bucket` | Bucket for master TIFFs, service JPGs, audit files and ID claims. |
 | `s3_public_bucket` | Bucket for PDFs, hOCR, thumbnails and manifests. |
@@ -66,9 +67,9 @@ batch_id: example-batch
 | `s3_public_prefix` | Optional public content root; defaults to `s3_prefix`. |
 | `batch_id` | Safe path segment for the package; defaults to the YAML filename without its extension. |
 
-Set both destination buckets explicitly for the environment before an execute run. AWS credentials
-come from the selected AWS profile or the standard AWS credential chain; do not put
-credentials in the YAML file.
+The public bucket defaults to `islandora-derivatives`. Set both destination buckets explicitly
+for the environment before an execute run. AWS credentials come from the selected AWS profile or
+the standard AWS credential chain; do not put credentials in the YAML file.
 
 For `generate --manifests`, both URL bases must be absolute HTTPS URLs, or HTTP URLs
 whose host is exactly `localhost`, `127.0.0.1` or `[::1]`. Bases cannot contain
@@ -84,6 +85,25 @@ is removed. Each planned key must begin with its configured prefix followed by `
 at least one key character. Invalid prefixes are refused before generation output or
 push storage setup.
 `check` and `generate` without `--manifests` do not require either setting.
+
+## Publishing manifests
+
+Set `manifest_publish_dir` to an absolute, existing local directory served at the configured
+`manifest_base_url`. Preview is the default and writes neither files nor publication evidence.
+After a push has a verified receipt, execute with the run directory name as confirmation:
+
+```sh
+workbench-lite publish-manifests /path/to/RUN_ID \
+  --config package.yml --generated-dir generated
+workbench-lite publish-manifests /path/to/RUN_ID \
+  --config package.yml --generated-dir generated --execute --confirm RUN_ID
+```
+
+The command copies only receipted manifests, verifies their fingerprints and existing `@id`s,
+and creates new local names without replacing files. It appends intent and result records to
+`publication.jsonl` inside the run; the push journal remains unchanged. Matching files from an
+earlier attempt are reported as unchanged on rerun. Rollback does not yet account for published
+manifests, so do not roll back a published run until that protection is available.
 
 `s3_public_prefix` follows the `s3_prefix` validation rules. It selects the root for public
 content; when absent, public keys keep using `s3_prefix` and retain their existing names.
