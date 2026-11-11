@@ -17,6 +17,7 @@ from rehearsal_harness import (
     SCENARIOS_BY_NUMBER,
     FaultClient,
     invoke_cli,
+    resolve_claim_prefix,
     start_worker,
 )
 from rehearsal_scenarios import SCENARIO_RUNNERS, ScenarioMismatch
@@ -295,7 +296,7 @@ class ScenarioRunner:
             fault=fault,
             ready_file=ready,
             hold_barrier=True,
-            claim_prefix=claim_prefix,
+            claim_prefix=resolve_claim_prefix(claim_prefix),
         )
         deadline = time.monotonic() + 60
         while time.monotonic() < deadline and process.poll() is None and not ready.exists():

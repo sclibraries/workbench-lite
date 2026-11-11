@@ -63,6 +63,7 @@ def _validate_string_settings(config):
         's3_private_bucket',
         's3_public_bucket',
         's3_prefix',
+        's3_public_prefix',
         'batch_id',
         'cantaloupe_source_prefix',
         'manifest_key_prefix',
@@ -77,7 +78,7 @@ def _validate_boolean_settings(config):
 
 
 def _validate_key_segments(config):
-    for name in ('s3_prefix', 'batch_id'):
+    for name in ('s3_prefix', 's3_public_prefix', 'batch_id'):
         if name in config:
             value = config[name]
             if (

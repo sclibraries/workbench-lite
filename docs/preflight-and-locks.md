@@ -22,11 +22,16 @@ Before generation, output targets are checked for containment, directory/file co
 Push now performs bounded read-only preflight by default for both dry-run and execute. It uses a dedicated read-only preflight client with the same endpoint, region and profile selection as the upload client, and records:
 
 - Actual endpoint, intended buckets and scoped prefixes.
-- HeadBucket followed by ListObjectsV2 with `MaxKeys=1` per bucket.
+- HeadBucket per bucket followed by ListObjectsV2 with `MaxKeys=1` per content prefix.
 - Durable intent/result records for those calls and safe error codes on failure.
 - Read-access status and **write permission: unverified**.
 
 Only the preflight client uses five-second connect/read timeouts and one total SDK attempt. Execute creates a separate upload client after successful preflight with 10-second connect and 60-second read timeouts and one total SDK attempt. Application retries are limited to three attempts per entry and a five-minute run-wide wait budget; see [publication holds](publication-holds.md) for retry classification and reconciliation behavior. Dry runs create no upload client. No PutObject probe, delete, ACL update or other remote mutation is used to test permissions. Bucket access checks do not prove PutObject permission or authorize replacement. Before execute, every planned key is checked: matching existing content is verified by SHA-256 and size then skipped; changed content is rejected; a differing manifest is held for review. New writes use conditional creation. See [publication holds](publication-holds.md).
+
+When one bucket contains both private and public content, preflight lists each distinct
+content prefix separately. Claim reads use `{s3_prefix}/_ids/` in the private bucket and
+are reported under `claim_check`, separately from content access. Both checks remain
+read-only; list requests sample at most one object.
 
 After local readiness and all existing destination blockers pass, push reads the claim key for
 each validated object and page ID in canonical order from the private bucket at

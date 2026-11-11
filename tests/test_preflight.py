@@ -124,6 +124,8 @@ class PreflightTests(unittest.TestCase):
         for setting in [
             'additional_files: bad',
             's3_prefix: a/../b',
+            's3_public_prefix: 3',
+            's3_public_prefix: a/../b',
             'batch_id: ..',
             's3_private_bucket: INVALID_BUCKET',
             'input_dir: .\ninput_dir: elsewhere',
@@ -144,10 +146,12 @@ class PreflightTests(unittest.TestCase):
             'input_csv: input.csv\n'
             'cantaloupe_source_prefix: images/\n'
             'manifest_key_prefix: manifests/\n'
+            's3_public_prefix: public/\n'
         )
         config = load_config(self.config)
         self.assertEqual(config['cantaloupe_source_prefix'], 'images')
         self.assertEqual(config['manifest_key_prefix'], 'manifests')
+        self.assertEqual(config['s3_public_prefix'], 'public/')
 
     def test_output_escape_and_low_disk_are_blocking(self):
         from workbench_lite.preflight import output_readiness
@@ -224,6 +228,14 @@ class PreflightTests(unittest.TestCase):
                 return {'KeyCount': 0}
 
         reader = Reader()
+        self.config.write_text(
+            self.config.read_text(encoding='utf-8')
+            + 's3_private_bucket: wbl-local-test-shared\n'
+            + 's3_public_bucket: wbl-local-test-shared\n'
+            + 's3_prefix: private-zone\n'
+            + 's3_public_prefix: public-zone\n',
+            encoding='utf-8',
+        )
         out = io.StringIO()
         with (
             patch('workbench_lite.cli.create_s3_client', return_value=reader),
@@ -242,13 +254,20 @@ class PreflightTests(unittest.TestCase):
                 ]
             )
         self.assertEqual(result, 0)
-        self.assertEqual(len(reader.reads), 4)
+        self.assertEqual(len(reader.reads), 3)
+        list_prefixes = {
+            parameters['Prefix'] for operation, parameters in reader.reads if operation == 'list'
+        }
+        self.assertEqual(list_prefixes, {'private-zone/sample/', 'public-zone/sample/'})
+        self.assertNotIn('', list_prefixes)
         self.assertEqual(reader.calls, [])
         report = json.loads(out.getvalue())
         self.assertEqual(report['preflight']['storage']['write_permission'], 'unverified')
         self.assertEqual(
             report['preflight']['storage']['credential_access'], 'read_access_verified'
         )
+        self.assertEqual(len(report['preflight']['storage']['targets']), 2)
+        self.assertEqual(report['preflight']['claim_check']['status'], 'checked')
 
     def test_cli_access_denial_blocks_uploads_and_offline_never_creates_client(self):
         import contextlib

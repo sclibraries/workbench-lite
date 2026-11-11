@@ -530,6 +530,7 @@ class PublicationTests(unittest.TestCase):
             'rollback_hold',
             'endpoint',
             'buckets',
+            'public_prefix',
             'reference',
         )
         for case in refusal_cases:
@@ -562,6 +563,7 @@ class PublicationTests(unittest.TestCase):
             'rollback_hold': self._add_rollback_hold,
             'endpoint': self._change_endpoint_evidence,
             'buckets': self._change_bucket_evidence,
+            'public_prefix': self._change_public_prefix_evidence,
             'reference': self._remove_run_reference,
         }
         return changes[case]()
@@ -602,6 +604,10 @@ class PublicationTests(unittest.TestCase):
 
     def _change_bucket_evidence(self):
         self.config.write_text(self.config.read_text() + 's3_private_bucket: other-bucket\n')
+        return 'http://s3.test'
+
+    def _change_public_prefix_evidence(self):
+        self.config.write_text(self.config.read_text() + 's3_public_prefix: public-zone\n')
         return 'http://s3.test'
 
     def _remove_run_reference(self):

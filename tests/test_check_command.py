@@ -137,19 +137,24 @@ class CheckCommandTest(unittest.TestCase):
             'title,id,field_model,parent_id,field_weight,file,hocr\n'
             'Parent,obj one,Paged Content,,,A one.pdf,\n'
             'Parent,obj/one,Paged Content,,,A_one.pdf,\n',
+            config_text=(
+                'input_dir: .\ninput_csv: input.csv\n'
+                's3_private_bucket: wbl-local-test-private\n'
+                's3_public_bucket: wbl-local-test-public\n'
+            ),
             allow_dummy_files=True,
         )
 
         self.assertEqual(len(report.validation_errors), 2)
         self.assertIn(
-            "Upload plan collision for bucket 'compass-prod-i2-files', "
+            "Upload plan collision for bucket 'wbl-local-test-public', "
             "key 'workbench-lite/package/originals/obj_one/A_one.pdf': "
             'role=pdf, object_id=obj/one, page_id=; collides with role=pdf, '
             'object_id=obj one, page_id=.',
             report.validation_errors,
         )
         self.assertIn(
-            "Upload plan collision for bucket 'islandora-derivatives', "
+            "Upload plan collision for bucket 'wbl-local-test-public', "
             "key 'workbench-lite/package/manifests/obj_one.json': "
             'role=manifest, object_id=obj/one, page_id=; collides with role=manifest, '
             'object_id=obj one, page_id=.',
@@ -220,78 +225,93 @@ class CheckCommandTest(unittest.TestCase):
         self.assertEqual(first_object.pages[-1].weight, 2)
 
     def test_run_check_builds_deterministic_upload_plan_for_synthetic_package(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            legacy_plan = self._upload_plan_for_layout(temp_dir, None)
+            split_plan = self._upload_plan_for_layout(temp_dir, 'public-zone')
+        self._assert_upload_role_matrix(legacy_plan, None)
+        self._assert_upload_role_matrix(split_plan, 'public-zone')
+        self._assert_legacy_upload_keys(legacy_plan)
+
+    def _upload_plan_for_layout(self, directory, public_prefix):
         from workbench_lite.check import run_check
 
-        report = run_check(
-            config_path=CONFIG_PATH,
+        config_path = Path(directory) / (public_prefix or 'legacy')
+        config_path.write_text(
+            CONFIG_PATH.read_text(encoding='utf-8')
+            + 's3_private_bucket: wbl-local-test-private\n'
+            + 's3_public_bucket: wbl-local-test-public\n'
+            + 'batch_id: synthetic_package\n'
+            + (f's3_public_prefix: {public_prefix}\n' if public_prefix else ''),
+            encoding='utf-8',
+        )
+        return run_check(
+            config_path=config_path,
             input_csv_override=CSV_PATH,
             allow_dummy_files=True,
             run_id='test-run-synthetic',
-        )
+        ).upload_plan
 
-        role_counts = Counter(entry.role for entry in report.upload_plan)
-        self.assertEqual(role_counts['pdf'], 2)
-        self.assertEqual(role_counts['master_tiff'], 3)
-        self.assertEqual(role_counts['hocr'], 3)
-        self.assertEqual(role_counts['service_jpg'], 3)
-        self.assertEqual(role_counts['thumbnail'], 3)
-        self.assertEqual(role_counts['manifest'], 2)
-        self.assertEqual(role_counts['audit'], 1)
-
-        pdf_entry = next(entry for entry in report.upload_plan if entry.role == 'pdf')
-        self.assertEqual(pdf_entry.bucket, 'compass-prod-i2-files')
+    def _assert_legacy_upload_keys(self, plan):
         self.assertEqual(
-            pdf_entry.key,
-            'workbench-lite/synthetic_package/originals/collection-north/north-star.pdf',
+            Counter(entry.role for entry in plan),
+            Counter(
+                {
+                    'pdf': 2,
+                    'master_tiff': 3,
+                    'hocr': 3,
+                    'service_jpg': 3,
+                    'thumbnail': 3,
+                    'manifest': 2,
+                    'audit': 1,
+                }
+            ),
         )
-        self.assertFalse(pdf_entry.public)
-        self.assertFalse(pdf_entry.generated)
+        entries = {(entry.role, entry.object_id, entry.page_id): entry for entry in plan}
+        expected_keys = {
+            ('pdf', 'collection-north', ''): (
+                'workbench-lite/synthetic_package/originals/collection-north/north-star.pdf'
+            ),
+            ('master_tiff', 'collection-north', 'north-page-001'): (
+                'workbench-lite/synthetic_package/originals/collection-north/pages/north-page-001.tif'
+            ),
+            ('hocr', 'collection-north', 'north-page-001'): (
+                'workbench-lite/synthetic_package/ocr/collection-north/north-page-001.html'
+            ),
+            ('service_jpg', 'collection-north', 'north-page-001'): (
+                'workbench-lite/synthetic_package/derivatives/'
+                'collection-north/pages/north-page-001/service.jpg'
+            ),
+            ('manifest', 'collection-north', ''): (
+                'workbench-lite/synthetic_package/manifests/collection-north.json'
+            ),
+            ('audit', '', ''): (
+                'workbench-lite/synthetic_package/audit/test-run-synthetic/upload-plan.json'
+            ),
+        }
+        for identity, key in expected_keys.items():
+            self.assertEqual(entries[identity].key, key)
+        self.assertFalse(entries['pdf', 'collection-north', ''].generated)
+        self.assertTrue(entries['service_jpg', 'collection-north', 'north-page-001'].generated)
 
-        first_page_id = 'north-page-001'
-        first_page_tiff = next(
-            entry
-            for entry in report.upload_plan
-            if entry.role == 'master_tiff' and entry.page_id == first_page_id
-        )
-        self.assertEqual(
-            first_page_tiff.key,
-            'workbench-lite/synthetic_package/originals/collection-north/pages/north-page-001.tif',
-        )
-
-        first_page_hocr = next(
-            entry
-            for entry in report.upload_plan
-            if entry.role == 'hocr' and entry.page_id == first_page_id
-        )
-        self.assertEqual(
-            first_page_hocr.key,
-            'workbench-lite/synthetic_package/ocr/collection-north/north-page-001.html',
-        )
-        self.assertTrue(first_page_hocr.public)
-
-        first_service_jpg = next(
-            entry
-            for entry in report.upload_plan
-            if entry.role == 'service_jpg' and entry.page_id == first_page_id
-        )
-        self.assertEqual(
-            first_service_jpg.key,
-            'workbench-lite/synthetic_package/derivatives/'
-            'collection-north/pages/north-page-001/service.jpg',
-        )
-        self.assertTrue(first_service_jpg.generated)
-
-        manifest_entry = next(entry for entry in report.upload_plan if entry.role == 'manifest')
-        self.assertEqual(
-            manifest_entry.key,
-            'workbench-lite/synthetic_package/manifests/collection-north.json',
-        )
-
-        audit_entry = next(entry for entry in report.upload_plan if entry.role == 'audit')
-        self.assertEqual(
-            audit_entry.key,
-            'workbench-lite/synthetic_package/audit/test-run-synthetic/upload-plan.json',
-        )
+    def _assert_upload_role_matrix(self, plan, public_prefix):
+        role_targets = {
+            'pdf': ('wbl-local-test-public', True),
+            'master_tiff': ('wbl-local-test-private', False),
+            'hocr': ('wbl-local-test-public', True),
+            'service_jpg': ('wbl-local-test-private', False),
+            'thumbnail': ('wbl-local-test-public', True),
+            'manifest': ('wbl-local-test-public', True),
+            'audit': ('wbl-local-test-private', False),
+        }
+        for entry in plan:
+            bucket, is_public = role_targets[entry.role]
+            self.assertEqual((entry.bucket, entry.public), (bucket, is_public))
+            expected_prefix = (
+                'public-zone/synthetic_package/'
+                if public_prefix and is_public
+                else 'workbench-lite/synthetic_package/'
+            )
+            self.assertTrue(entry.key.startswith(expected_prefix), entry.key)
 
     def test_cli_check_outputs_json_summary(self):
         env = os.environ.copy()

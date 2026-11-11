@@ -23,6 +23,7 @@ CONFIG_FIELDS = {
     'input_dir',
     'batch_id',
     's3_prefix',
+    's3_public_prefix',
     's3_private_bucket',
     's3_public_bucket',
     'manifest_base_url',

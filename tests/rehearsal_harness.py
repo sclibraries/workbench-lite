@@ -410,10 +410,19 @@ for _scenario in SCENARIO_EXPECTATIONS:
 TEST_ENDPOINT = 'http://synthetic.invalid'
 TEST_PRIVATE_BUCKET = 'wbl-local-test-sources'
 TEST_PUBLIC_BUCKET = 'wbl-local-test-derivatives'
+_CLAIM_PREFIXES = {}
+
+
+def register_claim_prefix(scenario_prefix, private_prefix):
+    _CLAIM_PREFIXES[str(scenario_prefix)] = private_prefix
+
+
+def resolve_claim_prefix(prefix):
+    return _CLAIM_PREFIXES.get(str(prefix), prefix)
 
 
 def claim_root(prefix):
-    return f'{prefix.strip("/")}/_ids/'
+    return f'{resolve_claim_prefix(prefix).strip("/")}/_ids/'
 
 
 def is_claim_key(key, prefix):

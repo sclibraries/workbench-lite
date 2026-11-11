@@ -22,8 +22,11 @@ def build_upload_plan(
     private_bucket = str(config.get('s3_private_bucket') or DEFAULT_PRIVATE_BUCKET)
     public_bucket = str(config.get('s3_public_bucket') or DEFAULT_PUBLIC_BUCKET)
     prefix = str(config.get('s3_prefix') or DEFAULT_PREFIX)
+    public_prefix = str(config.get('s3_public_prefix') or prefix)
     batch_id = str(config.get('batch_id') or config_path.stem)
-    batch_prefix = _join_key(prefix, _normalize_segment(batch_id))
+    batch_segment = _normalize_segment(batch_id)
+    private_batch_prefix = _join_key(prefix, batch_segment)
+    public_batch_prefix = _join_key(public_prefix, batch_segment)
 
     plan: List[UploadPlanEntry] = []
     for workbench_object in objects:
@@ -33,14 +36,14 @@ def build_upload_plan(
                 _entry(
                     role='pdf',
                     source_path=workbench_object.pdf_path,
-                    bucket=private_bucket,
+                    bucket=public_bucket,
                     key=_join_key(
-                        batch_prefix,
+                        public_batch_prefix,
                         'originals',
                         object_segment,
                         _source_basename(workbench_object.pdf_path),
                     ),
-                    public=False,
+                    public=True,
                     object_id=workbench_object.object_id,
                     page_id='',
                     generated=False,
@@ -57,7 +60,7 @@ def build_upload_plan(
                         source_path=page.file_path,
                         bucket=private_bucket,
                         key=_join_key(
-                            batch_prefix,
+                            private_batch_prefix,
                             'originals',
                             object_segment,
                             'pages',
@@ -78,7 +81,7 @@ def build_upload_plan(
                         source_path=page.hocr_path,
                         bucket=public_bucket,
                         key=_join_key(
-                            batch_prefix,
+                            public_batch_prefix,
                             'ocr',
                             object_segment,
                             _source_basename(page.hocr_path),
@@ -96,16 +99,16 @@ def build_upload_plan(
                     _entry(
                         role='service_jpg',
                         source_path=page.file_path,
-                        bucket=public_bucket,
+                        bucket=private_bucket,
                         key=_join_key(
-                            batch_prefix,
+                            private_batch_prefix,
                             'derivatives',
                             object_segment,
                             'pages',
                             page_segment,
                             'service.jpg',
                         ),
-                        public=True,
+                        public=False,
                         object_id=workbench_object.object_id,
                         page_id=page.page_id,
                         generated=True,
@@ -118,7 +121,7 @@ def build_upload_plan(
                         source_path=page.file_path,
                         bucket=public_bucket,
                         key=_join_key(
-                            batch_prefix,
+                            public_batch_prefix,
                             'derivatives',
                             object_segment,
                             'pages',
@@ -138,7 +141,7 @@ def build_upload_plan(
                 role='manifest',
                 source_path='',
                 bucket=public_bucket,
-                key=_join_key(batch_prefix, 'manifests', f'{object_segment}.json'),
+                key=_join_key(public_batch_prefix, 'manifests', f'{object_segment}.json'),
                 public=True,
                 object_id=workbench_object.object_id,
                 page_id='',
@@ -153,7 +156,7 @@ def build_upload_plan(
             role='audit',
             source_path='',
             bucket=private_bucket,
-            key=_join_key(batch_prefix, 'audit', run_id, 'upload-plan.json'),
+            key=_join_key(private_batch_prefix, 'audit', run_id, 'upload-plan.json'),
             public=False,
             object_id='',
             page_id='',

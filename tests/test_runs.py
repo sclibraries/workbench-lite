@@ -278,12 +278,15 @@ class RunTests(unittest.TestCase):
         with config.open('a') as f:
             f.write(
                 'password: SECRET_CONFIG\nmanifest_base_url: https://user:SECRET_URL@host/path?token=SECRET_QUERY\n'
+                's3_public_prefix: public-zone\n'
             )
         (self.root / 'input.csv').write_text(
             'title,password,file\nSecret: A history,SECRET_CSV,https://host/a?token=SECRET_QUERY\n'
         )
         run = RunJournal.create(self.root / 'runs')
         run.inputs(config, load_config(config), self.root / 'input.csv')
+        config_snapshot = json.loads((run.path / 'config.json').read_text())
+        self.assertEqual(config_snapshot['s3_public_prefix'], 'public-zone')
         run.start('generate')
         run.intent(
             'generate',

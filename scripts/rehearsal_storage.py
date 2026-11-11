@@ -8,7 +8,7 @@ from pathlib import Path
 import re
 import shutil
 
-from rehearsal_harness import stream_identity
+from rehearsal_harness import register_claim_prefix, stream_identity
 
 ENDPOINT = 'http://localhost:4566'
 SENTINEL_BODIES = {
@@ -35,8 +35,6 @@ def validate_target(endpoint, private_bucket, public_bucket):
     pattern = re.compile(r'^wbl-local-test-[a-z0-9][a-z0-9.-]*[a-z0-9]$')
     if not pattern.fullmatch(private_bucket) or not pattern.fullmatch(public_bucket):
         raise ValueError('Both rehearsal buckets must use the wbl-local-test-* namespace.')
-    if private_bucket == public_bucket:
-        raise ValueError('Private and public rehearsal buckets must differ.')
 
 
 def ensure_bucket(client, bucket):
@@ -153,6 +151,11 @@ def make_config(source_root, directory, bucket_private, bucket_public, prefix):
     value['s3_private_bucket'] = bucket_private
     value['s3_public_bucket'] = bucket_public
     value['s3_prefix'] = prefix
+    value.pop('s3_public_prefix', None)
+    if bucket_private == bucket_public:
+        value['s3_prefix'] = f'{prefix}/private'
+        value['s3_public_prefix'] = f'{prefix}/public'
+    register_claim_prefix(prefix, value['s3_prefix'])
     value['manifest_base_url'] = 'http://localhost:8080/manifests'
     value['cantaloupe_base_url'] = 'http://localhost:8080/iiif/2'
     target = directory / 'config.yml'
@@ -174,6 +177,7 @@ def hardlink_tree(source, destination):
 
 
 def cleanup_prefix(storage, buckets, prefix):
+    buckets = tuple(dict.fromkeys(buckets))
     before = {bucket: storage_listing(storage, bucket, prefix) for bucket in buckets}
     outcomes = []
     for bucket in buckets:

@@ -409,41 +409,25 @@ def _check_output_capacity(root, required_bytes, errors):
 
 
 def storage_readiness(client, entries, endpoint, *, offline=False, journal=None):
-    from .push import STORAGE_ERRORS
-
-    targets = []
+    targets = _storage_targets(entries, endpoint)
     checks, errors = [], []
-    for bucket in sorted({entry.bucket for entry in entries}):
-        parents = [str(Path(entry.key).parent) for entry in entries if entry.bucket == bucket]
-        prefix = os.path.commonpath(parents).rstrip('/') + '/'
-        if prefix == '/':
-            prefix = ''
-        targets.append({'endpoint': endpoint, 'bucket': bucket, 'prefix': prefix})
-        if offline:
-            continue
-        operations = [
-            ('HeadBucket', client.head_bucket, {'Bucket': bucket}),
-            ('ListObjectsV2', None, {'Bucket': bucket, 'Prefix': prefix, 'MaxKeys': 1}),
-        ]
-        for operation, method, parameters in operations:
-            identity = {'operation': operation, 'bucket': bucket, 'prefix': prefix}
-            op = journal.intent('preflight', identity) if journal else None
-            try:
-                if method is None:
-                    method = client.list_objects_v2
-                response = method(**parameters)
-                result = {**identity, 'status': 'verified', 'outcome': 'accessible'}
-                if operation == 'ListObjectsV2':
-                    result.update(max_keys=1, sampled_objects=response.get('KeyCount', 0))
-            except STORAGE_ERRORS as exc:
-                message = f'{bucket}: {operation_error(exc)}'
-                errors.append(message)
-                result = {**identity, 'status': 'failed', 'message': message}
-            checks.append(result)
-            if journal:
-                journal.result(op, 'preflight', result)
-            if result['status'] == 'failed':
-                break
+    if not offline:
+        by_bucket = {}
+        for target in targets:
+            by_bucket.setdefault(target['bucket'], []).append(target)
+        for bucket, scoped_targets in sorted(by_bucket.items()):
+            head = _storage_check(
+                client, 'HeadBucket', bucket, scoped_targets[0]['prefix'], journal
+            )
+            checks.append(head)
+            if head['status'] == 'failed':
+                errors.append(head['message'])
+                continue
+            for target in scoped_targets:
+                result = _storage_check(client, 'ListObjectsV2', bucket, target['prefix'], journal)
+                checks.append(result)
+                if result['status'] == 'failed':
+                    errors.append(result['message'])
     return {
         'targets': targets,
         'checks': checks,
@@ -458,3 +442,42 @@ def storage_readiness(client, entries, endpoint, *, offline=False, journal=None)
         'limitations': 'Read-only access does not prove PutObject permission or absence of '
         'conflicting remote objects.',
     }
+
+
+def _storage_targets(entries, endpoint):
+    grouped = {}
+    for entry in entries:
+        grouped.setdefault((entry.bucket, entry.public), []).append(str(Path(entry.key).parent))
+    unique = {}
+    for (bucket, _), parents in grouped.items():
+        prefix = os.path.commonpath(parents).rstrip('/') + '/'
+        if prefix == '/':
+            prefix = ''
+        unique[(bucket, prefix)] = {'endpoint': endpoint, 'bucket': bucket, 'prefix': prefix}
+    return sorted(unique.values(), key=lambda item: (item['bucket'], item['prefix']))
+
+
+def _storage_check(client, operation, bucket, prefix, journal):
+    from .push import STORAGE_ERRORS
+
+    identity = {'operation': operation, 'bucket': bucket, 'prefix': prefix}
+    op = journal.intent('preflight', identity) if journal else None
+    parameters = {'Bucket': bucket}
+    method = client.head_bucket
+    if operation == 'ListObjectsV2':
+        method = client.list_objects_v2
+        parameters.update(Prefix=prefix, MaxKeys=1)
+    try:
+        response = method(**parameters)
+        result = {**identity, 'status': 'verified', 'outcome': 'accessible'}
+        if operation == 'ListObjectsV2':
+            result.update(max_keys=1, sampled_objects=response.get('KeyCount', 0))
+    except STORAGE_ERRORS as exc:
+        result = {
+            **identity,
+            'status': 'failed',
+            'message': f'{bucket}: {operation_error(exc)}',
+        }
+    if journal:
+        journal.result(op, 'preflight', result)
+    return result

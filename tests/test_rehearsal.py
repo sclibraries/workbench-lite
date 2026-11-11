@@ -20,6 +20,7 @@ from rehearsal_harness import (
     FileS3Client,
     FaultClient,
     cli_client_factory,
+    claim_root,
     clear_dead_test_locks,
     invoke_cli,
     is_claim_key,
@@ -68,6 +69,30 @@ class RehearsalScenarioTests(unittest.TestCase):
         self.assertEqual(wrapped.meta.endpoint_url, 'http://localhost:4566')
         self.assertEqual(wrapped.region_name, 'us-east-1')
         self.assertIs(wrapped.client, wrapped)
+
+    def test_shared_bucket_package_splits_public_prefix_under_rehearsal_root(self):
+        import yaml
+        from scripts.rehearsal_storage import ENDPOINT, make_config, validate_target
+
+        config = make_config(
+            self.package_root,
+            self.root / 'shared-config',
+            TEST_PRIVATE_BUCKET,
+            TEST_PRIVATE_BUCKET,
+            'shared-case',
+        )
+        values = yaml.safe_load(config.read_text(encoding='utf-8'))
+        self.assertEqual(values['s3_prefix'], 'shared-case/private')
+        self.assertEqual(values['s3_public_prefix'], 'shared-case/public')
+        self.assertEqual(claim_root('shared-case'), 'shared-case/private/_ids/')
+        validate_target(ENDPOINT, TEST_PRIVATE_BUCKET, TEST_PRIVATE_BUCKET)
+        for endpoint, private_bucket, public_bucket in (
+            ('http://example.org', TEST_PRIVATE_BUCKET, TEST_PRIVATE_BUCKET),
+            (ENDPOINT, 'other-test-bucket', 'other-test-bucket'),
+        ):
+            with self.subTest(endpoint=endpoint, bucket=private_bucket):
+                with self.assertRaises(ValueError):
+                    validate_target(endpoint, private_bucket, public_bucket)
 
     def test_fault_client_delegates_upload_to_wrapped_boto_client(self):
         with patch.dict('os.environ', {'AWS_EC2_METADATA_DISABLED': 'true'}):

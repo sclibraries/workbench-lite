@@ -275,3 +275,37 @@ raise SystemExit(cli.entrypoint())
             with WriterLocks(self.root) as second:
                 with self.assertRaises(LockError):
                     lock_destination(second, 'http://127.0.0.1:4566', overlapping)
+
+        shared_root = self.root / 'shared'
+        shared_root.mkdir()
+        config = package(shared_root)
+        config.write_text(
+            config.read_text(encoding='utf-8')
+            + 's3_private_bucket: wbl-local-test-shared\n'
+            + 's3_public_bucket: wbl-local-test-shared\n'
+            + 's3_prefix: private-zone\n'
+            + 's3_public_prefix: public-zone\n',
+            encoding='utf-8',
+        )
+        shared_plan = run_check(config).upload_plan
+        self.assertEqual({entry.bucket for entry in shared_plan}, {'wbl-local-test-shared'})
+        self.assertEqual(
+            {entry.key.split('/', 1)[0] for entry in shared_plan},
+            {'private-zone', 'public-zone'},
+        )
+        private_plan = [entry for entry in shared_plan if not entry.public]
+        public_plan = [entry for entry in shared_plan if entry.public]
+        from types import SimpleNamespace
+
+        recorded_entries = [{'bucket': entry.bucket, 'key': entry.key} for entry in public_plan]
+        operation_plans = (
+            ('push', public_plan),
+            ('reconcile', [SimpleNamespace(**entry) for entry in recorded_entries]),
+            ('rollback', [SimpleNamespace(**entry) for entry in recorded_entries]),
+        )
+        with WriterLocks(self.root) as first:
+            lock_destination(first, 'http://localhost:4566', private_plan)
+            for operation, entries in operation_plans:
+                with self.subTest(operation=operation), WriterLocks(self.root) as second:
+                    with self.assertRaisesRegex(LockError, 'Writer lock is held'):
+                        lock_destination(second, 'http://localhost:4566', entries)
