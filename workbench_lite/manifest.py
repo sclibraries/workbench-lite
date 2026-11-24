@@ -13,7 +13,6 @@ from .public_urls import join_image_service_url, join_manifest_url
 
 
 MANIFEST_IMAGE_MAX_DIMENSION = 2000
-MANIFEST_THUMBNAIL_MAX_DIMENSION = 160
 
 
 def generate_manifests(
@@ -26,6 +25,7 @@ def generate_manifests(
     page_dimensions: Optional[Dict[tuple[str, str], tuple[int, int]]] = None,
     cantaloupe_source_prefix: Optional[str] = None,
     manifest_key_prefix: Optional[str] = None,
+    public_base_url: Optional[str] = None,
 ) -> GenerateResult:
     results = RecordedResults(journal, 'generate')
     generated_count = 0
@@ -59,6 +59,7 @@ def generate_manifests(
                 cantaloupe_base_url,
                 page_dimensions,
                 cantaloupe_source_prefix,
+                public_base_url,
             )
             if page_canvas is None:
                 missing_reasons.append(
@@ -92,6 +93,7 @@ def generate_manifests(
             ),
             sequence_id=None,
             pdf_entry=entries_by_key.get(('pdf', obj.object_id, '')),
+            public_base_url=public_base_url,
         )
 
         try:
@@ -144,6 +146,7 @@ def _build_canvas_entry(
     cantaloupe_base_url: str,
     page_dimensions: Dict[tuple[str, str], tuple[int, int]],
     cantaloupe_source_prefix: Optional[str],
+    public_base_url: Optional[str],
 ) -> tuple[Optional[Dict[str, object]], Optional[str]]:
     service_entry = entries_by_key.get(('service_jpg', obj.object_id, page.page_id))
     master_entry = entries_by_key.get(('master_tiff', obj.object_id, page.page_id))
@@ -176,12 +179,8 @@ def _build_canvas_entry(
         f'{service_id}/full/!{MANIFEST_IMAGE_MAX_DIMENSION},'
         f'{MANIFEST_IMAGE_MAX_DIMENSION}/0/default.jpg'
     )
-    thumbnail_id = (
-        f'{service_id}/full/!{MANIFEST_THUMBNAIL_MAX_DIMENSION},'
-        f'{MANIFEST_THUMBNAIL_MAX_DIMENSION}/0/default.jpg'
-    )
-
     hocr_entry = entries_by_key.get(('hocr', obj.object_id, page.page_id))
+    thumbnail_entry = entries_by_key.get(('thumbnail', obj.object_id, page.page_id))
 
     canvas_id = f'page/{_normalize_segment(page.page_id)}'
     canvas_payload: Dict[str, object] = {
@@ -207,14 +206,17 @@ def _build_canvas_entry(
                 },
             }
         ],
-        'thumbnail': {
-            '@id': thumbnail_id,
-        },
     }
+
+    if thumbnail_entry is not None:
+        canvas_payload['thumbnail'] = {
+            '@id': _manifest_asset_url(thumbnail_entry, public_base_url),
+            'format': 'image/jpeg',
+        }
 
     if hocr_entry is not None:
         canvas_payload['seeAlso'] = {
-            '@id': _manifest_asset_url(hocr_entry),
+            '@id': _manifest_asset_url(hocr_entry, public_base_url),
             'format': 'text/vnd.hocr+html',
             'label': 'hOCR',
         }
@@ -240,6 +242,7 @@ def _build_manifest_payload(
     manifest_id: str,
     sequence_id: Optional[str],
     pdf_entry: Optional[UploadPlanEntry],
+    public_base_url: Optional[str],
 ) -> Dict[str, object]:
     sequence_id = sequence_id or f'{manifest_id}/sequence/normal'
 
@@ -257,12 +260,13 @@ def _build_manifest_payload(
         ],
     }
 
-    metadata: List[Dict[str, str]] = [
-        {'label': 'Object ID', 'value': obj.object_id},
-    ]
+    payload['metadata'] = [{'label': 'Object ID', 'value': obj.object_id}]
     if pdf_entry:
-        metadata.append({'label': 'Download PDF', 'value': _manifest_asset_url(pdf_entry)})
-    payload['metadata'] = metadata
+        payload['rendering'] = {
+            '@id': _manifest_asset_url(pdf_entry, public_base_url),
+            'format': 'application/pdf',
+            'label': 'Download PDF',
+        }
 
     return payload
 
@@ -281,8 +285,10 @@ def _manifest_id(
     return manifest_path
 
 
-def _manifest_asset_url(entry: UploadPlanEntry) -> str:
-    return entry.key
+def _manifest_asset_url(entry: UploadPlanEntry, public_base_url: Optional[str]) -> str:
+    if public_base_url is None:
+        return entry.key
+    return join_manifest_url(public_base_url, entry.key)
 
 
 def _output_path_for_entry(entry_key: str, output_dir: Path) -> Path:

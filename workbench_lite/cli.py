@@ -1186,13 +1186,22 @@ def _resolve_generation_bases(args, config):
     image_base = config.get('cantaloupe_base_url')
     if image_base is None:
         image_base = args.cantaloupe_base_url
+    public_base = config.get('public_base_url')
+    if public_base is None:
+        public_bucket = config.get('s3_public_bucket') or DEFAULT_PUBLIC_BUCKET
+        if '.' in public_bucket:
+            raise ValueError('public_base_url is required when the public bucket contains a dot.')
+        public_base = f'https://{public_bucket}.s3.amazonaws.com'
     try:
-        return (
-            normalize_public_base_url(manifest_base),
-            normalize_public_base_url(image_base),
-        )
+        manifest_base = normalize_public_base_url(manifest_base)
+        image_base = normalize_public_base_url(image_base)
     except ValueError as exc:
         raise ValueError(f'Invalid manifest base URL: {exc}') from exc
+    try:
+        public_base = normalize_public_base_url(public_base)
+    except ValueError as exc:
+        raise ValueError(f'Invalid public base URL: {exc}') from exc
+    return manifest_base, image_base, public_base
 
 
 def _add_requested_manifests(
@@ -1206,7 +1215,7 @@ def _add_requested_manifests(
 ):
     if not args.manifests:
         return report
-    manifest_base_url, cantaloupe_base_url = bases
+    manifest_base_url, cantaloupe_base_url, public_base_url = bases
     manifest_report = generate_manifests(
         objects=check_report.objects,
         upload_plan=check_report.upload_plan,
@@ -1217,6 +1226,7 @@ def _add_requested_manifests(
         page_dimensions=report.page_dimensions,
         cantaloupe_source_prefix=cantaloupe_source_prefix,
         manifest_key_prefix=manifest_key_prefix,
+        public_base_url=public_base_url,
     )
     return _combine_generate_reports(report, manifest_report)
 

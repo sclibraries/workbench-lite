@@ -208,29 +208,11 @@ class ManifestPublicUrlTests(unittest.TestCase):
 
     def _build_reserved_key_manifest(self):
         config = self.package('encoded')
+        self._add_synthetic_hocr(config)
         report = run_check(config)
         output = self.root / 'encoded-generated'
         service_report = self._generate_service_image(report, output, config)
-        original_service = next(
-            entry for entry in report.upload_plan if entry.role == 'service_jpg'
-        )
-        original_manifest = next(entry for entry in report.upload_plan if entry.role == 'manifest')
-        service_key = 'sample/é/derivatives/literal%2F with space?hash#/service.jpg'
-        manifest_key = 'sample/é/manifests/literal%2F with space?hash#/manifest.json'
-        service_path = output / service_key
-        service_path.parent.mkdir(parents=True, exist_ok=True)
-        service_path.write_bytes((output / original_service.key).read_bytes())
-        service_entry = replace(original_service, key=service_key)
-        manifest_entry = replace(original_manifest, key=manifest_key)
-        plan = [
-            manifest_entry
-            if entry is original_manifest
-            else service_entry
-            if entry is original_service
-            else entry
-            for entry in report.upload_plan
-        ]
-
+        plan, entries = self._encoded_asset_plan(report, output)
         generated = generate_manifests(
             report.objects,
             plan,
@@ -240,22 +222,63 @@ class ManifestPublicUrlTests(unittest.TestCase):
             cantaloupe_source_prefix='sample/é/derivatives',
             manifest_key_prefix='sample/é/manifests',
             page_dimensions=service_report.page_dimensions,
+            public_base_url='https://files.example.org/archive',
         )
         payload = json.loads(Path(generated.results[0].output_path).read_text())
-        return payload, manifest_entry, service_entry, manifest_key, service_key
+        return {'payload': payload, **entries}
+
+    def _add_synthetic_hocr(self, config):
+        csv_path = config.parent / 'input.csv'
+        contents = csv_path.read_text(encoding='utf-8')
+        contents = contents.replace('field_weight,file\n', 'field_weight,file,hocr\n')
+        contents = contents.replace('page-1.tif\n', 'page-1.tif,page-1.hocr\n')
+        csv_path.write_text(contents, encoding='utf-8')
+        (config.parent / 'page-1.hocr').write_text('synthetic hOCR', encoding='utf-8')
+
+    def _encoded_asset_plan(self, report, output):
+        originals = {
+            role: next(entry for entry in report.upload_plan if entry.role == role)
+            for role in ('manifest', 'service_jpg', 'pdf', 'hocr', 'thumbnail')
+        }
+        keys = {
+            'manifest': 'sample/é/manifests/literal%2F with space?hash#/manifest.json',
+            'service_jpg': 'sample/é/derivatives/literal%2F with space?hash#/service.jpg',
+            'pdf': 'sample/é/public/literal%2F with space?hash#/parent.pdf',
+            'hocr': 'sample/é/public/literal%2F with space?hash#/page.hocr',
+            'thumbnail': 'sample/é/public/literal%2F with space?hash#/thumbnail.jpg',
+        }
+        replacements = {
+            id(entry): replace(entry, key=keys[role]) for role, entry in originals.items()
+        }
+        service_path = output / keys['service_jpg']
+        service_path.parent.mkdir(parents=True, exist_ok=True)
+        service_path.write_bytes((output / originals['service_jpg'].key).read_bytes())
+        plan = [replacements.get(id(entry), entry) for entry in report.upload_plan]
+        return plan, {
+            'manifest_entry': replacements[id(originals['manifest'])],
+            'service_entry': replacements[id(originals['service_jpg'])],
+            'manifest_key': keys['manifest'],
+            'service_key': keys['service_jpg'],
+            'assets': {
+                role: replacements[id(originals[role])] for role in ('pdf', 'hocr', 'thumbnail')
+            },
+        }
 
     def _assert_reserved_key_urls(self, case):
-        payload, manifest_entry, service_entry, manifest_key, service_key = case
+        payload = case['payload']
         canvas = payload['sequences'][0]['canvases'][0]
         annotation = canvas['images'][0]
+        service_id = annotation['resource']['service']['@id']
 
+        manifest_key = case['manifest_key']
+        service_key = case['service_key']
         self.assertEqual(
             payload['@id'],
             'https://manifests.example.org/archive/'
             'literal%252F%20with%20space%3Fhash%23/manifest.json',
         )
         self.assertEqual(
-            annotation['resource']['service']['@id'],
+            service_id,
             'https://images.example.org/iiif/2/literal%252F%20with%20space%3Fhash%23%2Fservice.jpg',
         )
         self.assertIn('%252F', payload['@id'])
@@ -264,24 +287,66 @@ class ManifestPublicUrlTests(unittest.TestCase):
             manifest_key,
         )
         self.assertEqual(
-            'sample/é/derivatives/'
-            + unquote(annotation['resource']['service']['@id'].split('/iiif/2/', 1)[1]),
+            'sample/é/derivatives/' + unquote(service_id.split('/iiif/2/', 1)[1]),
             service_key,
         )
-        self.assertEqual(manifest_entry.key, manifest_key)
-        self.assertEqual(service_entry.key, service_key)
+        self.assertEqual(case['manifest_entry'].key, manifest_key)
+        self.assertEqual(case['service_entry'].key, service_key)
+        self._assert_public_asset_links(payload, canvas, case['assets'])
         self.assertEqual(canvas['@id'], 'page/page-1')
         self.assertEqual(annotation['on'], canvas['@id'])
         self.assertEqual((canvas['width'], canvas['height']), (12, 10))
-        service_id = annotation['resource']['service']['@id']
         self.assertEqual(
             annotation['resource']['@id'],
             f'{service_id}/full/!2000,2000/0/default.jpg',
         )
+
+    def _assert_public_asset_links(self, payload, canvas, assets):
+        for role, field in (('thumbnail', 'thumbnail'), ('hocr', 'seeAlso')):
+            self.assertEqual(
+                canvas[field]['@id'],
+                f'https://files.example.org/archive/{quote(assets[role].key, safe="/")}',
+            )
+        self.assertEqual(canvas['thumbnail']['format'], 'image/jpeg')
         self.assertEqual(
-            canvas['thumbnail']['@id'],
-            f'{service_id}/full/!160,160/0/default.jpg',
+            canvas['seeAlso'],
+            {
+                '@id': f'https://files.example.org/archive/{quote(assets["hocr"].key, safe="/")}',
+                'format': 'text/vnd.hocr+html',
+                'label': 'hOCR',
+            },
         )
+        self.assertEqual(
+            payload['rendering'],
+            {
+                '@id': f'https://files.example.org/archive/{quote(assets["pdf"].key, safe="/")}',
+                'format': 'application/pdf',
+                'label': 'Download PDF',
+            },
+        )
+        self.assertNotIn('Download PDF', [item['label'] for item in payload['metadata']])
+
+    def test_manifest_omits_unplanned_thumbnail_pdf_and_hocr(self):
+        config = self.package('absent-assets')
+        report = run_check(config)
+        output = self.root / 'absent-assets-generated'
+        service_report = self._generate_service_image(report, output, config)
+        plan = [entry for entry in report.upload_plan if entry.role not in {'pdf', 'thumbnail'}]
+
+        generated = generate_manifests(
+            report.objects,
+            plan,
+            output,
+            cantaloupe_base_url=IMAGE_BASE,
+            manifest_base_url=MANIFEST_BASE,
+            page_dimensions=service_report.page_dimensions,
+        )
+        payload = json.loads(Path(generated.results[0].output_path).read_text())
+        canvas = payload['sequences'][0]['canvases'][0]
+
+        self.assertNotIn('rendering', payload)
+        self.assertNotIn('thumbnail', canvas)
+        self.assertNotIn('seeAlso', canvas)
 
     def _assert_master_tiff_fallback_strips_source_prefix(self):
         config = self.package('master-fallback')
@@ -376,6 +441,15 @@ class ManifestPublicUrlTests(unittest.TestCase):
             ),
             ('empty-manifest-config', {'manifest_base_url': ''}, []),
             ('empty-image-config', {'cantaloupe_base_url': ''}, []),
+            ('empty-public-config', {'public_base_url': ''}, []),
+            ('non-string-public-config', {'public_base_url': 42}, []),
+            ('dotted-default-public-bucket', {'s3_public_bucket': 'files.example'}, []),
+            ('malformed-default-host', {'s3_public_bucket': None}, []),
+            (
+                'malformed-public-host',
+                {'public_base_url': 'https://bad_host.example.org'},
+                [],
+            ),
             ('unsafe-manifest-prefix', {'manifest_key_prefix': '/absolute'}, []),
             ('unmatched-manifest-prefix', {'manifest_key_prefix': 'other-root'}, []),
             ('unmatched-image-prefix', {'cantaloupe_source_prefix': 'other-root'}, []),
@@ -385,20 +459,26 @@ class ManifestPublicUrlTests(unittest.TestCase):
                 config = self.package(name)
                 self._update_config(config, **settings)
                 output = self.root / f'{name}-generated'
-                result = self.invoke(
-                    [
-                        'generate',
-                        *self.common(config, name),
-                        '--output-dir',
-                        output,
-                        '--manifests',
-                        '--manifest-base-url',
-                        MANIFEST_BASE,
-                        '--cantaloupe-base-url',
-                        IMAGE_BASE,
-                        *flags,
-                    ]
-                )
+                default_bucket = 'bad_host' if name == 'malformed-default-host' else None
+                with patch.object(
+                    cli,
+                    'DEFAULT_PUBLIC_BUCKET',
+                    default_bucket or cli.DEFAULT_PUBLIC_BUCKET,
+                ):
+                    result = self.invoke(
+                        [
+                            'generate',
+                            *self.common(config, name),
+                            '--output-dir',
+                            output,
+                            '--manifests',
+                            '--manifest-base-url',
+                            MANIFEST_BASE,
+                            '--cantaloupe-base-url',
+                            IMAGE_BASE,
+                            *flags,
+                        ]
+                    )
                 self.assertEqual(result['exit'], 3)
                 self.assertFalse(output.exists())
 
@@ -444,7 +524,13 @@ class ManifestPublicUrlTests(unittest.TestCase):
 
     def test_config_bases_override_flags(self):
         config = self.package('precedence')
-        self._update_config(config, cantaloupe_source_prefix='', manifest_key_prefix='')
+        public_base = 'HTTPS://FILES.EXAMPLE.ORG/archive///'
+        self._update_config(
+            config,
+            cantaloupe_source_prefix='',
+            manifest_key_prefix='',
+            public_base_url=public_base,
+        )
         output = self.root / 'precedence-generated'
         result = self.invoke(
             [
@@ -461,24 +547,26 @@ class ManifestPublicUrlTests(unittest.TestCase):
         )
         self.assertEqual(result['exit'], 0, result['stdout'] + result['stderr'])
         payload = json.loads(self.generated_manifest(output).read_text())
-        manifest_entry = next(
-            entry for entry in run_check(config).upload_plan if entry.role == 'manifest'
-        )
-        self.assertEqual(payload['@id'], f'{MANIFEST_BASE}/{manifest_entry.key}')
-        service_entry = next(
-            entry for entry in run_check(config).upload_plan if entry.role == 'service_jpg'
+        entries = {entry.role: entry for entry in run_check(config).upload_plan}
+        self.assertEqual(payload['@id'], f'{MANIFEST_BASE}/{entries["manifest"].key}')
+        pdf_key = entries['pdf'].key
+        self.assertEqual(
+            payload['rendering']['@id'],
+            f'https://files.example.org/archive/{quote(pdf_key, safe="/")}',
         )
         service_id = payload['sequences'][0]['canvases'][0]['images'][0]['resource']['service'][
             '@id'
         ]
-        self.assertEqual(service_id, f'{IMAGE_BASE}/{quote(service_entry.key, safe="")}')
+        self.assertEqual(service_id, f'{IMAGE_BASE}/{quote(entries["service_jpg"].key, safe="")}')
         reference = json.loads((output / '.workbench-run.json').read_text())
         config_snapshot = json.loads((Path(reference['run_path']) / 'config.json').read_text())
         self.assertNotIn('cantaloupe_source_prefix', config_snapshot)
         self.assertNotIn('manifest_key_prefix', config_snapshot)
+        self.assertEqual(config_snapshot['public_base_url'], public_base)
 
     def test_generate_without_manifests_and_check_do_not_require_bases(self):
         config = self.package('no-bases', manifest_base=None, image_base=None)
+        self._update_config(config, public_base_url='not an absolute URL')
         check = self.invoke(['check', *self.common(config, 'check-no-bases')])
         output = self.root / 'no-manifests-generated'
         generated = self.generate(config, output, 'generate-no-bases', manifests=False)

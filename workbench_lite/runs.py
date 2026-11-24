@@ -28,6 +28,7 @@ CONFIG_FIELDS = {
     's3_public_bucket',
     'manifest_base_url',
     'cantaloupe_base_url',
+    'public_base_url',
     'cantaloupe_source_prefix',
     'manifest_key_prefix',
     'additional_files',

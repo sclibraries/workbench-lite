@@ -76,6 +76,7 @@ def _validate_string_settings(config):
         'input_csv',
         'manifest_base_url',
         'cantaloupe_base_url',
+        'public_base_url',
         's3_private_bucket',
         's3_public_bucket',
         's3_prefix',

@@ -58,6 +58,7 @@ batch_id: example-batch
 | `allow_missing_files` | Optional boolean for warning-only missing-file reports. It does not permit uploads with missing sources. |
 | `manifest_base_url` | Required for `generate --manifests`; public base for manifest identifiers. |
 | `cantaloupe_base_url` | Required for `generate --manifests`; public base for IIIF image services. |
+| `public_base_url` | Optional base for thumbnail, PDF and hOCR links; defaults to the public bucket's AWS address. Required when the bucket name contains a dot. |
 | `manifest_key_prefix` | Optional relative S3 key prefix removed from manifest identifiers; omit or leave empty to keep the full key. |
 | `manifest_publish_dir` | Existing absolute local directory served at `manifest_base_url`; read only by `publish-manifests`. |
 | `cantaloupe_source_prefix` | Optional relative S3 key prefix removed from image service identifiers; omit or leave empty to keep the full key. |
@@ -71,8 +72,14 @@ The public bucket defaults to `islandora-derivatives`. Set both destination buck
 for the environment before an execute run. AWS credentials come from the selected AWS profile or
 the standard AWS credential chain; do not put credentials in the YAML file.
 
-For `generate --manifests`, both URL bases must be absolute HTTPS URLs, or HTTP URLs
-whose host is exactly `localhost`, `127.0.0.1` or `[::1]`. Bases cannot contain
+Thumbnail, PDF and hOCR links use `public_base_url`. When omitted, it uses
+`https://<s3_public_bucket>.s3.amazonaws.com`; bucket names containing a dot require an explicit
+base because AWS's certificate does not cover that address. Set the key for LocalStack or another
+serving address. These links work only when the public objects can be read anonymously.
+
+For `generate --manifests`, `manifest_base_url` and `cantaloupe_base_url` must be absolute HTTPS
+URLs, or HTTP URLs whose host is exactly `localhost`, `127.0.0.1` or `[::1]`. `public_base_url`
+(or its default) follows the same validation and normalization. Bases cannot contain
 `@` anywhere, userinfo, queries or fragments (including empty query or fragment delimiters),
 whitespace, control characters or backslashes. Hosts must be ASCII DNS names or IP
 literals (IPv6 literals use brackets); ports, when present, must be from 1 through

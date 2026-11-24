@@ -1191,9 +1191,9 @@ class FakeClient:
             )
             manifest_path = Path(manifest_report.results[0].output_path)
             payload = json.loads(manifest_path.read_text(encoding='utf-8'))
-
         canvas = payload['sequences'][0]['canvases'][0]
         resource = canvas['images'][0]['resource']
+        entries = {entry.role: entry for entry in check_report.upload_plan}
         service_id = (
             'http://localhost:8080/iiif/2/workbench-lite%2Fsample%2Fderivatives%2Fparent'
             '%2Fpages%2Fpage%2Fservice.jpg'
@@ -1203,7 +1203,11 @@ class FakeClient:
         self.assertEqual((canvas['width'], canvas['height']), (16, 10))
         self.assertNotIn('width', resource)
         self.assertEqual(resource['@id'], f'{service_id}/full/!2000,2000/0/default.jpg')
-        self.assertEqual(canvas['thumbnail']['@id'], f'{service_id}/full/!160,160/0/default.jpg')
+        self.assertEqual(
+            canvas['thumbnail'], {'@id': entries['thumbnail'].key, 'format': 'image/jpeg'}
+        )
+        self.assertEqual(canvas['seeAlso']['@id'], entries['hocr'].key)
+        self.assertEqual(payload['rendering']['@id'], entries['pdf'].key)
         self.assertEqual(
             resource['service'],
             {
@@ -1221,7 +1225,17 @@ class FakeClient:
         with tempfile.TemporaryDirectory() as temp_dir:
             package_dir = Path(temp_dir)
             config_path, csv_path, _input_dir = self.write_tiny_package(package_dir)
+            config_path.write_text(
+                config_path.read_text(encoding='utf-8')
+                + 's3_public_prefix: public-zone\n'
+                + 'manifest_key_prefix: public-zone\n',
+                encoding='utf-8',
+            )
+            from workbench_lite.check import run_check
 
+            upload_plan = run_check(
+                config_path=config_path, input_csv_override=csv_path
+            ).upload_plan
             result = subprocess.run(
                 [
                     sys.executable,
@@ -1244,8 +1258,48 @@ class FakeClient:
                 capture_output=True,
                 check=False,
             )
-            manifest_path = package_dir / 'generated/workbench-lite/sample/manifests/parent.json'
+            manifest_path = package_dir / 'generated/public-zone/sample/manifests/parent.json'
             manifest_payload = json.loads(manifest_path.read_text(encoding='utf-8'))
+
+            from workbench_lite.storage_plan import DEFAULT_PUBLIC_BUCKET
+
+            entries = {entry.role: entry for entry in upload_plan}
+            public_base = f'https://{DEFAULT_PUBLIC_BUCKET}.s3.amazonaws.com'
+            canvas = manifest_payload['sequences'][0]['canvases'][0]
+            resource = canvas['images'][0]['resource']
+            self.assertEqual((canvas.get('width'), canvas.get('height')), (16, 10))
+            self.assertEqual((resource.get('width'), resource.get('height')), (None, None))
+            self.assertEqual(canvas['@id'], 'page/page')
+            self.assertEqual(
+                manifest_payload['@id'],
+                f'https://manifests.example.org/{entries["manifest"].key.removeprefix("public-zone/")}',
+            )
+            self.assertTrue(resource['@id'].endswith('/full/!2000,2000/0/default.jpg'))
+            self.assertEqual(
+                canvas['thumbnail'],
+                {'@id': f'{public_base}/{entries["thumbnail"].key}', 'format': 'image/jpeg'},
+            )
+            self.assertEqual(
+                canvas['seeAlso'],
+                {
+                    '@id': f'{public_base}/{entries["hocr"].key}',
+                    'format': 'text/vnd.hocr+html',
+                    'label': 'hOCR',
+                },
+            )
+            self.assertEqual(
+                manifest_payload['rendering'],
+                {
+                    '@id': f'{public_base}/{entries["pdf"].key}',
+                    'format': 'application/pdf',
+                    'label': 'Download PDF',
+                },
+            )
+            self.assertNotIn(
+                'Download PDF', [item['label'] for item in manifest_payload['metadata']]
+            )
+            self.assertTrue(entries['thumbnail'].key.startswith('public-zone/'))
+            self.assertFalse((package_dir / 'generated' / entries['thumbnail'].key).exists())
 
         self.assertEqual(result.returncode, 0, result.stderr)
         payload = json.loads(result.stdout)
@@ -1256,13 +1310,6 @@ class FakeClient:
         self.assertIn('manifest', roles)
         self.assertIn('service_jpg', roles)
         self.assertNotIn('page_dimensions', payload)
-        canvas = manifest_payload['sequences'][0]['canvases'][0]
-        resource = canvas['images'][0]['resource']
-        self.assertEqual((canvas.get('width'), canvas.get('height')), (16, 10))
-        self.assertEqual((resource.get('width'), resource.get('height')), (None, None))
-        self.assertEqual(canvas['@id'], 'page/page')
-        self.assertTrue(resource['@id'].endswith('/full/!2000,2000/0/default.jpg'))
-        self.assertTrue(canvas['thumbnail']['@id'].endswith('/full/!160,160/0/default.jpg'))
 
     def test_build_cantaloupe_service_id_encodes_path_separators_and_spaces(self):
         from workbench_lite.manifest import build_cantaloupe_service_id
