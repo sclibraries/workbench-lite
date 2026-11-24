@@ -221,7 +221,7 @@ def _open_parent(root, relative, *, create):
                 return None
             if created:
                 try:
-                    os.fchmod(next_fd, 0o755)
+                    os.fchmod(next_fd, stat.S_IMODE(os.fstat(current_fd).st_mode) | 0o755)
                     os.fsync(current_fd)
                 except OSError:
                     os.close(next_fd)

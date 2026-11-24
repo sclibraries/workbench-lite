@@ -121,6 +121,17 @@ class PublishTests(unittest.TestCase):
         manifest = self._assert_created_publication(journal, log)
         self._assert_unchanged_rerun(manifest, journal, log)
 
+    def test_created_manifest_folder_inherits_group_write_from_parent(self):
+        self.publish_dir.chmod(0o775)
+        old_umask = os.umask(0o077)
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(self.publish('--execute', '--confirm', self.run.name), 0)
+        finally:
+            os.umask(old_umask)
+
+        self.assertEqual((self.publish_dir / 'manifests').stat().st_mode & 0o777, 0o775)
+
     def _assert_created_publication(self, journal, log):
         manifest = self.publish_dir / 'manifests' / 'parent.json'
         payload = json.loads(manifest.read_text(encoding='utf-8'))
