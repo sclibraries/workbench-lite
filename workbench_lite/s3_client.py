@@ -8,6 +8,19 @@ from typing import Optional
 from .retry_policy import UPLOAD_CONNECT_TIMEOUT_SECONDS, UPLOAD_READ_TIMEOUT_SECONDS
 
 
+_CONTENT_TYPES = {
+    '.jpg': 'image/jpeg',
+    '.jpeg': 'image/jpeg',
+    '.tif': 'image/tiff',
+    '.tiff': 'image/tiff',
+    '.pdf': 'application/pdf',
+    '.json': 'application/json',
+    '.html': 'text/html; charset=utf-8',
+    '.htm': 'text/html; charset=utf-8',
+    '.hocr': 'text/html; charset=utf-8',
+}
+
+
 @dataclass(frozen=True)
 class VerificationResult:
     matches: bool
@@ -101,15 +114,18 @@ class Boto3S3Client:
     def upload_file(self, source_path, bucket, key, checksum):
         # A HEAD alone cannot prevent a competing writer replacing a serving key.
         # Conditional single PUT fails closed; never fall back to unconditional PUT.
+        put_args = {
+            'Bucket': bucket,
+            'Key': key,
+            'IfNoneMatch': '*',
+            'ChecksumAlgorithm': 'SHA256',
+            'ChecksumSHA256': base64.b64encode(bytes.fromhex(checksum)).decode('ascii'),
+        }
+        content_type = _CONTENT_TYPES.get(Path(key).suffix.lower())
+        if content_type:
+            put_args['ContentType'] = content_type
         with Path(source_path).open('rb') as source:
-            self.client.put_object(
-                Bucket=bucket,
-                Key=key,
-                Body=source,
-                IfNoneMatch='*',
-                ChecksumAlgorithm='SHA256',
-                ChecksumSHA256=base64.b64encode(bytes.fromhex(checksum)).decode('ascii'),
-            )
+            self.client.put_object(Body=source, **put_args)
 
     def verify_file(self, bucket, key, checksum, size_bytes):
         metadata = self.client.head_object(Bucket=bucket, Key=key, ChecksumMode='ENABLED')

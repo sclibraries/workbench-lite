@@ -102,6 +102,44 @@ class S3PublicationTests(unittest.TestCase):
             request['ChecksumSHA256'], base64.b64encode(bytes.fromhex(checksum)).decode('ascii')
         )
 
+    def test_put_uses_content_type_for_supported_suffixes(self):
+        from unittest.mock import Mock
+
+        cases = [
+            ('file.jpg', 'image/jpeg'),
+            ('file.JPG', 'image/jpeg'),
+            ('file.jpeg', 'image/jpeg'),
+            ('file.JPEG', 'image/jpeg'),
+            ('file.tif', 'image/tiff'),
+            ('file.TIF', 'image/tiff'),
+            ('file.tiff', 'image/tiff'),
+            ('file.TIFF', 'image/tiff'),
+            ('file.pdf', 'application/pdf'),
+            ('file.PDF', 'application/pdf'),
+            ('file.json', 'application/json'),
+            ('file.JSON', 'application/json'),
+            ('file.html', 'text/html; charset=utf-8'),
+            ('file.HTML', 'text/html; charset=utf-8'),
+            ('file.htm', 'text/html; charset=utf-8'),
+            ('file.HTM', 'text/html; charset=utf-8'),
+            ('file.hocr', 'text/html; charset=utf-8'),
+            ('file.HOCR', 'text/html; charset=utf-8'),
+            ('file.txt', None),
+            ('file', None),
+        ]
+        value = b'local bytes'
+        checksum = hashlib.sha256(value).hexdigest()
+        with tempfile.TemporaryDirectory() as root:
+            path = Path(root) / 'source'
+            path.write_bytes(value)
+            for key, expected in cases:
+                with self.subTest(key=key):
+                    store = Mock()
+                    Boto3S3Client(store).upload_file(path, 'bucket', key, checksum)
+                    request = store.put_object.call_args.kwargs
+                    self.assertEqual(request.get('ContentType'), expected)
+                    self.assertEqual('ContentType' in request, expected is not None)
+
     def test_default_verification_uses_stored_sha256_and_size_without_get(self):
         from unittest.mock import Mock
         import base64

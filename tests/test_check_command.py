@@ -709,7 +709,9 @@ class FakeClient:
             response['ChecksumType'] = 'FULL_OBJECT'
         return response
     def get_object(self, Bucket, Key): return {'Body': io.BytesIO(self.written[Bucket, Key])}
-    def put_object(self, Bucket, Key, Body, IfNoneMatch, ChecksumAlgorithm, ChecksumSHA256):
+    def put_object(
+        self, Bucket, Key, Body, IfNoneMatch, ChecksumAlgorithm, ChecksumSHA256, ContentType=None
+    ):
         assert IfNoneMatch == '*'
         self.written[Bucket, Key] = Body.read()
         with open(os.environ['FAKE_BOTO3_UPLOAD_LOG'], 'a') as handle:
